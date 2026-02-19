@@ -447,8 +447,7 @@ def launch_data_process_task(
     num_workers: int = 8,
     args = None,
 ):
-    if args is not None:
-        num_workers = args.dataset_num_workers
+    num_workers = _get_arg(args, "dataset_num_workers", num_workers)
         
     dataloader = torch.utils.data.DataLoader(dataset, shuffle=False, collate_fn=lambda x: x[0], num_workers=num_workers)
     model.to(device=accelerator.device)

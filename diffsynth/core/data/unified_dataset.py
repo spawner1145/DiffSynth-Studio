@@ -1,6 +1,7 @@
 from .operators import *
 import torch, json, pandas, os, math
 import random
+from PIL import Image
 
 
 class BucketManager:
