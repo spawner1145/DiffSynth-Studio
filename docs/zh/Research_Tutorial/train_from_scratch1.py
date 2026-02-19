@@ -78,7 +78,7 @@ class AAADiT(torch.nn.Module):
         self.timestep_embedder = TimestepEmbeddings(256, dim)
         self.image_embedder = torch.nn.Sequential(torch.nn.Linear(128, dim), torch.nn.LayerNorm(dim))
         self.text_embedder = torch.nn.Sequential(torch.nn.Linear(1024, dim), torch.nn.LayerNorm(dim))
-        self.blocks = torch.nn.ModuleList([AAABlock(dim) for _ in range(10)])
+        self.blocks = torch.nn.ModuleList([AAABlock(dim) for _ in range(20)])
         self.proj_out = torch.nn.Linear(dim, 128)
 
     def forward(
