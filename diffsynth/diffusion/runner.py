@@ -396,8 +396,6 @@ def launch_training_task(
                         except AttributeError:
                             grad_norm_item = float(grad_norm)
                         postfix["grad"] = f"{grad_norm_item:.3f}"
-                    postfix["epoch"] = f"{epoch_id + 1}/{num_epochs}"
-                    postfix["step"] = f"{global_step}/{total_steps}"
                     progress_bar.set_postfix(postfix)
 
                     if accelerator.is_main_process and global_step % log_every_n_steps == 0:

@@ -316,6 +316,10 @@ class UnifiedDataset(torch.utils.data.Dataset):
             "bucket_counts": {f"{w}x{h}": count for (w, h), count in sorted(bucket_counts.items())},
         }
         print(f"Bucket enabled: {self.bucket_info['num_buckets']} buckets on key '{self.bucket_data_key}'.")
+        if len(bucket_counts) > 0:
+            sorted_bucket_items = sorted(bucket_counts.items(), key=lambda x: (-x[1], x[0][0], x[0][1]))
+            for (w, h), count in sorted_bucket_items:
+                print(f"({w},{h})==>{count}")
 
     def set_seed(self, seed):
         self.seed = int(seed)
