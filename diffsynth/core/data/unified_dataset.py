@@ -282,7 +282,7 @@ class UnifiedDataset(torch.utils.data.Dataset):
             raise ValueError("min_bucket_reso must be equal or less than min(resolution).")
         if max(max_reso) > self.max_bucket_reso:
             raise ValueError("max_bucket_reso must be equal or greater than max(resolution).")
-        max_bucket_size = max(max_reso)
+        max_bucket_size = int(self.max_bucket_reso)
         self.bucket_manager = BucketManager(
             no_upscale=self.bucket_no_upscale,
             max_reso=max_reso,
