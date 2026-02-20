@@ -104,8 +104,6 @@ def _build_scheduler(
         return min(1.0, float(step + 1) / float(warmup_steps))
 
     if lr_scheduler_type == "constant":
-        if len(lr_scheduler_kwargs) == 0:
-            return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lambda step: 1.0)
         return torch.optim.lr_scheduler.ConstantLR(optimizer, **lr_scheduler_kwargs)
 
     if lr_scheduler_type == "constant_with_warmup":
