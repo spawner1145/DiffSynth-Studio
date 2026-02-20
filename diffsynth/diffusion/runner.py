@@ -160,7 +160,7 @@ def _compute_loss(model, dataset, data):
                 if _all_tensors_with_same_shape(values):
                     merged[key] = torch.stack(values, dim=0)
                 else:
-                    return None
+                    merged[key] = values
             return merged
         return None
 
@@ -193,6 +193,8 @@ def _infer_local_batch_size(data):
         for value in data.values():
             if isinstance(value, torch.Tensor) and value.ndim >= 1:
                 return max(1, int(value.shape[0]))
+            if isinstance(value, (list, tuple)):
+                return max(1, len(value))
     return 1
 
 
@@ -351,6 +353,7 @@ def launch_training_task(
         current_epoch.value = int(epoch_id)
         if hasattr(dataset, "set_current_epoch"):
             dataset.set_current_epoch(epoch_id)
+        optimizer.zero_grad()
         progress_bar = tqdm(dataloader, disable=not accelerator.is_local_main_process)
         progress_bar.set_description(f"Epoch {epoch_id + 1}/{num_epochs}")
         epoch_start_time = time.perf_counter()
@@ -360,7 +363,6 @@ def launch_training_task(
         for data in progress_bar:
             current_step.value = int(global_step)
             with accelerator.accumulate(model):
-                optimizer.zero_grad()
                 loss = _compute_loss(model, dataset, data)
                 accelerator.backward(loss)
                 grad_norm = None
@@ -373,6 +375,7 @@ def launch_training_task(
                     grad_norm = _compute_grad_norm(current_trainable_params)
                 optimizer.step()
                 if accelerator.sync_gradients:
+                    optimizer.zero_grad()
                     model_logger.on_step_end(accelerator, model, save_steps, loss=loss, epoch_id=epoch_id)
                     scheduler.step()
                     global_step += 1

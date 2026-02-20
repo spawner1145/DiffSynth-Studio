@@ -222,13 +222,20 @@ class AAAUnit_PromptEmbedder(PipelineUnit):
 
     def process(self, pipe: AAAImagePipeline, prompt):
         pipe.load_models_to_device(self.onload_model_names)
-        text = pipe.tokenizer.apply_chat_template(
-            [{"role": "user", "content": prompt}],
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,
-        )
-        inputs = pipe.tokenizer(text, return_tensors="pt", padding="max_length", truncation=True, max_length=128).to(pipe.device)
+        if isinstance(prompt, str):
+            prompts = [prompt]
+        else:
+            prompts = list(prompt)
+        texts = [
+            pipe.tokenizer.apply_chat_template(
+                [{"role": "user", "content": text_prompt}],
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+            for text_prompt in prompts
+        ]
+        inputs = pipe.tokenizer(texts, return_tensors="pt", padding="max_length", truncation=True, max_length=128).to(pipe.device)
         output = pipe.text_encoder(**inputs, output_hidden_states=True, use_cache=False)
         prompt_embeds = torch.concat([output.hidden_states[k] for k in self.hidden_states_layers], dim=-1)
         return {"prompt_embeds": prompt_embeds}
@@ -237,12 +244,13 @@ class AAAUnit_PromptEmbedder(PipelineUnit):
 class AAAUnit_NoiseInitializer(PipelineUnit):
     def __init__(self):
         super().__init__(
-            input_params=("height", "width", "seed", "rand_device"),
+            input_params=("height", "width", "seed", "rand_device", "batch_size"),
             output_params=("noise",),
         )
 
-    def process(self, pipe: AAAImagePipeline, height, width, seed, rand_device):
-        noise = pipe.generate_noise((1, 128, height//16, width//16), seed=seed, rand_device=rand_device, rand_torch_dtype=pipe.torch_dtype)
+    def process(self, pipe: AAAImagePipeline, height, width, seed, rand_device, batch_size=1):
+        batch_size = int(batch_size)
+        noise = pipe.generate_noise((batch_size, 128, height//16, width//16), seed=seed, rand_device=rand_device, rand_torch_dtype=pipe.torch_dtype)
         return {"noise": noise}
 
 
@@ -258,7 +266,10 @@ class AAAUnit_InputImageEmbedder(PipelineUnit):
         if input_image is None:
             return {"latents": noise, "input_latents": None}
         pipe.load_models_to_device(['vae'])
-        image = pipe.preprocess_image(input_image)
+        if isinstance(input_image, (list, tuple)):
+            image = torch.cat([pipe.preprocess_image(img) for img in input_image], dim=0)
+        else:
+            image = pipe.preprocess_image(input_image)
         input_latents = pipe.vae.encode(image)
         if pipe.scheduler.training:
             return {"latents": noise, "input_latents": input_latents}
@@ -317,12 +328,25 @@ class AAATrainingModule(DiffusionTrainingModule):
         self.pipe.scheduler.set_timesteps(1000, training=True)
 
     def forward(self, data):
+        prompt_value = data["prompt"]
+        image_value = data["image"]
+        if isinstance(prompt_value, str):
+            batch_size = 1
+        else:
+            batch_size = len(prompt_value)
+
+        if isinstance(image_value, (list, tuple)):
+            first_image = image_value[0]
+        else:
+            first_image = image_value
+
         inputs_posi = {"prompt": data["prompt"]}
         inputs_nega = {"negative_prompt": ""}
         inputs_shared = {
-            "input_image": data["image"],
-            "height": data["image"].size[1],
-            "width": data["image"].size[0],
+            "input_image": image_value,
+            "height": first_image.size[1],
+            "width": first_image.size[0],
+            "batch_size": batch_size,
             "cfg_scale": 1,
             "use_gradient_checkpointing": False,
             "use_gradient_checkpointing_offload": False,
@@ -335,11 +359,11 @@ class AAATrainingModule(DiffusionTrainingModule):
 
 if __name__ == "__main__":
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=1)
-    train_resolution = (1536, 1536)
+    train_resolution = (768, 768)
     max_bucket_reso = 2048
     dataset = UnifiedDataset(
-        base_path="/root/autodl-tmp/DiffSynth-Studio/data/images",
-        metadata_path="/root/autodl-tmp/DiffSynth-Studio/data/metadata_merged.csv",
+        base_path="/root/autodl-tmp/DiffSynth-Studio/danbooru/images",
+        metadata_path="/root/autodl-tmp/DiffSynth-Studio/danbooru/metadata.csv",
         max_data_items=10000000,
         data_file_keys=("image",),
         enable_bucket=True,
@@ -350,7 +374,7 @@ if __name__ == "__main__":
         bucket_data_key="image",
         bucket_base_reso=train_resolution,
         main_data_operator=UnifiedDataset.default_image_operator(
-            base_path="/root/autodl-tmp/DiffSynth-Studio/data/images",
+            base_path="/root/autodl-tmp/DiffSynth-Studio/danbooru/images",
             height=None,
             width=None,
             max_pixels=max_bucket_reso * max_bucket_reso,
@@ -360,12 +384,12 @@ if __name__ == "__main__":
     )
     model = AAATrainingModule(device=accelerator.device)
     model_logger = ModelLogger(
-        "models/AAA/v1",
+        "models/AAA/v3",
         remove_prefix_in_ckpt="pipe.dit.",
     )
     launch_training_task(
         accelerator, dataset, model, model_logger,
-        batch_size=1,
+        batch_size=64,
         learning_rate=2e-4,
         optimizer_type="pytorch_optimizer.Adan",
         #optimizer_args=[
@@ -381,6 +405,7 @@ if __name__ == "__main__":
         lr_warmup_steps=0,
         #max_grad_norm=1.0,
         num_workers=4,
-        save_steps=50000,
-        num_epochs=999999,
+        #save_steps=50000,
+        save_epochs=5,
+        num_epochs=99999999999,
     )
