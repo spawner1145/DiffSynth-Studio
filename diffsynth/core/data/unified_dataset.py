@@ -237,8 +237,11 @@ class UnifiedDataset(torch.utils.data.Dataset):
         path = self.resolve_data_path(path)
         if not os.path.exists(path):
             return None
-        with Image.open(path) as image:
-            width, height = image.size
+        try:
+            with Image.open(path) as image:
+                width, height = image.size
+        except Exception:
+            return None
         return width, height
 
     def setup_buckets_if_needed(self):
@@ -256,6 +259,11 @@ class UnifiedDataset(torch.utils.data.Dataset):
             return
 
         self.bucket_data_key = bucket_data_key
+        self.bucket_reso_steps = int(self.bucket_reso_steps)
+        if self.bucket_reso_steps <= 0:
+            raise ValueError("bucket_reso_steps must be a positive integer.")
+
+        self.min_bucket_reso = int(self.min_bucket_reso)
         if isinstance(self.bucket_base_reso, (tuple, list)) and len(self.bucket_base_reso) == 2:
             max_reso = (int(self.bucket_base_reso[0]), int(self.bucket_base_reso[1]))
         elif isinstance(self.max_bucket_reso, (tuple, list)) and len(self.max_bucket_reso) == 2:
@@ -271,13 +279,19 @@ class UnifiedDataset(torch.utils.data.Dataset):
 
         if self.min_bucket_reso % self.bucket_reso_steps != 0:
             adjusted_min_bucket_reso = self.min_bucket_reso - self.min_bucket_reso % self.bucket_reso_steps
+            adjusted_min_bucket_reso = max(self.bucket_reso_steps, adjusted_min_bucket_reso)
             print(f"min_bucket_reso is adjusted to be multiple of bucket_reso_steps: {self.min_bucket_reso} -> {adjusted_min_bucket_reso}")
             self.min_bucket_reso = adjusted_min_bucket_reso
         if max_bucket_reso_limit % self.bucket_reso_steps != 0:
             adjusted_max_bucket_reso = max_bucket_reso_limit + self.bucket_reso_steps - max_bucket_reso_limit % self.bucket_reso_steps
             print(f"max_bucket_reso is adjusted to be multiple of bucket_reso_steps: {max_bucket_reso_limit} -> {adjusted_max_bucket_reso}")
             max_bucket_reso_limit = adjusted_max_bucket_reso
+        if max_bucket_reso_limit < self.bucket_reso_steps:
+            max_bucket_reso_limit = self.bucket_reso_steps
         self.max_bucket_reso = max_bucket_reso_limit
+
+        if self.max_bucket_reso < self.min_bucket_reso:
+            raise ValueError("max_bucket_reso must be greater than or equal to min_bucket_reso.")
 
         if min(max_reso) < self.min_bucket_reso:
             raise ValueError("min_bucket_reso must be equal or less than min(resolution).")
@@ -295,16 +309,48 @@ class UnifiedDataset(torch.utils.data.Dataset):
             self.bucket_manager.make_buckets()
 
         bucket_counts = {}
+        skipped_missing_key = 0
+        skipped_invalid_value = 0
+        skipped_missing_file = 0
+        skipped_unreadable = 0
         for data_id, data in enumerate(self.data):
             if bucket_data_key not in data:
+                skipped_missing_key += 1
                 continue
-            image_size = self.fetch_image_size_from_data_value(data[bucket_data_key])
-            if image_size is None:
+
+            value = data[bucket_data_key]
+            path = None
+            if isinstance(value, str):
+                path = value
+            elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], str):
+                path = value[0]
+
+            if path is None:
+                skipped_invalid_value += 1
                 continue
-            image_width, image_height = image_size
+
+            path = self.resolve_data_path(path)
+            if not os.path.exists(path):
+                skipped_missing_file += 1
+                continue
+
+            try:
+                with Image.open(path) as image:
+                    image_width, image_height = image.size
+            except Exception:
+                skipped_unreadable += 1
+                continue
+
             reso, _, _ = self.bucket_manager.select_bucket(image_width, image_height)
             self.bucket_reso_by_data_id[data_id] = reso
             bucket_counts[reso] = bucket_counts.get(reso, 0) + 1
+
+        if len(self.bucket_reso_by_data_id) == 0:
+            raise ValueError(
+                "Bucket is enabled but no valid items are available for bucketing. "
+                + f"missing_key={skipped_missing_key}, invalid_value={skipped_invalid_value}, "
+                + f"missing_file={skipped_missing_file}, unreadable={skipped_unreadable}."
+            )
 
         self.bucket_info = {
             "bucket_data_key": self.bucket_data_key,
@@ -314,9 +360,21 @@ class UnifiedDataset(torch.utils.data.Dataset):
             "max_reso": [max_reso[0], max_reso[1]],
             "bucket_reso_steps": self.bucket_reso_steps,
             "num_buckets": len(bucket_counts),
+            "num_bucketed_items": len(self.bucket_reso_by_data_id),
+            "num_skipped_missing_key": skipped_missing_key,
+            "num_skipped_invalid_value": skipped_invalid_value,
+            "num_skipped_missing_file": skipped_missing_file,
+            "num_skipped_unreadable": skipped_unreadable,
             "bucket_counts": {f"{w}x{h}": count for (w, h), count in sorted(bucket_counts.items())},
         }
         print(f"Bucket enabled: {self.bucket_info['num_buckets']} buckets on key '{self.bucket_data_key}'.")
+        skipped_total = skipped_missing_key + skipped_invalid_value + skipped_missing_file + skipped_unreadable
+        if skipped_total > 0:
+            print(
+                "Bucket skipped items: "
+                + f"missing_key={skipped_missing_key}, invalid_value={skipped_invalid_value}, "
+                + f"missing_file={skipped_missing_file}, unreadable={skipped_unreadable}"
+            )
         if len(bucket_counts) > 0:
             sorted_bucket_items = sorted(bucket_counts.items(), key=lambda x: (-x[1], x[0][0], x[0][1]))
             for (w, h), count in sorted_bucket_items:

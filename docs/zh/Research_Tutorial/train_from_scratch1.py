@@ -25,6 +25,7 @@ class AAAPositionalEmbedding(torch.nn.Module):
         image_emb = self.image_emb.to(device=image.device, dtype=image.dtype)
         image_emb = torch.nn.functional.interpolate(image_emb, size=(height, width), mode="bilinear")
         image_emb = rearrange(image_emb, "B C H W -> B (H W) C")
+        image_emb = repeat(image_emb, "1 S C -> B S C", B=text.shape[0])
         text_emb = self.text_emb.to(device=text.device, dtype=text.dtype)
         text_emb = repeat(text_emb, "C -> B L C", B=text.shape[0], L=text.shape[1])
         emb = torch.concat([image_emb, text_emb], dim=1)
@@ -90,7 +91,10 @@ class AAADiT(torch.nn.Module):
         use_gradient_checkpointing_offload=False,
     ):
         pos_emb = self.pos_embedder(latents, prompt_embeds)
-        t_emb = self.timestep_embedder(timestep, dtype=latents.dtype).view(1, 1, -1)
+        t_emb = self.timestep_embedder(timestep, dtype=latents.dtype)
+        if t_emb.ndim == 1:
+            t_emb = t_emb.unsqueeze(0)
+        t_emb = t_emb.unsqueeze(1)
         image = self.image_embedder(rearrange(latents, "B C H W -> B (H W) C"))
         text = self.text_embedder(prompt_embeds)
         emb = torch.concat([image, text], dim=1)
