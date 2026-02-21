@@ -726,6 +726,7 @@ class ComplextroImageDiT(torch.nn.Module):
 
         self.img_in = nn.Linear(in_channels, self.hidden_size)
         self.txt_in = nn.Linear(text_embed_dim, self.hidden_size)
+        self.image_pad_token = nn.Parameter(torch.empty((1, in_channels)))
 
         self.noise_refiner = nn.ModuleList(
             [
@@ -756,6 +757,7 @@ class ComplextroImageDiT(torch.nn.Module):
                 RMSNorm(siglip_feat_dim, eps=1e-6),
                 nn.Linear(siglip_feat_dim, self.hidden_size),
             )
+            self.siglip_pad_token = nn.Parameter(torch.empty((1, self.hidden_size)))
             self.siglip_refiner = nn.ModuleList(
                 [
                     ComplextroSingleTransformerBlock(
@@ -770,6 +772,11 @@ class ComplextroImageDiT(torch.nn.Module):
         else:
             self.siglip_embedder = None
             self.siglip_refiner = None
+            self.siglip_pad_token = None
+
+        nn.init.normal_(self.image_pad_token, mean=0.0, std=0.02)
+        if self.siglip_pad_token is not None:
+            nn.init.normal_(self.siglip_pad_token, mean=0.0, std=0.02)
 
         self.transformer_blocks = nn.ModuleList(
             [
@@ -785,12 +792,39 @@ class ComplextroImageDiT(torch.nn.Module):
         self.norm_out = AdaLayerNorm(self.hidden_size, single=True)
         self.proj_out = nn.Linear(self.hidden_size, in_channels)
 
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        if "image_pad_token" not in state_dict:
+            state_dict = dict(state_dict)
+            state_dict["image_pad_token"] = self.image_pad_token.detach().clone()
+
+        if self.siglip_pad_token is not None:
+            if "siglip_pad_token" not in state_dict:
+                if not isinstance(state_dict, dict):
+                    state_dict = dict(state_dict)
+                state_dict["siglip_pad_token"] = self.siglip_pad_token.detach().clone()
+            else:
+                loaded_siglip_pad = state_dict["siglip_pad_token"]
+                if tuple(loaded_siglip_pad.shape) != tuple(self.siglip_pad_token.shape):
+                    if not isinstance(state_dict, dict):
+                        state_dict = dict(state_dict)
+                    state_dict["siglip_pad_token"] = self.siglip_pad_token.detach().clone()
+
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
     @staticmethod
-    def _pad_tokens(tokens: torch.Tensor, pad_multiple: int = SEQ_MULTI_OF) -> Tuple[torch.Tensor, int, int]:
+    def _pad_tokens(
+        tokens: torch.Tensor,
+        pad_multiple: int = SEQ_MULTI_OF,
+        pad_token: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, int, int]:
         ori_len = tokens.shape[0]
         pad_len = (-ori_len) % pad_multiple
         if pad_len > 0:
-            tokens = torch.cat([tokens, tokens[-1:].repeat(pad_len, 1)], dim=0)
+            if pad_token is None:
+                pad_values = tokens[-1:].repeat(pad_len, 1)
+            else:
+                pad_values = pad_token.to(device=tokens.device, dtype=tokens.dtype).repeat(pad_len, 1)
+            tokens = torch.cat([tokens, pad_values], dim=0)
         return tokens, ori_len, ori_len + pad_len
 
     @staticmethod
@@ -905,6 +939,26 @@ class ComplextroImageDiT(torch.nn.Module):
             temb_clean.unsqueeze(1),
         )
 
+    def _build_2d_freqs(self, height: int, width: int, device: torch.device) -> torch.Tensor:
+        img_freqs, _ = self.pos_embed([(1, height, width)], [1], device=device)
+        return img_freqs[: height * width]
+
+    def _build_scaled_siglip_freqs(
+        self,
+        sig_h: int,
+        sig_w: int,
+        ref_h: int,
+        ref_w: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        ref_freqs = self._build_2d_freqs(ref_h, ref_w, device=device)
+        ref_freqs = ref_freqs.view(ref_h, ref_w, -1)
+
+        y_idx = torch.linspace(0, max(ref_h - 1, 0), steps=sig_h, device=device).round().long()
+        x_idx = torch.linspace(0, max(ref_w - 1, 0), steps=sig_w, device=device).round().long()
+        sampled = ref_freqs[y_idx][:, x_idx]
+        return sampled.reshape(sig_h * sig_w, -1)
+
     def _build_omni_image_freqs(
         self,
         image_sizes: List[Optional[Tuple[int, int]]],
@@ -913,27 +967,11 @@ class ComplextroImageDiT(torch.nn.Module):
         device: torch.device,
         siglip_sizes: Optional[List[Optional[Tuple[int, int]]]] = None,
         siglip_lengths: Optional[List[int]] = None,
+        siglip_ref_sizes: Optional[List[Optional[Tuple[int, int]]]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        real_shapes: List[Tuple[int, int, int]] = []
-        for size in image_sizes:
-            if size is not None:
-                height, width = size
-                real_shapes.append((1, height, width))
-        if siglip_sizes is not None:
-            for size in siglip_sizes:
-                if size is not None:
-                    height, width = size
-                    real_shapes.append((1, height, width))
-
-        if len(real_shapes) == 0:
-            real_shapes = [(1, 1, 1)]
-
-        all_img_freqs, txt_freqs = self.pos_embed(real_shapes, [txt_seq_len], device=device)
+        all_img_freqs, txt_freqs = self.pos_embed([(1, 1, 1)], [txt_seq_len], device=device)
         txt_freqs = txt_freqs[:txt_seq_len]
-
         template_freq = all_img_freqs[:1]
-
-        cursor = 0
         segment_freqs = []
 
         for size, total_len in zip(image_sizes, image_lengths):
@@ -942,23 +980,25 @@ class ComplextroImageDiT(torch.nn.Module):
                 continue
 
             height, width = size
-            ori_len = height * width
-            local = all_img_freqs[cursor : cursor + ori_len]
-            cursor += ori_len
+            local = self._build_2d_freqs(height, width, device=device)
             if total_len > local.shape[0]:
                 local = torch.cat([local, local[-1:].repeat(total_len - local.shape[0], 1)], dim=0)
             segment_freqs.append(local[:total_len])
 
         if siglip_sizes is not None and siglip_lengths is not None:
-            for size, total_len in zip(siglip_sizes, siglip_lengths):
+            if siglip_ref_sizes is None:
+                siglip_ref_sizes = [None] * len(siglip_sizes)
+            for size, ref_size, total_len in zip(siglip_sizes, siglip_ref_sizes, siglip_lengths):
                 if size is None:
                     segment_freqs.append(template_freq.repeat(total_len, 1))
                     continue
 
-                height, width = size
-                ori_len = height * width
-                local = all_img_freqs[cursor : cursor + ori_len]
-                cursor += ori_len
+                sig_h, sig_w = size
+                if ref_size is not None:
+                    ref_h, ref_w = ref_size
+                    local = self._build_scaled_siglip_freqs(sig_h, sig_w, ref_h, ref_w, device=device)
+                else:
+                    local = self._build_2d_freqs(sig_h, sig_w, device=device)
                 if total_len > local.shape[0]:
                     local = torch.cat([local, local[-1:].repeat(total_len - local.shape[0], 1)], dim=0)
                 segment_freqs.append(local[:total_len])
@@ -1099,13 +1139,15 @@ class ComplextroImageDiT(torch.nn.Module):
                     local_noise_flag = noise_flags[img_idx]
                     if img is None:
                         pad_len = SEQ_MULTI_OF
-                        image_tokens_list.append(torch.zeros((pad_len, self.img_in.in_features), device=prompt_emb.device, dtype=prompt_emb.dtype))
+                        image_tokens_list.append(
+                            self.image_pad_token.to(device=prompt_emb.device, dtype=prompt_emb.dtype).repeat(pad_len, 1)
+                        )
                         size_list.append(None)
                         length_list.append(pad_len)
                         image_token_noise_mask.extend([local_noise_flag] * pad_len)
                         continue
                     tokens, (h, w) = self._flatten_latent(img)
-                    tokens, _, total_len = self._pad_tokens(tokens)
+                    tokens, _, total_len = self._pad_tokens(tokens, pad_token=self.image_pad_token)
                     image_tokens_list.append(tokens)
                     size_list.append((h, w))
                     length_list.append(total_len)
@@ -1149,24 +1191,46 @@ class ComplextroImageDiT(torch.nn.Module):
                 if siglip_feats is not None:
                     if self.siglip_embedder is None:
                         raise ValueError("siglip_feats provided but siglip_feat_dim is None.")
-                    sig_list = []
+                    sig_raw_list = []
+                    sig_raw_lens = []
                     for sig_idx, sig in enumerate(siglip_feats[b]):
                         local_noise_flag = noise_flags[sig_idx] if sig_idx < len(noise_flags) else noise_flags[-1]
                         if sig is None:
                             pad_len = SEQ_MULTI_OF
-                            sig_list.append(torch.zeros((pad_len, self.siglip_feat_dim), device=prompt_emb.device, dtype=prompt_emb.dtype))
                             sig_shapes.append(None)
                             sig_lengths.append(pad_len)
                             sig_token_noise_mask.extend([local_noise_flag] * pad_len)
                             continue
                         sig_tok, (sh, sw) = self._flatten_siglip(sig)
-                        sig_tok, _, sig_total_len = self._pad_tokens(sig_tok)
-                        sig_list.append(sig_tok)
+                        sig_raw_list.append(sig_tok)
+                        sig_raw_lens.append(sig_tok.shape[0])
                         sig_shapes.append((sh, sw))
+                        sig_total_len = sig_tok.shape[0] + ((-sig_tok.shape[0]) % SEQ_MULTI_OF)
                         sig_lengths.append(sig_total_len)
                         sig_token_noise_mask.extend([local_noise_flag] * sig_total_len)
+
+                    embedded_sig_chunks = []
+                    if len(sig_raw_list) > 0:
+                        sig_tokens_raw = torch.cat(sig_raw_list, dim=0)
+                        sig_tokens_raw = self.siglip_embedder(sig_tokens_raw)
+                        embedded_sig_chunks = list(sig_tokens_raw.split(sig_raw_lens, dim=0))
+
+                    sig_list = []
+                    sig_chunk_idx = 0
+                    for sig_shape, sig_total_len in zip(sig_shapes, sig_lengths):
+                        if sig_shape is None:
+                            sig_list.append(
+                                self.siglip_pad_token.to(device=prompt_emb.device, dtype=image_tokens.dtype).repeat(
+                                    sig_total_len, 1
+                                )
+                            )
+                            continue
+                        sig_tok = embedded_sig_chunks[sig_chunk_idx]
+                        sig_chunk_idx += 1
+                        sig_tok, _, _ = self._pad_tokens(sig_tok, pad_token=self.siglip_pad_token)
+                        sig_list.append(sig_tok)
+
                     sig_tokens = torch.cat(sig_list, dim=0)
-                    sig_tokens = self.siglip_embedder(sig_tokens)
                     for block in self.siglip_refiner:
                         sig_tokens = gradient_checkpoint_forward(
                             block,
@@ -1183,6 +1247,7 @@ class ComplextroImageDiT(torch.nn.Module):
                     device=prompt_emb.device,
                     siglip_sizes=sig_shapes if sig_tokens is not None else None,
                     siglip_lengths=sig_lengths if sig_tokens is not None else None,
+                    siglip_ref_sizes=size_list if sig_tokens is not None else None,
                 )
 
                 txt_token_noise_mask = [0] * txt_seq_len
