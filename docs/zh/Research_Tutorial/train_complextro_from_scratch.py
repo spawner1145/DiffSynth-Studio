@@ -212,18 +212,18 @@ if __name__ == "__main__":
 
     data_file_keys = ("image", "edit_image", "condition_images") if train_omni else ("image",)
 
-    train_resolution = (768, 768)
-    max_bucket_reso = 2048
+    train_resolution = (256, 256)
+    max_bucket_reso = 512
     dataset = UnifiedDataset(
         base_path="/root/autodl-tmp/DiffSynth-Studio/danbooru/images",
-        metadata_path="/root/autodl-tmp/DiffSynth-Studio/danbooru/metadata.csv",
+        metadata_path="/root/autodl-tmp/DiffSynth-Studio/danbooru/metadata_merged.csv",
         max_data_items=10000000,
         data_file_keys=data_file_keys,
         enable_bucket=True,
         bucket_no_upscale=False,
-        min_bucket_reso=256,
+        min_bucket_reso=128,
         max_bucket_reso=max_bucket_reso,
-        bucket_reso_steps=64,
+        bucket_reso_steps=16,
         bucket_data_key="image",
         bucket_base_reso=train_resolution,
         main_data_operator=UnifiedDataset.default_image_operator(
