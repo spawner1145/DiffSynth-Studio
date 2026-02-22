@@ -72,6 +72,7 @@ def build_complextro_pipe(
 if __name__ == "__main__":
     device = "cuda"
     dtype = torch.bfloat16
+    # 需要和训练时候配置一样
     complextro_model_config = {
         "num_layers": 6,
         "num_refiner_layers": 0,
@@ -105,14 +106,14 @@ if __name__ == "__main__":
             num_inference_steps=30,
             cfg_scale=7.0,
             seed=seed,
-            height=768,
-            width=768,
+            height=256,
+            width=256,
             omni_mode=False,
         )
         image.save(f"complextro_image_{seed}.jpg")
 
-    # Omni 示例（可选）
-    # 使用前请先加载 SigLIP 模型（build_complextro_pipe 里传 siglip_model_file），并准备条件图。
+    # Omni 示例
+    # 使用前先加载 SigLIP 模型（build_complextro_pipe 里传 siglip_model_file），并准备条件图。
     # cond_images = [Image.open("cond1.jpg").convert("RGB"), Image.open("cond2.jpg").convert("RGB")]
     # omni_out = pipe(
     #     prompt="keep subject identity, turn into anime style",
@@ -120,8 +121,8 @@ if __name__ == "__main__":
     #     num_inference_steps=30,
     #     cfg_scale=7.0,
     #     seed=123,
-    #     height=768,
-    #     width=768,
+    #     height=256,
+    #     width=256,
     #     omni_mode=True,
     #     edit_image=cond_images,
     #     image_noise_mask=[0, 0, 1],

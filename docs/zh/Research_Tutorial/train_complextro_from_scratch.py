@@ -198,8 +198,9 @@ if __name__ == "__main__":
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=1)
     train_omni = False
 
-    # 1B 近似配置示例（基于当前架构的经验缩放）
+    # 1.05 B 配置
     # 你也可以改成更深更宽；需要满足 hidden_size = num_attention_heads * attention_head_dim
+    # 默认是num_layers=60，num_refiner_layers=2的配置
     complextro_model_config = {
         "num_layers": 6,
         "num_refiner_layers": 0,
@@ -241,7 +242,7 @@ if __name__ == "__main__":
         complextro_model_config=complextro_model_config,
     )
     model_logger = ModelLogger(
-        "models/Complextro/v1",
+        "models/Complextro/v1", # dit输出文件夹
         remove_prefix_in_ckpt="pipe.dit.",
     )
 
@@ -250,12 +251,14 @@ if __name__ == "__main__":
         dataset,
         model,
         model_logger,
-        batch_size=64,
-        learning_rate=2e-4,
-        optimizer_type="pytorch_optimizer.Adan",
+        batch_size=10,
+        learning_rate=1e-4,
+        optimizer_type="adamw",
         lr_scheduler_type="constant",
         lr_warmup_steps=0,
+        max_grad_norm=1.0,
         num_workers=4,
+        #save_steps=50000,
         save_epochs=5,
         num_epochs=99999999999,
     )
