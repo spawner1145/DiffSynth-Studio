@@ -1160,6 +1160,13 @@ class ComplextroImageDiT(torch.nn.Module):
                     conditioning_noisy[b : b + 1],
                     conditioning_clean[b : b + 1],
                 )
+                image_freqs_for_refiner, _ = self._build_omni_image_freqs(
+                    image_sizes=size_list,
+                    image_lengths=length_list,
+                    txt_seq_len=1,
+                    device=prompt_emb.device,
+                )
+                image_freqs_for_refiner = image_freqs_for_refiner.unsqueeze(0)
 
                 for block in self.noise_refiner:
                     image_tokens = gradient_checkpoint_forward(
@@ -1168,6 +1175,7 @@ class ComplextroImageDiT(torch.nn.Module):
                         use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
                         hidden_states=image_tokens.unsqueeze(0),
                         temb=image_temb,
+                        image_rotary_emb=image_freqs_for_refiner,
                     ).squeeze(0)
 
                 txt_seq_len = (
@@ -1176,12 +1184,21 @@ class ComplextroImageDiT(torch.nn.Module):
                     else text_tokens.shape[1]
                 )
                 text_tokens_b = text_tokens[b : b + 1, :txt_seq_len]
+
+                _, txt_freqs_for_refiner = self._build_omni_image_freqs(
+                    image_sizes=size_list,
+                    image_lengths=length_list,
+                    txt_seq_len=txt_seq_len,
+                    device=prompt_emb.device,
+                )
+                txt_freqs_for_refiner = txt_freqs_for_refiner[:txt_seq_len].unsqueeze(0)
                 for block in self.context_refiner:
                     text_tokens_b = gradient_checkpoint_forward(
                         block,
                         use_gradient_checkpointing=use_gradient_checkpointing,
                         use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
                         hidden_states=text_tokens_b,
+                        image_rotary_emb=txt_freqs_for_refiner,
                     )
 
                 sig_tokens = None
@@ -1231,12 +1248,23 @@ class ComplextroImageDiT(torch.nn.Module):
                         sig_list.append(sig_tok)
 
                     sig_tokens = torch.cat(sig_list, dim=0)
+                    sig_freqs_for_refiner, _ = self._build_omni_image_freqs(
+                        image_sizes=[],
+                        image_lengths=[],
+                        txt_seq_len=1,
+                        device=prompt_emb.device,
+                        siglip_sizes=sig_shapes,
+                        siglip_lengths=sig_lengths,
+                        siglip_ref_sizes=size_list,
+                    )
+                    sig_freqs_for_refiner = sig_freqs_for_refiner.unsqueeze(0)
                     for block in self.siglip_refiner:
                         sig_tokens = gradient_checkpoint_forward(
                             block,
                             use_gradient_checkpointing=use_gradient_checkpointing,
                             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
                             hidden_states=sig_tokens.unsqueeze(0),
+                            image_rotary_emb=sig_freqs_for_refiner,
                         ).squeeze(0)
 
                 txt_seq_lens = [txt_seq_len]
@@ -1317,6 +1345,40 @@ class ComplextroImageDiT(torch.nn.Module):
         text_tokens = self.txt_in(self.txt_norm(prompt_emb))
         image_tokens = self.img_in(image_tokens)
 
+        txt_seq_lens = (
+            [int(v) for v in prompt_emb_mask.sum(dim=1).tolist()]
+            if prompt_emb_mask is not None
+            else [text_tokens.shape[1]] * text_tokens.shape[0]
+        )
+        max_txt_len = max(txt_seq_lens)
+        text_tokens = text_tokens[:, :max_txt_len]
+
+        text_key_mask = None
+        if prompt_emb_mask is not None:
+            text_key_mask = torch.zeros(
+                (len(txt_seq_lens), 1, 1, max_txt_len),
+                device=text_tokens.device,
+                dtype=text_tokens.dtype,
+            )
+            for i, txt_len in enumerate(txt_seq_lens):
+                if txt_len < max_txt_len:
+                    text_key_mask[i, 0, 0, txt_len:] = float("-inf")
+
+        text_freqs_list = []
+        for txt_len in txt_seq_lens:
+            _, txt_freqs = self.pos_embed([(1, latent_h, latent_w)], [int(txt_len)], device=image_tokens.device)
+            text_freqs_list.append(txt_freqs[: int(txt_len)])
+        text_freqs_for_refiner = pad_sequence(text_freqs_list, batch_first=True, padding_value=0.0)
+
+        x_seqlen = image_tokens.shape[1]
+        image_freqs_single = self._build_2d_freqs(latent_h, latent_w, device=image_tokens.device)
+        if x_seqlen > image_freqs_single.shape[0]:
+            image_freqs_single = torch.cat(
+                [image_freqs_single, image_freqs_single[-1:].repeat(x_seqlen - image_freqs_single.shape[0], 1)],
+                dim=0,
+            )
+        image_freqs_for_refiner = image_freqs_single[:x_seqlen].unsqueeze(0).repeat(image_tokens.shape[0], 1, 1)
+
         conditioning = self.time_text_embed(timestep, image_tokens.dtype)
 
         # Refine image tokens (noise) and text tokens (context)
@@ -1327,6 +1389,7 @@ class ComplextroImageDiT(torch.nn.Module):
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
                 hidden_states=image_tokens,
                 temb=conditioning,
+                image_rotary_emb=image_freqs_for_refiner,
             )
 
         for block in self.context_refiner:
@@ -1335,6 +1398,8 @@ class ComplextroImageDiT(torch.nn.Module):
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
                 hidden_states=text_tokens,
+                image_rotary_emb=text_freqs_for_refiner,
+                attention_mask=text_key_mask,
             )
 
         # SigLIP vision feats (optional)
@@ -1358,21 +1423,19 @@ class ComplextroImageDiT(torch.nn.Module):
                 raise ValueError("siglip_feats must be 3D (B,S,C) or 4D (B,H,W,C).")
 
             siglip_tokens = self.siglip_embedder(siglip_tokens)
+            siglip_freqs_for_refiner = self._build_2d_freqs(siglip_shape[1], siglip_shape[2], device=image_tokens.device)
+            siglip_freqs_for_refiner = siglip_freqs_for_refiner[:siglip_tokens.shape[1]]
+            siglip_freqs_for_refiner = siglip_freqs_for_refiner.unsqueeze(0).repeat(siglip_tokens.shape[0], 1, 1)
             for block in self.siglip_refiner:
                 siglip_tokens = gradient_checkpoint_forward(
                     block,
                     use_gradient_checkpointing=use_gradient_checkpointing,
                     use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
                     hidden_states=siglip_tokens,
+                    image_rotary_emb=siglip_freqs_for_refiner,
                 )
 
         # RoPE for unified sequence (text + image + optional siglip)
-        txt_seq_lens = (
-            prompt_emb_mask.sum(dim=1).tolist()
-            if prompt_emb_mask is not None
-            else [text_tokens.shape[1]] * text_tokens.shape[0]
-        )
-
         # Align basic unified order with z_image_dit: [x, cap]
         # (keep optional siglip support by appending after cap when present)
         unified_list = []
