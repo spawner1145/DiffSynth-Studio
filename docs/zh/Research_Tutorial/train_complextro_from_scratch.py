@@ -199,7 +199,7 @@ if __name__ == "__main__":
     train_omni = False
 
     # 1.05 B 配置
-    # 你也可以改成更深更宽；需要满足 hidden_size = num_attention_heads * attention_head_dim
+    # 你也可以改成更深更宽(一般是直接改num_layers和num_refiner_layers)；需要满足 hidden_size = num_attention_heads * attention_head_dim
     # 默认是num_layers=60，num_refiner_layers=2的配置
     complextro_model_config = {
         "num_layers": 6,
