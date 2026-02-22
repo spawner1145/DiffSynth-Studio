@@ -200,7 +200,7 @@ class ComplextroUnit_PromptEmbedder(PipelineUnit):
             output_hidden_states=True,
             use_cache=False,
         )
-        prompt_emb = output.hidden_states[-1].to(dtype=pipe.torch_dtype, device=pipe.device)
+        prompt_emb = output.hidden_states[-2].to(dtype=pipe.torch_dtype, device=pipe.device) # 暂时保留意见，-1好像效果一般
         prompt_emb_mask = model_inputs.attention_mask.to(device=pipe.device, dtype=torch.long)
         return {"prompt_emb": prompt_emb, "prompt_emb_mask": prompt_emb_mask}
 
