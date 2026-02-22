@@ -891,17 +891,53 @@ class ComplextroImageDiT(torch.nn.Module):
         seq_lens: List[int],
         dtype: torch.dtype,
         device: torch.device,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        token_valid_masks: Optional[List[torch.Tensor]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         max_len = max(seq_lens)
         unified = pad_sequence(unified_list, batch_first=True, padding_value=0.0)
         unified_freqs = pad_sequence(freqs_list, batch_first=True, padding_value=0.0)
 
-        key_mask = torch.zeros((len(seq_lens), 1, 1, max_len), device=device, dtype=dtype)
-        for i, seq_len in enumerate(seq_lens):
-            if seq_len < max_len:
-                key_mask[i, 0, 0, seq_len:] = float("-inf")
+        key_mask = None
+        has_batch_padding = any(seq_len < max_len for seq_len in seq_lens)
+        has_internal_padding = False
+        if token_valid_masks is not None:
+            has_internal_padding = any((~valid_mask.bool()).any().item() for valid_mask in token_valid_masks)
+
+        if has_batch_padding or has_internal_padding:
+            key_mask = torch.zeros((len(seq_lens), 1, 1, max_len), device=device, dtype=dtype)
+            for i, seq_len in enumerate(seq_lens):
+                if token_valid_masks is not None:
+                    valid_mask = token_valid_masks[i].to(device=device).bool()
+                    invalid_index = torch.nonzero(~valid_mask, as_tuple=False).squeeze(-1)
+                    if invalid_index.numel() > 0:
+                        key_mask[i, 0, 0, invalid_index] = float("-inf")
+                if seq_len < max_len:
+                    key_mask[i, 0, 0, seq_len:] = float("-inf")
 
         return unified, unified_freqs, key_mask
+
+    @staticmethod
+    def _build_segmented_key_mask(
+        original_lengths: List[int],
+        padded_lengths: List[int],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> Optional[torch.Tensor]:
+        if len(original_lengths) != len(padded_lengths):
+            raise ValueError("original_lengths and padded_lengths must have same length.")
+
+        if all(ori_len == pad_len for ori_len, pad_len in zip(original_lengths, padded_lengths)):
+            return None
+
+        total_len = sum(padded_lengths)
+        key_mask = torch.zeros((1, 1, 1, total_len), device=device, dtype=dtype)
+        offset = 0
+        for ori_len, pad_len in zip(original_lengths, padded_lengths):
+            if ori_len < pad_len:
+                key_mask[:, :, :, offset + ori_len : offset + pad_len] = float("-inf")
+            offset += pad_len
+
+        return key_mask
 
     @staticmethod
     def _resolve_omni_image_noise_flags(
@@ -1120,10 +1156,30 @@ class ComplextroImageDiT(torch.nn.Module):
             unified_list = []
             freqs_list = []
             temb_list = []
+            valid_masks_list = []
             seq_lens = []
             x_sizes = []
             x_lengths = []
             x_pos_offsets = []
+
+            prepared_image_tokens = []
+            prepared_image_freqs_for_refiner = []
+            prepared_image_temb = []
+            prepared_image_noise_masks = []
+            prepared_image_valid_masks = []
+            prepared_size_lists = []
+            prepared_length_lists = []
+
+            prepared_sig_tokens = []
+            prepared_sig_freqs_for_refiner = []
+            prepared_sig_shapes = []
+            prepared_sig_lengths = []
+            prepared_sig_noise_masks = []
+            prepared_sig_valid_masks = []
+
+            prepared_txt_tokens = []
+            prepared_txt_freqs_for_refiner = []
+            prepared_txt_seq_lens = []
 
             for b in range(batch_size):
                 noise_flags = self._resolve_omni_image_noise_flags(
@@ -1135,6 +1191,7 @@ class ComplextroImageDiT(torch.nn.Module):
                 size_list = []
                 length_list = []
                 image_token_noise_mask = []
+                image_token_valid_mask = []
                 for img_idx, img in enumerate(latents[b]):
                     local_noise_flag = noise_flags[img_idx]
                     if img is None:
@@ -1145,13 +1202,15 @@ class ComplextroImageDiT(torch.nn.Module):
                         size_list.append(None)
                         length_list.append(pad_len)
                         image_token_noise_mask.extend([local_noise_flag] * pad_len)
+                        image_token_valid_mask.extend([0] * pad_len)
                         continue
                     tokens, (h, w) = self._flatten_latent(img)
-                    tokens, _, total_len = self._pad_tokens(tokens, pad_token=self.image_pad_token)
+                    tokens, original_len, total_len = self._pad_tokens(tokens, pad_token=self.image_pad_token)
                     image_tokens_list.append(tokens)
                     size_list.append((h, w))
                     length_list.append(total_len)
                     image_token_noise_mask.extend([local_noise_flag] * total_len)
+                    image_token_valid_mask.extend([1] * original_len + [0] * (total_len - original_len))
 
                 image_tokens = torch.cat(image_tokens_list, dim=0)
                 image_tokens = self.img_in(image_tokens)
@@ -1166,17 +1225,8 @@ class ComplextroImageDiT(torch.nn.Module):
                     txt_seq_len=1,
                     device=prompt_emb.device,
                 )
-                image_freqs_for_refiner = image_freqs_for_refiner.unsqueeze(0)
-
-                for block in self.noise_refiner:
-                    image_tokens = gradient_checkpoint_forward(
-                        block,
-                        use_gradient_checkpointing=use_gradient_checkpointing,
-                        use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-                        hidden_states=image_tokens.unsqueeze(0),
-                        temb=image_temb,
-                        image_rotary_emb=image_freqs_for_refiner,
-                    ).squeeze(0)
+                prepared_image_freqs_for_refiner.append(image_freqs_for_refiner)
+                prepared_image_temb.append(image_temb.squeeze(0))
 
                 txt_seq_len = (
                     int(prompt_emb_mask[b].sum().item())
@@ -1192,19 +1242,15 @@ class ComplextroImageDiT(torch.nn.Module):
                     device=prompt_emb.device,
                 )
                 txt_freqs_for_refiner = txt_freqs_for_refiner[:txt_seq_len].unsqueeze(0)
-                for block in self.context_refiner:
-                    text_tokens_b = gradient_checkpoint_forward(
-                        block,
-                        use_gradient_checkpointing=use_gradient_checkpointing,
-                        use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-                        hidden_states=text_tokens_b,
-                        image_rotary_emb=txt_freqs_for_refiner,
-                    )
+                prepared_txt_tokens.append(text_tokens_b)
+                prepared_txt_freqs_for_refiner.append(txt_freqs_for_refiner)
+                prepared_txt_seq_lens.append(txt_seq_len)
 
                 sig_tokens = None
                 sig_shapes = []
                 sig_lengths = []
                 sig_token_noise_mask = []
+                sig_token_valid_mask = []
                 if siglip_feats is not None:
                     if self.siglip_embedder is None:
                         raise ValueError("siglip_feats provided but siglip_feat_dim is None.")
@@ -1217,14 +1263,17 @@ class ComplextroImageDiT(torch.nn.Module):
                             sig_shapes.append(None)
                             sig_lengths.append(pad_len)
                             sig_token_noise_mask.extend([local_noise_flag] * pad_len)
+                            sig_token_valid_mask.extend([0] * pad_len)
                             continue
                         sig_tok, (sh, sw) = self._flatten_siglip(sig)
                         sig_raw_list.append(sig_tok)
                         sig_raw_lens.append(sig_tok.shape[0])
                         sig_shapes.append((sh, sw))
-                        sig_total_len = sig_tok.shape[0] + ((-sig_tok.shape[0]) % SEQ_MULTI_OF)
+                        sig_original_len = sig_tok.shape[0]
+                        sig_total_len = sig_original_len + ((-sig_original_len) % SEQ_MULTI_OF)
                         sig_lengths.append(sig_total_len)
                         sig_token_noise_mask.extend([local_noise_flag] * sig_total_len)
+                        sig_token_valid_mask.extend([1] * sig_original_len + [0] * (sig_total_len - sig_original_len))
 
                     embedded_sig_chunks = []
                     if len(sig_raw_list) > 0:
@@ -1257,17 +1306,117 @@ class ComplextroImageDiT(torch.nn.Module):
                         siglip_lengths=sig_lengths,
                         siglip_ref_sizes=size_list,
                     )
-                    sig_freqs_for_refiner = sig_freqs_for_refiner.unsqueeze(0)
-                    for block in self.siglip_refiner:
-                        sig_tokens = gradient_checkpoint_forward(
-                            block,
-                            use_gradient_checkpointing=use_gradient_checkpointing,
-                            use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-                            hidden_states=sig_tokens.unsqueeze(0),
-                            image_rotary_emb=sig_freqs_for_refiner,
-                        ).squeeze(0)
+                    prepared_sig_freqs_for_refiner.append(sig_freqs_for_refiner)
+                else:
+                    prepared_sig_freqs_for_refiner.append(None)
 
-                txt_seq_lens = [txt_seq_len]
+                prepared_image_tokens.append(image_tokens)
+                prepared_image_noise_masks.append(image_token_noise_mask)
+                prepared_image_valid_masks.append(image_token_valid_mask)
+                prepared_size_lists.append(size_list)
+                prepared_length_lists.append(length_list)
+
+                prepared_sig_tokens.append(sig_tokens)
+                prepared_sig_shapes.append(sig_shapes)
+                prepared_sig_lengths.append(sig_lengths)
+                prepared_sig_noise_masks.append(sig_token_noise_mask)
+                prepared_sig_valid_masks.append(sig_token_valid_mask)
+
+            prepared_image_valid_mask_tensors = [
+                torch.tensor(mask, dtype=torch.bool, device=prompt_emb.device)
+                for mask in prepared_image_valid_masks
+            ]
+
+            image_refiner_seq_lens = [sum(length_list) for length_list in prepared_length_lists]
+            batched_image_tokens, batched_image_freqs_for_refiner, image_refiner_key_mask = self._build_padded_unified(
+                prepared_image_tokens,
+                prepared_image_freqs_for_refiner,
+                image_refiner_seq_lens,
+                dtype=text_tokens.dtype,
+                device=prompt_emb.device,
+                token_valid_masks=prepared_image_valid_mask_tensors,
+            )
+            batched_image_temb = pad_sequence(prepared_image_temb, batch_first=True, padding_value=0.0)
+            for block in self.noise_refiner:
+                batched_image_tokens = gradient_checkpoint_forward(
+                    block,
+                    use_gradient_checkpointing=use_gradient_checkpointing,
+                    use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+                    hidden_states=batched_image_tokens,
+                    temb=batched_image_temb,
+                    image_rotary_emb=batched_image_freqs_for_refiner,
+                    attention_mask=image_refiner_key_mask,
+                )
+
+            for b in range(batch_size):
+                image_len = image_refiner_seq_lens[b]
+                prepared_image_tokens[b] = batched_image_tokens[b, :image_len, :]
+
+            if siglip_feats is not None and self.siglip_refiner is not None:
+                sig_refiner_seq_lens = [sum(lengths) for lengths in prepared_sig_lengths]
+                prepared_sig_valid_mask_tensors = [
+                    torch.tensor(mask, dtype=torch.bool, device=prompt_emb.device)
+                    for mask in prepared_sig_valid_masks
+                ]
+                sig_freqs_for_batch = []
+                for idx, freqs in enumerate(prepared_sig_freqs_for_refiner):
+                    if freqs is None:
+                        raise ValueError(f"Missing siglip refiner frequencies for sample {idx} in omni mode.")
+                    sig_freqs_for_batch.append(freqs)
+                batched_sig_tokens, batched_sig_freqs_for_refiner, sig_refiner_key_mask = self._build_padded_unified(
+                    prepared_sig_tokens,
+                    sig_freqs_for_batch,
+                    sig_refiner_seq_lens,
+                    dtype=text_tokens.dtype,
+                    device=prompt_emb.device,
+                    token_valid_masks=prepared_sig_valid_mask_tensors,
+                )
+                for block in self.siglip_refiner:
+                    batched_sig_tokens = gradient_checkpoint_forward(
+                        block,
+                        use_gradient_checkpointing=use_gradient_checkpointing,
+                        use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+                        hidden_states=batched_sig_tokens,
+                        image_rotary_emb=batched_sig_freqs_for_refiner,
+                        attention_mask=sig_refiner_key_mask,
+                    )
+
+                for b in range(batch_size):
+                    sig_len = sig_refiner_seq_lens[b]
+                    prepared_sig_tokens[b] = batched_sig_tokens[b, :sig_len, :]
+
+            text_refiner_seq_lens = [int(v) for v in prepared_txt_seq_lens]
+            batched_text_tokens, batched_text_freqs_for_refiner, text_refiner_key_mask = self._build_padded_unified(
+                prepared_txt_tokens,
+                prepared_txt_freqs_for_refiner,
+                text_refiner_seq_lens,
+                dtype=text_tokens.dtype,
+                device=prompt_emb.device,
+            )
+            for block in self.context_refiner:
+                batched_text_tokens = gradient_checkpoint_forward(
+                    block,
+                    use_gradient_checkpointing=use_gradient_checkpointing,
+                    use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+                    hidden_states=batched_text_tokens,
+                    image_rotary_emb=batched_text_freqs_for_refiner,
+                    attention_mask=text_refiner_key_mask,
+                )
+
+            for b in range(batch_size):
+                txt_seq_len = text_refiner_seq_lens[b]
+                text_tokens_b = batched_text_tokens[b, :txt_seq_len, :]
+                image_tokens = prepared_image_tokens[b]
+                image_token_noise_mask = prepared_image_noise_masks[b]
+                image_token_valid_mask = prepared_image_valid_masks[b]
+                size_list = prepared_size_lists[b]
+                length_list = prepared_length_lists[b]
+                sig_tokens = prepared_sig_tokens[b]
+                sig_shapes = prepared_sig_shapes[b]
+                sig_lengths = prepared_sig_lengths[b]
+                sig_token_noise_mask = prepared_sig_noise_masks[b]
+                sig_token_valid_mask = prepared_sig_valid_masks[b]
+
                 img_freqs, txt_freqs = self._build_omni_image_freqs(
                     image_sizes=size_list,
                     image_lengths=length_list,
@@ -1280,6 +1429,7 @@ class ComplextroImageDiT(torch.nn.Module):
 
                 txt_token_noise_mask = [0] * txt_seq_len
                 unified_token_noise_mask = txt_token_noise_mask + image_token_noise_mask + sig_token_noise_mask
+                unified_token_valid_mask = [1] * txt_seq_len + image_token_valid_mask + sig_token_valid_mask
                 unified_temb = self._build_per_token_temb(
                     unified_token_noise_mask,
                     conditioning_noisy[b : b + 1],
@@ -1287,12 +1437,13 @@ class ComplextroImageDiT(torch.nn.Module):
                 ).squeeze(0)
 
                 # Align omni unified order with z_image_dit: [cap, x, siglip]
-                unified = torch.cat([text_tokens_b.squeeze(0), image_tokens] + ([sig_tokens] if sig_tokens is not None else []), dim=0)
+                unified = torch.cat([text_tokens_b, image_tokens] + ([sig_tokens] if sig_tokens is not None else []), dim=0)
                 unified_freqs = torch.cat([txt_freqs, img_freqs], dim=0)
 
                 unified_list.append(unified)
                 freqs_list.append(unified_freqs)
                 temb_list.append(unified_temb)
+                valid_masks_list.append(torch.tensor(unified_token_valid_mask, dtype=torch.bool, device=prompt_emb.device))
                 seq_lens.append(unified.shape[0])
                 x_sizes.append(size_list)
                 x_lengths.append(length_list)
@@ -1304,6 +1455,7 @@ class ComplextroImageDiT(torch.nn.Module):
                 seq_lens,
                 dtype=text_tokens.dtype,
                 device=prompt_emb.device,
+                token_valid_masks=valid_masks_list,
             )
             unified_temb = pad_sequence(temb_list, batch_first=True, padding_value=0.0)
 
@@ -1355,14 +1507,15 @@ class ComplextroImageDiT(torch.nn.Module):
 
         text_key_mask = None
         if prompt_emb_mask is not None:
-            text_key_mask = torch.zeros(
-                (len(txt_seq_lens), 1, 1, max_txt_len),
-                device=text_tokens.device,
-                dtype=text_tokens.dtype,
-            )
-            for i, txt_len in enumerate(txt_seq_lens):
-                if txt_len < max_txt_len:
-                    text_key_mask[i, 0, 0, txt_len:] = float("-inf")
+            if any(txt_len < max_txt_len for txt_len in txt_seq_lens):
+                text_key_mask = torch.zeros(
+                    (len(txt_seq_lens), 1, 1, max_txt_len),
+                    device=text_tokens.device,
+                    dtype=text_tokens.dtype,
+                )
+                for i, txt_len in enumerate(txt_seq_lens):
+                    if txt_len < max_txt_len:
+                        text_key_mask[i, 0, 0, txt_len:] = float("-inf")
 
         text_freqs_list = []
         for txt_len in txt_seq_lens:
