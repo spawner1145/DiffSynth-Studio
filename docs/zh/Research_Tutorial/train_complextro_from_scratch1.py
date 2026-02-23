@@ -23,6 +23,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/qwen3/model.safetensors",
         flux2_vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
         qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3",
+        complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e3-s10059.safetensors",
         train_omni: bool = False,
         complextro_model_config: Optional[dict] = None,
     ):
@@ -49,7 +50,17 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         self.pipe.tokenizer = AutoTokenizer.from_pretrained(qwen_tokenizer_dir)
 
         self.pipe.vram_management_enabled = self.pipe.check_vram_management_state()
-        self.pipe.dit = ComplextroImageDiT(**self.complextro_model_config).to(dtype=torch.bfloat16, device=device)
+        
+        if complextro_dit_file:
+            self.pipe.dit = load_model(
+                ComplextroImageDiT,
+                complextro_dit_file,
+                config=self.complextro_model_config,
+                torch_dtype=torch.bfloat16,
+                device=device,
+            )
+        else:
+            self.pipe.dit = ComplextroImageDiT(**self.complextro_model_config).to(dtype=torch.bfloat16, device=device)
 
         text_hidden_size = int(self.pipe.text_encoder.model.config.hidden_size)
         dit_text_dim = int(self.pipe.dit.txt_in.in_features)
@@ -208,7 +219,7 @@ if __name__ == "__main__":
         "num_attention_heads": 24,
         "attention_head_dim": 128,
         "rope_axes_dim": [16, 56, 56],
-        "enable_tread_routing": False,
+        "enable_tread_routing": True,
         "tread_routes": [
             {
                 "selection_ratio": 0.5,
