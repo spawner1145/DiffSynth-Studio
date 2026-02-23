@@ -1,7 +1,16 @@
 import os, math, ast, importlib, time, torch
+import argparse
+from typing import Any, Callable, Optional, Tuple
 from multiprocessing import Value
 from tqdm import tqdm
 from accelerate import Accelerator
+from torch.optim import Optimizer
+import transformers
+from diffusers.optimization import (
+    SchedulerType as DiffusersSchedulerType,
+    TYPE_TO_SCHEDULER_FUNCTION as DIFFUSERS_TYPE_TO_SCHEDULER_FUNCTION,
+)
+from transformers.optimization import SchedulerType, TYPE_TO_SCHEDULER_FUNCTION
 from .training_module import DiffusionTrainingModule
 from .logger import ModelLogger
 
@@ -49,95 +58,477 @@ def _resolve_attr_case_insensitive(module, attr_name):
     raise AttributeError(f"Cannot find {attr_name} in module {module.__name__}")
 
 
-def _build_optimizer(
-    optimizer_type,
-    trainable_params,
-    learning_rate,
-    weight_decay,
-    optimizer_kwargs=None,
-    optimizer_args=None,
-):
-    optimizer_type = "AdamW" if optimizer_type in [None, ""] else optimizer_type
-    optimizer_kwargs = {} if optimizer_kwargs is None else dict(optimizer_kwargs)
-    optimizer_kwargs.update(_parse_kv_args(optimizer_args))
+def get_optimizer(args, trainable_params) -> Tuple[str, str, object]:
+    # "Optimizer to use: AdamW, AdamW8bit, Lion, SGDNesterov, SGDNesterov8bit, PagedAdamW, PagedAdamW8bit, PagedAdamW32bit, Lion8bit, PagedLion8bit, AdEMAMix8bit, PagedAdEMAMix8bit, DAdaptation(DAdaptAdamPreprint), DAdaptAdaGrad, DAdaptAdam, DAdaptAdan, DAdaptAdanIP, DAdaptLion, DAdaptSGD, Adafactor"
 
-    optimizer_type_lower = optimizer_type.lower()
-    if optimizer_type_lower == "adamw":
-        optimizer_kwargs.setdefault("weight_decay", weight_decay)
+    optimizer_type = args.optimizer_type
+    if args.use_8bit_adam:
+        assert (
+            not args.use_lion_optimizer
+        ), "both option use_8bit_adam and use_lion_optimizer are specified"
+        assert (
+            optimizer_type is None or optimizer_type == ""
+        ), "both option use_8bit_adam and optimizer_type are specified"
+        optimizer_type = "AdamW8bit"
 
-    if "." in optimizer_type:
-        split = optimizer_type.rfind(".")
-        module = importlib.import_module(optimizer_type[:split])
-        class_name = optimizer_type[split + 1:]
-        optimizer_class = _resolve_attr_case_insensitive(module, class_name)
-    else:
-        optimizer_class = _resolve_attr_case_insensitive(torch.optim, optimizer_type)
+    elif args.use_lion_optimizer:
+        assert (
+            optimizer_type is None or optimizer_type == ""
+        ), "both option use_lion_optimizer and optimizer_type are specified"
+        optimizer_type = "Lion"
 
-    optimizer = optimizer_class(trainable_params, lr=learning_rate, **optimizer_kwargs)
-    return optimizer
+    if optimizer_type is None or optimizer_type == "":
+        optimizer_type = "AdamW"
+    optimizer_type = optimizer_type.lower()
+
+    if args.fused_backward_pass:
+        assert (
+            optimizer_type == "Adafactor".lower()
+        ), "fused_backward_pass currently only works with optimizer_type Adafactor"
+        assert (
+            args.gradient_accumulation_steps == 1
+        ), "fused_backward_pass does not work with gradient_accumulation_steps > 1"
+
+    optimizer_kwargs = {}
+    if args.optimizer_args is not None and len(args.optimizer_args) > 0:
+        for arg in args.optimizer_args:
+            key, value = arg.split("=")
+            value = ast.literal_eval(value)
+            optimizer_kwargs[key] = value
+
+    lr = args.learning_rate
+    optimizer = None
+    optimizer_class = None
+
+    if optimizer_type == "Lion".lower():
+        try:
+            import lion_pytorch
+        except ImportError:
+            raise ImportError("No lion_pytorch")
+        print(f"use Lion optimizer | {optimizer_kwargs}")
+        optimizer_class = lion_pytorch.Lion
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    elif optimizer_type.endswith("8bit".lower()):
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError("No bitsandbytes")
+
+        if optimizer_type == "AdamW8bit".lower():
+            print(f"use 8-bit AdamW optimizer | {optimizer_kwargs}")
+            optimizer_class = bnb.optim.AdamW8bit
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+        elif optimizer_type == "SGDNesterov8bit".lower():
+            print(f"use 8-bit SGD with Nesterov optimizer | {optimizer_kwargs}")
+            if "momentum" not in optimizer_kwargs:
+                print(
+                    f"8-bit SGD with Nesterov must be with momentum, set momentum to 0.9"
+                )
+                optimizer_kwargs["momentum"] = 0.9
+
+            optimizer_class = bnb.optim.SGD8bit
+            optimizer = optimizer_class(trainable_params, lr=lr, nesterov=True, **optimizer_kwargs)
+
+        elif optimizer_type == "Lion8bit".lower():
+            print(f"use 8-bit Lion optimizer | {optimizer_kwargs}")
+            try:
+                optimizer_class = bnb.optim.Lion8bit
+            except AttributeError:
+                raise AttributeError(
+                    "No Lion8bit. The version of bitsandbytes installed seems to be old. Please install 0.38.0 or later."
+                )
+        elif optimizer_type == "PagedAdamW8bit".lower():
+            print(f"use 8-bit PagedAdamW optimizer | {optimizer_kwargs}")
+            try:
+                optimizer_class = bnb.optim.PagedAdamW8bit
+            except AttributeError:
+                raise AttributeError(
+                    "No PagedAdamW8bit. The version of bitsandbytes installed seems to be old. Please install 0.39.0 or later."
+                )
+        elif optimizer_type == "PagedLion8bit".lower():
+            print(f"use 8-bit Paged Lion optimizer | {optimizer_kwargs}")
+            try:
+                optimizer_class = bnb.optim.PagedLion8bit
+            except AttributeError:
+                raise AttributeError(
+                    "No PagedLion8bit. The version of bitsandbytes installed seems to be old. Please install 0.39.0 or later."
+                )
+
+        if optimizer_class is not None:
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    elif optimizer_type == "PagedAdamW".lower():
+        print(f"use PagedAdamW optimizer | {optimizer_kwargs}")
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError("No bitsandby")
+        try:
+            optimizer_class = bnb.optim.PagedAdamW
+        except AttributeError:
+            raise AttributeError(
+                "No PagedAdamW. The version of bitsandbytes installed seems to be old. Please install 0.39.0 or later."
+            )
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    elif optimizer_type == "PagedAdamW32bit".lower():
+        print(f"use 32-bit PagedAdamW optimizer | {optimizer_kwargs}")
+        try:
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError("No bitsandbytes")
+        try:
+            optimizer_class = bnb.optim.PagedAdamW32bit
+        except AttributeError:
+            raise AttributeError(
+                "No PagedAdamW32bit. The version of bitsandbytes installed seems to be old. Please install 0.39.0 or later."
+            )
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    elif optimizer_type == "SGDNesterov".lower():
+        print(f"use SGD with Nesterov optimizer | {optimizer_kwargs}")
+        if "momentum" not in optimizer_kwargs:
+            print(
+                f"SGD with Nesterov must be with momentum, set momentum to 0.9"
+            )
+            optimizer_kwargs["momentum"] = 0.9
+
+        optimizer_class = torch.optim.SGD
+        optimizer = optimizer_class(trainable_params, lr=lr, nesterov=True, **optimizer_kwargs)
+
+    elif optimizer_type.startswith("DAdapt".lower()) or optimizer_type == "Prodigy".lower():
+        # check lr and lr_count, and logger.info warning
+        actual_lr = lr
+        lr_count = 1
+        if type(trainable_params) == list and type(trainable_params[0]) == dict:
+            lrs = set()
+            actual_lr = trainable_params[0].get("lr", actual_lr)
+            for group in trainable_params:
+                lrs.add(group.get("lr", actual_lr))
+            lr_count = len(lrs)
+
+        if actual_lr <= 0.1:
+            print(
+                f"learning rate is too low. If using D-Adaptation or Prodigy, set learning rate around 1.0: lr={actual_lr}"
+            )
+            print("recommend option: lr=1.0")
+        if lr_count > 1:
+            print(
+                f"when multiple learning rates are specified with dadaptation (e.g. for Text Encoder and U-Net), only the first one will take effect: lr={actual_lr}"
+            )
+
+        if optimizer_type.startswith("DAdapt".lower()):
+            # DAdaptation family
+            # check dadaptation is installed
+            try:
+                import dadaptation
+                import dadaptation.experimental as experimental
+            except ImportError:
+                raise ImportError("No dadaptation")
+
+            # set optimizer
+            if optimizer_type == "DAdaptation".lower() or optimizer_type == "DAdaptAdamPreprint".lower():
+                optimizer_class = experimental.DAdaptAdamPreprint
+                print(f"use D-Adaptation AdamPreprint optimizer | {optimizer_kwargs}")
+            elif optimizer_type == "DAdaptAdaGrad".lower():
+                optimizer_class = dadaptation.DAdaptAdaGrad
+                print(f"use D-Adaptation AdaGrad optimizer | {optimizer_kwargs}")
+            elif optimizer_type == "DAdaptAdam".lower():
+                optimizer_class = dadaptation.DAdaptAdam
+                print(f"use D-Adaptation Adam optimizer | {optimizer_kwargs}")
+            elif optimizer_type == "DAdaptAdan".lower():
+                optimizer_class = dadaptation.DAdaptAdan
+                print(f"use D-Adaptation Adan optimizer | {optimizer_kwargs}")
+            elif optimizer_type == "DAdaptAdanIP".lower():
+                optimizer_class = experimental.DAdaptAdanIP
+                print(f"use D-Adaptation AdanIP optimizer | {optimizer_kwargs}")
+            elif optimizer_type == "DAdaptLion".lower():
+                optimizer_class = dadaptation.DAdaptLion
+                print(f"use D-Adaptation Lion optimizer | {optimizer_kwargs}")
+            elif optimizer_type == "DAdaptSGD".lower():
+                optimizer_class = dadaptation.DAdaptSGD
+                print(f"use D-Adaptation SGD optimizer | {optimizer_kwargs}")
+            else:
+                raise ValueError(f"Unknown optimizer type: {optimizer_type}")
+
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+        else:
+            # Prodigy
+            # check Prodigy is installed
+            try:
+                import prodigyopt
+            except ImportError:
+                raise ImportError("No Prodigy")
+
+            print(f"use Prodigy optimizer | {optimizer_kwargs}")
+            optimizer_class = prodigyopt.Prodigy
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    elif optimizer_type == "Adafactor".lower():
+        # 引数を確認して適宜補正する
+        if "relative_step" not in optimizer_kwargs:
+            optimizer_kwargs["relative_step"] = True  # default
+        if not optimizer_kwargs["relative_step"] and optimizer_kwargs.get("warmup_init", False):
+            print(
+                f"set relative_step to True because warmup_init is True"
+            )
+            optimizer_kwargs["relative_step"] = True
+        print(f"use Adafactor optimizer | {optimizer_kwargs}")
+
+        if optimizer_kwargs["relative_step"]:
+            print(f"relative_step is true")
+            if lr != 0.0:
+                print(f"learning rate is used as initial_lr")
+            args.learning_rate = None
+
+            if type(trainable_params) == list and type(trainable_params[0]) == dict:
+                has_group_lr = False
+                for group in trainable_params:
+                    p = group.pop("lr", None)
+                    has_group_lr = has_group_lr or (p is not None)
+
+                if has_group_lr:
+                    print(f"unet_lr and text_encoder_lr are ignored")
+                    args.unet_lr = None
+                    args.text_encoder_lr = None
+
+            if args.lr_scheduler != "adafactor":
+                print(f"use adafactor_scheduler")
+            args.lr_scheduler = f"adafactor:{lr}"
+
+            lr = None
+        else:
+            if args.max_grad_norm != 0.0:
+                print(
+                    f"because max_grad_norm is set, clip_grad_norm is enabled. consider set to 0"
+                )
+            if args.lr_scheduler != "constant_with_warmup":
+                print(f"constant_with_warmup will be good")
+            if optimizer_kwargs.get("clip_threshold", 1.0) != 1.0:
+                print(f"clip_threshold=1.0 will be good")
+
+        optimizer_class = transformers.optimization.Adafactor
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    elif optimizer_type == "AdamW".lower():
+        print(f"use AdamW optimizer | {optimizer_kwargs}")
+        optimizer_class = torch.optim.AdamW
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    elif optimizer_type.endswith("schedulefree".lower()):
+        try:
+            import schedulefree as sf
+        except ImportError:
+            raise ImportError("No schedulefree")
+
+        if optimizer_type == "RAdamScheduleFree".lower():
+            optimizer_class = sf.RAdamScheduleFree
+            print(f"use RAdamScheduleFree optimizer | {optimizer_kwargs}")
+        elif optimizer_type == "AdamWScheduleFree".lower():
+            optimizer_class = sf.AdamWScheduleFree
+            print(f"use AdamWScheduleFree optimizer | {optimizer_kwargs}")
+        elif optimizer_type == "SGDScheduleFree".lower():
+            optimizer_class = sf.SGDScheduleFree
+            print(f"use SGDScheduleFree optimizer | {optimizer_kwargs}")
+        else:
+            optimizer_class = None
+
+        if optimizer_class is not None:
+            optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    if optimizer is None:
+        case_sensitive_optimizer_type = args.optimizer_type  # not lower
+        print(f"use {case_sensitive_optimizer_type} | {optimizer_kwargs}")
+
+        if "." not in case_sensitive_optimizer_type:  # from torch.optim
+            optimizer_module = torch.optim
+        else:  # from other library
+            values = case_sensitive_optimizer_type.split(".")
+            optimizer_module = importlib.import_module(".".join(values[:-1]))
+            case_sensitive_optimizer_type = values[-1]
+
+        optimizer_class = getattr(optimizer_module, case_sensitive_optimizer_type)
+        optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
+
+    # for logging
+    optimizer_name = optimizer_class.__module__ + "." + optimizer_class.__name__
+    optimizer_args = ",".join([f"{k}={v}" for k, v in optimizer_kwargs.items()])
+
+    if hasattr(optimizer, "train") and callable(optimizer.train):
+        # make optimizer as train mode before training for schedulefree optimizer. the optimizer will be in eval mode in sampling and saving.
+        optimizer.train()
+
+    return optimizer_name, optimizer_args, optimizer
 
 
-def _build_scheduler(
-    optimizer,
-    lr_scheduler_type,
-    total_steps,
-    lr_warmup_steps=0,
-    lr_scheduler_args=None,
-):
-    lr_scheduler_type = "constant" if lr_scheduler_type in [None, ""] else lr_scheduler_type
-    lr_scheduler_kwargs = _parse_kv_args(lr_scheduler_args)
+def get_optimizer_train_eval_fn(optimizer: Optimizer, args: argparse.Namespace) -> Tuple[Callable, Callable]:
+    if not is_schedulefree_optimizer(optimizer, args):
+        # return dummy func
+        return lambda: None, lambda: None
 
-    if "." in lr_scheduler_type:
-        split = lr_scheduler_type.rfind(".")
-        module = importlib.import_module(lr_scheduler_type[:split])
-        class_name = lr_scheduler_type[split + 1:]
-        scheduler_class = _resolve_attr_case_insensitive(module, class_name)
-        return scheduler_class(optimizer, **lr_scheduler_kwargs)
+    # get train and eval functions from optimizer
+    train_fn = optimizer.train
+    eval_fn = optimizer.eval
 
-    lr_scheduler_type = lr_scheduler_type.lower()
-    warmup_steps = max(0, int(lr_warmup_steps))
-    total_steps = max(1, int(total_steps))
+    return train_fn, eval_fn
 
-    def warmup_ratio(step):
-        if warmup_steps <= 0:
-            return 1.0
-        return min(1.0, float(step + 1) / float(warmup_steps))
 
-    if lr_scheduler_type == "constant":
-        return torch.optim.lr_scheduler.ConstantLR(optimizer, **lr_scheduler_kwargs)
+def is_schedulefree_optimizer(optimizer: Optimizer, args: argparse.Namespace) -> bool:
+    return args.optimizer_type.lower().endswith("schedulefree".lower())  # or args.optimizer_schedulefree_wrapper
 
-    if lr_scheduler_type == "constant_with_warmup":
-        def lr_lambda(step):
-            return warmup_ratio(step)
-        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda, **lr_scheduler_kwargs)
 
-    if lr_scheduler_type == "linear":
-        def lr_lambda(step):
-            if step < warmup_steps:
-                return warmup_ratio(step)
-            denom = max(1, total_steps - warmup_steps)
-            progress = float(step - warmup_steps + 1) / float(denom)
-            return max(0.0, 1.0 - progress)
-        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda, **lr_scheduler_kwargs)
+def get_dummy_scheduler(optimizer: Optimizer) -> Any:
+    # dummy scheduler for schedulefree optimizer. supports only empty step(), get_last_lr() and optimizers.
+    # this scheduler is used for logging only.
+    # this isn't be wrapped by accelerator because of this class is not a subclass of torch.optim.lr_scheduler._LRScheduler
+    class DummyScheduler:
+        def __init__(self, optimizer: Optimizer):
+            self.optimizer = optimizer
 
-    if lr_scheduler_type == "cosine":
-        def lr_lambda(step):
-            if step < warmup_steps:
-                return warmup_ratio(step)
-            denom = max(1, total_steps - warmup_steps)
-            progress = min(1.0, float(step - warmup_steps + 1) / float(denom))
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
-        return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda, **lr_scheduler_kwargs)
+        def step(self):
+            pass
 
-    try:
-        scheduler_class = _resolve_attr_case_insensitive(torch.optim.lr_scheduler, lr_scheduler_type)
-        return scheduler_class(optimizer, **lr_scheduler_kwargs)
-    except AttributeError:
-        pass
+        def get_last_lr(self):
+            return [group["lr"] for group in self.optimizer.param_groups]
 
-    raise ValueError(
-        f"Unsupported lr_scheduler_type: {lr_scheduler_type}. Use built-in constant/constant_with_warmup/linear/cosine, "
-        + "a torch.optim.lr_scheduler class name, or full class path."
+    return DummyScheduler(optimizer)
+
+
+def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
+    """
+    Unified API to get any scheduler from its name.
+    """
+    # if schedulefree optimizer, return dummy scheduler
+    if is_schedulefree_optimizer(optimizer, args):
+        return get_dummy_scheduler(optimizer)
+
+    name = args.lr_scheduler
+    num_training_steps = args.max_train_steps * num_processes  # * args.gradient_accumulation_steps
+    num_warmup_steps: Optional[int] = (
+        int(args.lr_warmup_steps * num_training_steps) if isinstance(args.lr_warmup_steps, float) else args.lr_warmup_steps
+    )
+    num_decay_steps: Optional[int] = (
+        int(args.lr_decay_steps * num_training_steps) if isinstance(args.lr_decay_steps, float) else args.lr_decay_steps
+    )
+    num_stable_steps = num_training_steps - num_warmup_steps - num_decay_steps
+    num_cycles = args.lr_scheduler_num_cycles
+    power = args.lr_scheduler_power
+    timescale = args.lr_scheduler_timescale
+    min_lr_ratio = args.lr_scheduler_min_lr_ratio
+
+    lr_scheduler_kwargs = {}  # get custom lr_scheduler kwargs
+    if args.lr_scheduler_args is not None and len(args.lr_scheduler_args) > 0:
+        for arg in args.lr_scheduler_args:
+            key, value = arg.split("=")
+            value = ast.literal_eval(value)
+            lr_scheduler_kwargs[key] = value
+
+    def wrap_check_needless_num_warmup_steps(return_vals):
+        if num_warmup_steps is not None and num_warmup_steps != 0:
+            raise ValueError(f"{name} does not require num_warmup_steps. Set None or 0.")
+        return return_vals
+
+    # using any lr_scheduler from other library
+    if args.lr_scheduler_type:
+        lr_scheduler_type = args.lr_scheduler_type
+        print(f"use {lr_scheduler_type} | {lr_scheduler_kwargs} as lr_scheduler")
+        if "." not in lr_scheduler_type:  # default to use torch.optim
+            lr_scheduler_module = torch.optim.lr_scheduler
+        else:
+            values = lr_scheduler_type.split(".")
+            lr_scheduler_module = importlib.import_module(".".join(values[:-1]))
+            lr_scheduler_type = values[-1]
+        lr_scheduler_class = getattr(lr_scheduler_module, lr_scheduler_type)
+        lr_scheduler = lr_scheduler_class(optimizer, **lr_scheduler_kwargs)
+        return wrap_check_needless_num_warmup_steps(lr_scheduler)
+
+    if name.startswith("adafactor"):
+        assert (
+            type(optimizer) == transformers.optimization.Adafactor
+        ), f"adafactor scheduler must be used with Adafactor optimizer"
+        initial_lr = float(name.split(":")[1])
+        return wrap_check_needless_num_warmup_steps(transformers.optimization.AdafactorSchedule(optimizer, initial_lr))
+
+    if name == DiffusersSchedulerType.PIECEWISE_CONSTANT.value:
+        name = DiffusersSchedulerType(name)
+        schedule_func = DIFFUSERS_TYPE_TO_SCHEDULER_FUNCTION[name]
+        return schedule_func(optimizer, **lr_scheduler_kwargs)  # step_rules and last_epoch are given as kwargs
+
+    name = SchedulerType(name)
+    schedule_func = TYPE_TO_SCHEDULER_FUNCTION[name]
+
+    if name == SchedulerType.CONSTANT:
+        return wrap_check_needless_num_warmup_steps(schedule_func(optimizer, **lr_scheduler_kwargs))
+
+    # All other schedulers require num_warmup_steps
+    if num_warmup_steps is None:
+        raise ValueError(f"{name} requires num_warmup_steps, please provide that argument.")
+
+    if name == SchedulerType.CONSTANT_WITH_WARMUP:
+        return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, **lr_scheduler_kwargs)
+
+    if name == SchedulerType.INVERSE_SQRT:
+        return schedule_func(optimizer, num_warmup_steps=num_warmup_steps, timescale=timescale, **lr_scheduler_kwargs)
+
+    # All other schedulers require num_training_steps
+    if num_training_steps is None:
+        raise ValueError(f"{name} requires num_training_steps, please provide that argument.")
+
+    if name == SchedulerType.COSINE_WITH_RESTARTS:
+        return schedule_func(
+            optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+            num_cycles=num_cycles,
+            **lr_scheduler_kwargs,
+        )
+
+    if name == SchedulerType.POLYNOMIAL:
+        return schedule_func(
+            optimizer, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps, power=power, **lr_scheduler_kwargs
+        )
+
+    if name == SchedulerType.COSINE_WITH_MIN_LR:
+        return schedule_func(
+            optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+            num_cycles=num_cycles / 2,
+            min_lr_rate=min_lr_ratio,
+            **lr_scheduler_kwargs,
+        )
+
+    # these schedulers do not require num_decay_steps
+    if name == SchedulerType.LINEAR or name == SchedulerType.COSINE:
+        return schedule_func(
+            optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_training_steps=num_training_steps,
+            **lr_scheduler_kwargs,
+        )
+
+    # All other schedulers require `num_decay_steps`
+    if num_decay_steps is None:
+        raise ValueError(f"{name} requires num_decay_steps, please provide that argument.")
+    if name == SchedulerType.WARMUP_STABLE_DECAY:
+        return schedule_func(
+            optimizer,
+            num_warmup_steps=num_warmup_steps,
+            num_stable_steps=num_stable_steps,
+            num_decay_steps=num_decay_steps,
+            num_cycles=num_cycles / 2,
+            min_lr_ratio=min_lr_ratio if min_lr_ratio is not None else 0.0,
+            **lr_scheduler_kwargs,
+        )
+
+    return schedule_func(
+        optimizer,
+        num_warmup_steps=num_warmup_steps,
+        num_training_steps=num_training_steps,
+        num_decay_steps=num_decay_steps,
+        **lr_scheduler_kwargs,
     )
 
 
@@ -224,6 +615,23 @@ def _normalize_log_with(log_with):
     return [str(item).strip().lower() for item in log_with if str(item).strip() != ""]
 
 
+def _is_builtin_lr_scheduler_name(name: Optional[str]) -> bool:
+    if name is None:
+        return True
+    name_str = str(name)
+    if name_str == "":
+        return True
+    if name_str.startswith("adafactor"):
+        return True
+    if name_str == DiffusersSchedulerType.PIECEWISE_CONSTANT.value:
+        return True
+    try:
+        SchedulerType(name_str)
+        return True
+    except Exception:
+        return False
+
+
 class _DatasetStateCollator:
     def __init__(self, current_epoch, current_step, dataset, base_collate_fn):
         self.current_epoch = current_epoch
@@ -273,6 +681,9 @@ def launch_training_task(
     tracker_config: dict = None,
     log_every_n_steps: int = 1,
 ):
+    if args is None:
+        args = argparse.Namespace()
+
     learning_rate = _get_arg(args, "learning_rate", learning_rate)
     weight_decay = _get_arg(args, "weight_decay", weight_decay)
     batch_size = _get_arg(args, "batch_size", _get_arg(args, "train_batch_size", batch_size))
@@ -295,14 +706,34 @@ def launch_training_task(
     num_epochs = _get_arg(args, "num_epochs", num_epochs)
 
     trainable_params = [param for param in model.parameters() if param.requires_grad]
-    optimizer = _build_optimizer(
-        optimizer_type,
-        trainable_params,
-        learning_rate,
-        weight_decay,
-        optimizer_kwargs=optimizer_kwargs,
-        optimizer_args=optimizer_args,
-    )
+    if optimizer_args is not None:
+        args.optimizer_args = optimizer_args
+    if optimizer_type is not None:
+        args.optimizer_type = optimizer_type
+    if optimizer_kwargs is not None:
+        # keep backward-compatible path; kwargs take precedence via optimizer_args when provided
+        if args.optimizer_args is None:
+            args.optimizer_args = []
+        for key, value in optimizer_kwargs.items():
+            args.optimizer_args.append(f"{key}={value}")
+
+    if not hasattr(args, "use_8bit_adam"):
+        args.use_8bit_adam = False
+    if not hasattr(args, "use_lion_optimizer"):
+        args.use_lion_optimizer = False
+    if not hasattr(args, "fused_backward_pass"):
+        args.fused_backward_pass = False
+
+    if not hasattr(args, "gradient_accumulation_steps"):
+        args.gradient_accumulation_steps = int(getattr(accelerator, "gradient_accumulation_steps", 1))
+    if not hasattr(args, "max_grad_norm"):
+        args.max_grad_norm = max_grad_norm if max_grad_norm is not None else 0.0
+    if not hasattr(args, "lr_scheduler"):
+        args.lr_scheduler = lr_scheduler_type
+    if not hasattr(args, "learning_rate"):
+        args.learning_rate = learning_rate
+
+    optimizer_name, optimizer_args_log, optimizer = get_optimizer(args, trainable_params)
 
     dataset_seed = _get_arg(args, "seed", 0)
     if hasattr(dataset, "set_seed"):
@@ -327,13 +758,29 @@ def launch_training_task(
     num_processes = max(1, int(getattr(accelerator, "num_processes", 1)))
     num_update_steps_per_epoch = math.ceil(len(dataloader) / num_processes / grad_accum_steps)
     total_steps = max(1, num_update_steps_per_epoch * int(num_epochs))
-    scheduler = _build_scheduler(
-        optimizer,
-        lr_scheduler_type=lr_scheduler_type,
-        total_steps=total_steps,
-        lr_warmup_steps=lr_warmup_steps,
-        lr_scheduler_args=lr_scheduler_args,
-    )
+    if not hasattr(args, "lr_scheduler_args"):
+        args.lr_scheduler_args = lr_scheduler_args
+    if not hasattr(args, "lr_scheduler_type"):
+        if _is_builtin_lr_scheduler_name(lr_scheduler_type):
+            args.lr_scheduler_type = ""
+        else:
+            args.lr_scheduler_type = lr_scheduler_type
+    if not hasattr(args, "lr_warmup_steps"):
+        args.lr_warmup_steps = lr_warmup_steps
+    if not hasattr(args, "lr_decay_steps"):
+        args.lr_decay_steps = 0
+    if not hasattr(args, "lr_scheduler_num_cycles"):
+        args.lr_scheduler_num_cycles = 1
+    if not hasattr(args, "lr_scheduler_power"):
+        args.lr_scheduler_power = 1.0
+    if not hasattr(args, "lr_scheduler_timescale"):
+        args.lr_scheduler_timescale = 1.0
+    if not hasattr(args, "lr_scheduler_min_lr_ratio"):
+        args.lr_scheduler_min_lr_ratio = None
+    if not hasattr(args, "max_train_steps"):
+        args.max_train_steps = total_steps
+
+    scheduler = get_scheduler_fix(args, optimizer, num_processes)
 
     enabled_trackers = _normalize_log_with(log_with)
     tb_writer = None
