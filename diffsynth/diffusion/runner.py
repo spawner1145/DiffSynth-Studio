@@ -61,17 +61,17 @@ def _resolve_attr_case_insensitive(module, attr_name):
 def get_optimizer(args, trainable_params) -> Tuple[str, str, object]:
     # "Optimizer to use: AdamW, AdamW8bit, Lion, SGDNesterov, SGDNesterov8bit, PagedAdamW, PagedAdamW8bit, PagedAdamW32bit, Lion8bit, PagedLion8bit, AdEMAMix8bit, PagedAdEMAMix8bit, DAdaptation(DAdaptAdamPreprint), DAdaptAdaGrad, DAdaptAdam, DAdaptAdan, DAdaptAdanIP, DAdaptLion, DAdaptSGD, Adafactor"
 
-    optimizer_type = args.optimizer_type
-    if args.use_8bit_adam:
+    optimizer_type = getattr(args, "optimizer_type", None)
+    if getattr(args, "use_8bit_adam", False):
         assert (
-            not args.use_lion_optimizer
+            not getattr(args, "use_lion_optimizer", False)
         ), "both option use_8bit_adam and use_lion_optimizer are specified"
         assert (
             optimizer_type is None or optimizer_type == ""
         ), "both option use_8bit_adam and optimizer_type are specified"
         optimizer_type = "AdamW8bit"
 
-    elif args.use_lion_optimizer:
+    elif getattr(args, "use_lion_optimizer", False):
         assert (
             optimizer_type is None or optimizer_type == ""
         ), "both option use_lion_optimizer and optimizer_type are specified"
@@ -81,22 +81,23 @@ def get_optimizer(args, trainable_params) -> Tuple[str, str, object]:
         optimizer_type = "AdamW"
     optimizer_type = optimizer_type.lower()
 
-    if args.fused_backward_pass:
+    if getattr(args, "fused_backward_pass", False):
         assert (
             optimizer_type == "Adafactor".lower()
         ), "fused_backward_pass currently only works with optimizer_type Adafactor"
         assert (
-            args.gradient_accumulation_steps == 1
+            getattr(args, "gradient_accumulation_steps", 1) == 1
         ), "fused_backward_pass does not work with gradient_accumulation_steps > 1"
 
     optimizer_kwargs = {}
-    if args.optimizer_args is not None and len(args.optimizer_args) > 0:
-        for arg in args.optimizer_args:
+    optimizer_args = getattr(args, "optimizer_args", None)
+    if optimizer_args is not None and len(optimizer_args) > 0:
+        for arg in optimizer_args:
             key, value = arg.split("=")
             value = ast.literal_eval(value)
             optimizer_kwargs[key] = value
 
-    lr = args.learning_rate
+    lr = getattr(args, "learning_rate", None)
     optimizer = None
     optimizer_class = None
 
@@ -339,7 +340,7 @@ def get_optimizer(args, trainable_params) -> Tuple[str, str, object]:
             optimizer = optimizer_class(trainable_params, lr=lr, **optimizer_kwargs)
 
     if optimizer is None:
-        case_sensitive_optimizer_type = args.optimizer_type  # not lower
+        case_sensitive_optimizer_type = getattr(args, "optimizer_type", "AdamW")  # not lower
         print(f"use {case_sensitive_optimizer_type} | {optimizer_kwargs}")
 
         if "." not in case_sensitive_optimizer_type:  # from torch.optim
@@ -376,7 +377,8 @@ def get_optimizer_train_eval_fn(optimizer: Optimizer, args: argparse.Namespace) 
 
 
 def is_schedulefree_optimizer(optimizer: Optimizer, args: argparse.Namespace) -> bool:
-    return args.optimizer_type.lower().endswith("schedulefree".lower())  # or args.optimizer_schedulefree_wrapper
+    optimizer_type = getattr(args, "optimizer_type", "")
+    return str(optimizer_type).lower().endswith("schedulefree".lower())  # or args.optimizer_schedulefree_wrapper
 
 
 def get_dummy_scheduler(optimizer: Optimizer) -> Any:
@@ -404,23 +406,29 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
     if is_schedulefree_optimizer(optimizer, args):
         return get_dummy_scheduler(optimizer)
 
-    name = args.lr_scheduler
-    num_training_steps = args.max_train_steps * num_processes  # * args.gradient_accumulation_steps
+    name = getattr(args, "lr_scheduler", "constant")
+    num_training_steps = getattr(args, "max_train_steps", None)
+    num_training_steps = num_training_steps * num_processes if num_training_steps is not None else None
     num_warmup_steps: Optional[int] = (
-        int(args.lr_warmup_steps * num_training_steps) if isinstance(args.lr_warmup_steps, float) else args.lr_warmup_steps
+        int(getattr(args, "lr_warmup_steps", 0) * num_training_steps)
+        if isinstance(getattr(args, "lr_warmup_steps", 0), float) and num_training_steps is not None
+        else getattr(args, "lr_warmup_steps", 0)
     )
     num_decay_steps: Optional[int] = (
-        int(args.lr_decay_steps * num_training_steps) if isinstance(args.lr_decay_steps, float) else args.lr_decay_steps
+        int(getattr(args, "lr_decay_steps", 0) * num_training_steps)
+        if isinstance(getattr(args, "lr_decay_steps", 0), float) and num_training_steps is not None
+        else getattr(args, "lr_decay_steps", 0)
     )
-    num_stable_steps = num_training_steps - num_warmup_steps - num_decay_steps
-    num_cycles = args.lr_scheduler_num_cycles
-    power = args.lr_scheduler_power
-    timescale = args.lr_scheduler_timescale
-    min_lr_ratio = args.lr_scheduler_min_lr_ratio
+    num_stable_steps = (num_training_steps - num_warmup_steps - num_decay_steps) if num_training_steps is not None else 0
+    num_cycles = getattr(args, "lr_scheduler_num_cycles", 1)
+    power = getattr(args, "lr_scheduler_power", 1.0)
+    timescale = getattr(args, "lr_scheduler_timescale", 1.0)
+    min_lr_ratio = getattr(args, "lr_scheduler_min_lr_ratio", None)
 
     lr_scheduler_kwargs = {}  # get custom lr_scheduler kwargs
-    if args.lr_scheduler_args is not None and len(args.lr_scheduler_args) > 0:
-        for arg in args.lr_scheduler_args:
+    lr_scheduler_args = getattr(args, "lr_scheduler_args", None)
+    if lr_scheduler_args is not None and len(lr_scheduler_args) > 0:
+        for arg in lr_scheduler_args:
             key, value = arg.split("=")
             value = ast.literal_eval(value)
             lr_scheduler_kwargs[key] = value
@@ -431,8 +439,8 @@ def get_scheduler_fix(args, optimizer: Optimizer, num_processes: int):
         return return_vals
 
     # using any lr_scheduler from other library
-    if args.lr_scheduler_type:
-        lr_scheduler_type = args.lr_scheduler_type
+    lr_scheduler_type = getattr(args, "lr_scheduler_type", "")
+    if lr_scheduler_type:
         print(f"use {lr_scheduler_type} | {lr_scheduler_kwargs} as lr_scheduler")
         if "." not in lr_scheduler_type:  # default to use torch.optim
             lr_scheduler_module = torch.optim.lr_scheduler
@@ -717,6 +725,8 @@ def launch_training_task(
         for key, value in optimizer_kwargs.items():
             args.optimizer_args.append(f"{key}={value}")
 
+    if not hasattr(args, "optimizer_args"):
+        args.optimizer_args = None
     if not hasattr(args, "use_8bit_adam"):
         args.use_8bit_adam = False
     if not hasattr(args, "use_lion_optimizer"):
