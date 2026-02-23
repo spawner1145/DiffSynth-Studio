@@ -15,6 +15,27 @@ except ModuleNotFoundError:
     FLASH_ATTN_3_AVAILABLE = False
 
 
+class TreadRouter:
+    def __init__(self):
+        super().__init__()
+
+    def get_mask(self, x, selection_rate=0.0):
+        batch_size, num_patches, _ = x.shape
+        device = x.device
+        num_mask = int(num_patches * selection_rate)
+        num_keep = max(1, num_patches - num_mask)
+        noise_random = torch.rand(batch_size, num_patches, device=device)
+        ids_shuffle = torch.argsort(noise_random, dim=1)
+        ids_keep = ids_shuffle[:, :num_keep]
+        return ids_keep
+
+    def start_route(self, x, ids_keep):
+        return x.gather(1, ids_keep.unsqueeze(-1).expand(-1, -1, x.size(2)))
+
+    def end_route(self, masked_x, ids_keep, original_x):
+        return original_x.scatter(1, ids_keep.unsqueeze(-1).expand(-1, -1, original_x.size(2)), masked_x)
+
+
 def complextro_image_flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, attention_mask = None, enable_fp8_attention: bool = False):
     if FLASH_ATTN_3_AVAILABLE and attention_mask is None:
         if not enable_fp8_attention:
@@ -689,6 +710,8 @@ class ComplextroImageDiT(torch.nn.Module):
         num_attention_heads: int = 24,
         attention_head_dim: int = 128,
         rope_axes_dim: Optional[List[int]] = None,
+        enable_tread_routing: bool = False,
+        tread_routes: Optional[List[dict]] = None,
     ):
         super().__init__()
 
@@ -708,6 +731,9 @@ class ComplextroImageDiT(torch.nn.Module):
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
         self.rope_axes_dim = rope_axes_dim
+        self.enable_tread_routing = bool(enable_tread_routing)
+        self.tread_routes = self._normalize_tread_routes(tread_routes)
+        self.tread_router = TreadRouter() if self.enable_tread_routing and len(self.tread_routes) > 0 else None
 
         if not use_layer3d_rope:
             self.pos_embed = ComplextroEmbedRope(theta=10000, axes_dim=self.rope_axes_dim, scale_rope=True)
@@ -789,6 +815,11 @@ class ComplextroImageDiT(torch.nn.Module):
                 for _ in range(num_layers)
             ]
         )
+        for route in self.tread_routes:
+            if route["start_layer_idx"] >= num_layers or route["end_layer_idx"] >= num_layers:
+                raise ValueError(
+                    f"tread route layer idx out of range: start={route['start_layer_idx']}, end={route['end_layer_idx']}, num_layers={num_layers}."
+                )
         self.norm_out = AdaLayerNorm(self.hidden_size, single=True)
         self.proj_out = nn.Linear(self.hidden_size, in_channels)
 
@@ -810,6 +841,40 @@ class ComplextroImageDiT(torch.nn.Module):
                     state_dict["siglip_pad_token"] = self.siglip_pad_token.detach().clone()
 
         return super().load_state_dict(state_dict, strict=strict, assign=assign)
+
+    @staticmethod
+    def _normalize_tread_routes(routes: Optional[List[dict]]) -> List[dict]:
+        if routes is None:
+            return []
+        if not isinstance(routes, list):
+            raise ValueError("tread_routes must be a list of route configs.")
+
+        normalized = []
+        for route in routes:
+            if not isinstance(route, dict):
+                raise ValueError("Each tread route must be a dict.")
+            if "start_layer_idx" not in route or "end_layer_idx" not in route:
+                raise ValueError("Each tread route must include start_layer_idx and end_layer_idx.")
+            selection_ratio = float(route.get("selection_ratio", 0.0))
+            if not (0.0 <= selection_ratio < 1.0):
+                raise ValueError("tread route selection_ratio must be in [0, 1).")
+            start_layer_idx = int(route["start_layer_idx"])
+            end_layer_idx = int(route["end_layer_idx"])
+            if end_layer_idx < start_layer_idx:
+                raise ValueError("tread route end_layer_idx must be >= start_layer_idx.")
+            normalized.append(
+                {
+                    "selection_ratio": selection_ratio,
+                    "start_layer_idx": start_layer_idx,
+                    "end_layer_idx": end_layer_idx,
+                }
+            )
+
+        normalized = sorted(normalized, key=lambda x: x["start_layer_idx"])
+        for i in range(1, len(normalized)):
+            if normalized[i]["start_layer_idx"] <= normalized[i - 1]["end_layer_idx"]:
+                raise ValueError("tread routes must not overlap.")
+        return normalized
 
     @staticmethod
     def _pad_tokens(
@@ -1459,16 +1524,58 @@ class ComplextroImageDiT(torch.nn.Module):
             )
             unified_temb = pad_sequence(temb_list, batch_first=True, padding_value=0.0)
 
-            for block in self.transformer_blocks:
+            use_tread_routing = self.training and self.tread_router is not None
+            route_idx = 0
+            current_route = self.tread_routes[route_idx] if use_tread_routing else None
+            route_ids_keep = None
+            routed_key_mask = None
+            routed_unified_temb = unified_temb
+            route_original_unified = None
+            route_original_freqs = None
+            route_original_temb = None
+
+            for block_idx, block in enumerate(self.transformer_blocks):
+                if use_tread_routing and current_route is not None and block_idx == current_route["start_layer_idx"]:
+                    route_original_unified = unified
+                    route_original_freqs = unified_freqs
+                    route_original_temb = unified_temb
+                    route_ids_keep = self.tread_router.get_mask(unified, selection_rate=current_route["selection_ratio"])
+                    unified = self.tread_router.start_route(unified, route_ids_keep)
+                    unified_freqs = self.tread_router.start_route(unified_freqs, route_ids_keep)
+                    routed_unified_temb = self.tread_router.start_route(unified_temb, route_ids_keep)
+                    if key_mask is not None:
+                        routed_key_mask = key_mask.gather(
+                            -1,
+                            route_ids_keep.unsqueeze(1).unsqueeze(1).expand(-1, key_mask.shape[1], key_mask.shape[2], -1),
+                        )
+                    else:
+                        routed_key_mask = None
+
+                active_key_mask = routed_key_mask if route_ids_keep is not None else key_mask
+                active_temb = routed_unified_temb if route_ids_keep is not None else unified_temb
+
                 unified = gradient_checkpoint_forward(
                     block,
                     use_gradient_checkpointing=use_gradient_checkpointing,
                     use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
                     hidden_states=unified,
-                    temb=unified_temb,
+                    temb=active_temb,
                     image_rotary_emb=unified_freqs,
-                    attention_mask=key_mask,
+                    attention_mask=active_key_mask,
                 )
+
+                if use_tread_routing and current_route is not None and block_idx == current_route["end_layer_idx"]:
+                    unified = self.tread_router.end_route(unified, route_ids_keep, route_original_unified)
+                    unified_freqs = self.tread_router.end_route(unified_freqs, route_ids_keep, route_original_freqs)
+                    unified_temb = self.tread_router.end_route(routed_unified_temb, route_ids_keep, route_original_temb)
+                    route_ids_keep = None
+                    routed_key_mask = None
+                    routed_unified_temb = unified_temb
+                    route_original_unified = None
+                    route_original_freqs = None
+                    route_original_temb = None
+                    route_idx += 1
+                    current_route = self.tread_routes[route_idx] if route_idx < len(self.tread_routes) else None
 
             image_tokens = unified
             image_tokens = self.norm_out(image_tokens, conditioning_noisy)
@@ -1633,7 +1740,31 @@ class ComplextroImageDiT(torch.nn.Module):
             device=image_tokens.device,
         )
 
-        for block in self.transformer_blocks:
+        use_tread_routing = self.training and self.tread_router is not None
+        route_idx = 0
+        current_route = self.tread_routes[route_idx] if use_tread_routing else None
+        route_ids_keep = None
+        routed_key_mask = None
+        route_original_unified = None
+        route_original_freqs = None
+
+        for block_idx, block in enumerate(self.transformer_blocks):
+            if use_tread_routing and current_route is not None and block_idx == current_route["start_layer_idx"]:
+                route_original_unified = unified
+                route_original_freqs = unified_freqs
+                route_ids_keep = self.tread_router.get_mask(unified, selection_rate=current_route["selection_ratio"])
+                unified = self.tread_router.start_route(unified, route_ids_keep)
+                unified_freqs = self.tread_router.start_route(unified_freqs, route_ids_keep)
+                if key_mask is not None:
+                    routed_key_mask = key_mask.gather(
+                        -1,
+                        route_ids_keep.unsqueeze(1).unsqueeze(1).expand(-1, key_mask.shape[1], key_mask.shape[2], -1),
+                    )
+                else:
+                    routed_key_mask = None
+
+            active_key_mask = routed_key_mask if route_ids_keep is not None else key_mask
+
             unified = gradient_checkpoint_forward(
                 block,
                 use_gradient_checkpointing=use_gradient_checkpointing,
@@ -1641,8 +1772,18 @@ class ComplextroImageDiT(torch.nn.Module):
                 hidden_states=unified,
                 temb=conditioning,
                 image_rotary_emb=unified_freqs,
-                attention_mask=key_mask,
+                attention_mask=active_key_mask,
             )
+
+            if use_tread_routing and current_route is not None and block_idx == current_route["end_layer_idx"]:
+                unified = self.tread_router.end_route(unified, route_ids_keep, route_original_unified)
+                unified_freqs = self.tread_router.end_route(unified_freqs, route_ids_keep, route_original_freqs)
+                route_ids_keep = None
+                routed_key_mask = None
+                route_original_unified = None
+                route_original_freqs = None
+                route_idx += 1
+                current_route = self.tread_routes[route_idx] if route_idx < len(self.tread_routes) else None
 
         image_tokens = []
         for b, (start, end) in enumerate(x_pos_offsets):
