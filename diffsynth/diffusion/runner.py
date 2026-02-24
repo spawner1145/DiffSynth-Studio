@@ -824,7 +824,11 @@ def launch_training_task(
         if hasattr(dataset, "set_current_epoch"):
             dataset.set_current_epoch(epoch_id)
         optimizer.zero_grad()
-        progress_bar = tqdm(dataloader, disable=not accelerator.is_local_main_process)
+        progress_bar = tqdm(
+            dataloader,
+            disable=not accelerator.is_local_main_process,
+            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n{postfix}",
+        )
         progress_bar.set_description(f"Epoch {epoch_id + 1}/{num_epochs}")
         epoch_start_time = time.perf_counter()
         update_start_time = epoch_start_time
