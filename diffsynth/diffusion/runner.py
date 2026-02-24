@@ -815,6 +815,13 @@ def launch_training_task(
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     global_step = 0
     log_every_n_steps = max(1, int(log_every_n_steps))
+    progress_loss_keys = _get_arg(args, "progress_loss_keys", None)
+    if progress_loss_keys is None:
+        progress_loss_keys = ["loss", "loss_ema"]  #progress_loss_keys=["loss","loss_ma50"] 或字符串：progress_loss_keys="loss,loss_ma50"
+    elif isinstance(progress_loss_keys, str):
+        progress_loss_keys = [k.strip() for k in progress_loss_keys.split(",") if k.strip()]
+    else:
+        progress_loss_keys = list(progress_loss_keys)
     trend_loss_ema = None
     trend_loss_ema_beta = 0.98
     trend_loss_window = deque(maxlen=50)
@@ -824,11 +831,7 @@ def launch_training_task(
         if hasattr(dataset, "set_current_epoch"):
             dataset.set_current_epoch(epoch_id)
         optimizer.zero_grad()
-        progress_bar = tqdm(
-            dataloader,
-            disable=not accelerator.is_local_main_process,
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]\n{postfix}",
-        )
+        progress_bar = tqdm(dataloader, disable=not accelerator.is_local_main_process)
         progress_bar.set_description(f"Epoch {epoch_id + 1}/{num_epochs}")
         epoch_start_time = time.perf_counter()
         update_start_time = epoch_start_time
@@ -870,11 +873,12 @@ def launch_training_task(
                     local_batch_size = _infer_local_batch_size(data)
                     samples_per_update = local_batch_size * world_size * grad_accum_steps
                     samples_per_sec = samples_per_update / update_duration
-                    postfix = {
+                    loss_entries = {
                         "loss": f"{loss_item:.4f}",
                         "loss_ema": f"{trend_loss_ema:.4f}",
                         "loss_ma50": f"{trend_loss_mean:.4f}",
                     }
+                    postfix = {k: loss_entries[k] for k in progress_loss_keys if k in loss_entries}
                     if lr is not None:
                         postfix["lr"] = f"{lr:.2e}"
                     if grad_norm is not None:
