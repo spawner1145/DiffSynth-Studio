@@ -817,7 +817,7 @@ def launch_training_task(
     log_every_n_steps = max(1, int(log_every_n_steps))
     progress_loss_keys = _get_arg(args, "progress_loss_keys", None)
     if progress_loss_keys is None:
-        progress_loss_keys = ["loss", "loss_ema"]  #progress_loss_keys=["loss","loss_ma50"] 或字符串：progress_loss_keys="loss,loss_ma50"
+        progress_loss_keys = ["loss_ema"]  #progress_loss_keys=["loss","loss_ma50"] 或字符串：progress_loss_keys="loss,loss_ma50"
     elif isinstance(progress_loss_keys, str):
         progress_loss_keys = [k.strip() for k in progress_loss_keys.split(",") if k.strip()]
     else:
