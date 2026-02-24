@@ -2,6 +2,7 @@ import os, math, ast, importlib, time, torch
 import argparse
 from typing import Any, Callable, Optional, Tuple
 from multiprocessing import Value
+from collections import deque
 from tqdm import tqdm
 from accelerate import Accelerator
 from torch.optim import Optimizer
@@ -814,6 +815,9 @@ def launch_training_task(
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
     global_step = 0
     log_every_n_steps = max(1, int(log_every_n_steps))
+    trend_loss_ema = None
+    trend_loss_ema_beta = 0.98
+    trend_loss_window = deque(maxlen=50)
     
     for epoch_id in range(num_epochs):
         current_epoch.value = int(epoch_id)
@@ -849,6 +853,12 @@ def launch_training_task(
 
                     lr = optimizer.param_groups[0].get("lr", None)
                     loss_item = loss.detach().float().item()
+                    if trend_loss_ema is None:
+                        trend_loss_ema = loss_item
+                    else:
+                        trend_loss_ema = trend_loss_ema_beta * trend_loss_ema + (1.0 - trend_loss_ema_beta) * loss_item
+                    trend_loss_window.append(loss_item)
+                    trend_loss_mean = sum(trend_loss_window) / max(1, len(trend_loss_window))
                     epoch_loss_sum += loss_item
                     update_duration = max(1e-12, time.perf_counter() - update_start_time)
                     update_start_time = time.perf_counter()
@@ -856,7 +866,11 @@ def launch_training_task(
                     local_batch_size = _infer_local_batch_size(data)
                     samples_per_update = local_batch_size * world_size * grad_accum_steps
                     samples_per_sec = samples_per_update / update_duration
-                    postfix = {"loss": f"{loss_item:.4f}"}
+                    postfix = {
+                        "loss": f"{loss_item:.4f}",
+                        "loss_ema": f"{trend_loss_ema:.4f}",
+                        "loss_ma50": f"{trend_loss_mean:.4f}",
+                    }
                     if lr is not None:
                         postfix["lr"] = f"{lr:.2e}"
                     if grad_norm is not None:
@@ -870,6 +884,8 @@ def launch_training_task(
                     if accelerator.is_main_process and global_step % log_every_n_steps == 0:
                         metrics = {
                             "train/loss": loss_item,
+                            "train/loss_ema": float(trend_loss_ema),
+                            "train/loss_ma50": float(trend_loss_mean),
                             "train/epoch": float(epoch_id),
                             "train/global_step": float(global_step),
                             "train/progress": float(global_step) / float(total_steps),
