@@ -23,7 +23,8 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/qwen3/model.safetensors",
         flux2_vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
         qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3",
-        complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e3-s10059.safetensors",
+        complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e43-s19221.safetensors",
+        #complextro_dit_file="",
         train_omni: bool = False,
         complextro_model_config: Optional[dict] = None,
     ):
@@ -206,7 +207,7 @@ if __name__ == "__main__":
             - 建议 bucket_base_reso、min/max_bucket_reso 与 height_division_factor/width_division_factor 保持 16 的倍数。
     """
 
-    accelerator = accelerate.Accelerator(gradient_accumulation_steps=1)
+    accelerator = accelerate.Accelerator(gradient_accumulation_steps=8)
     train_omni = False
 
     # 1.05 B 配置
@@ -214,7 +215,7 @@ if __name__ == "__main__":
     # 默认是num_layers=60，num_refiner_layers=2的配置
     complextro_model_config = {
         "num_layers": 12,
-        "num_refiner_layers": 1,
+        "num_refiner_layers": 0,
         "hidden_size": 3072,
         "num_attention_heads": 24,
         "attention_head_dim": 128,
@@ -231,22 +232,22 @@ if __name__ == "__main__":
 
     data_file_keys = ("image", "edit_image", "condition_images") if train_omni else ("image",)
 
-    train_resolution = (256, 256)
-    max_bucket_reso = 512
+    train_resolution = (512, 512)
+    max_bucket_reso = 1024
     dataset = UnifiedDataset(
-        base_path="/root/autodl-tmp/DiffSynth-Studio/data/images",
-        metadata_path="/root/autodl-tmp/DiffSynth-Studio/data/metadata_merged.csv",
+        base_path="/root/autodl-tmp/DiffSynth-Studio/danbooru/images",
+        metadata_path="/root/autodl-tmp/DiffSynth-Studio/danbooru/metadata.csv",
         max_data_items=10000000,
         data_file_keys=data_file_keys,
         enable_bucket=True,
         bucket_no_upscale=False,
-        min_bucket_reso=128,
+        min_bucket_reso=256,
         max_bucket_reso=max_bucket_reso,
-        bucket_reso_steps=16,
+        bucket_reso_steps=64,
         bucket_data_key="image",
         bucket_base_reso=train_resolution,
         main_data_operator=UnifiedDataset.default_image_operator(
-            base_path="/root/autodl-tmp/DiffSynth-Studio/data/images",
+            base_path="/root/autodl-tmp/DiffSynth-Studio/danbooru/images",
             height=None,
             width=None,
             max_pixels=max_bucket_reso * max_bucket_reso,
@@ -261,7 +262,7 @@ if __name__ == "__main__":
         complextro_model_config=complextro_model_config,
     )
     model_logger = ModelLogger(
-        "models/Complextro/v2", # dit输出文件夹
+        "models/Complextro/v3", # dit输出文件夹
         remove_prefix_in_ckpt="pipe.dit.",
     )
 
@@ -270,11 +271,11 @@ if __name__ == "__main__":
         dataset,
         model,
         model_logger,
-        batch_size=10,
-        learning_rate=1e-4,
+        batch_size=15,
+        learning_rate=1e-3,
         optimizer_type="pytorch_optimizer.Adan",
-        lr_scheduler_type="constant",
-        lr_warmup_steps=0,
+        lr_scheduler_type="constant_with_warmup",
+        lr_warmup_steps=100,
         mup_scale=True,
         mup_base_dim=1.0,
         mup_dim=complextro_model_config.get("hidden_size", None),
