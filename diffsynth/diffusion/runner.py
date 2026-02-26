@@ -59,6 +59,88 @@ def _resolve_attr_case_insensitive(module, attr_name):
     raise AttributeError(f"Cannot find {attr_name} in module {module.__name__}")
 
 
+def _infer_mup_dim(model) -> Optional[float]:
+    if model is None:
+        return None
+
+    dim_attr_names = (
+        "mup_dim",
+        "hidden_size",
+        "model_dim",
+        "width",
+        "dim",
+        "embed_dim",
+        "text_embed_dim",
+        "d_model",
+    )
+    container_attr_names = (
+        "model",
+        "pipe",
+        "dit",
+        "unet",
+        "text_encoder",
+        "transformer",
+        "encoder",
+        "decoder",
+    )
+
+    def _normalize_dim(value) -> Optional[float]:
+        if value is None:
+            return None
+        if isinstance(value, (int, float)):
+            return float(value) if value > 0 else None
+        try:
+            value = int(value)
+            return float(value) if value > 0 else None
+        except Exception:
+            return None
+
+    checked = set()
+    queue = [model]
+    while queue:
+        current = queue.pop(0)
+        if current is None or id(current) in checked:
+            continue
+        checked.add(id(current))
+
+        if isinstance(current, dict):
+            for name in dim_attr_names:
+                if name in current:
+                    dim = _normalize_dim(current.get(name))
+                    if dim is not None:
+                        return dim
+        else:
+            for name in dim_attr_names:
+                if hasattr(current, name):
+                    dim = _normalize_dim(getattr(current, name))
+                    if dim is not None:
+                        return dim
+
+        config = getattr(current, "config", None)
+        if config is not None and id(config) not in checked:
+            queue.append(config)
+
+        for name in container_attr_names:
+            if hasattr(current, name):
+                child = getattr(current, name)
+                if isinstance(child, (list, tuple)):
+                    queue.extend(list(child))
+                else:
+                    queue.append(child)
+
+    return None
+
+
+def _scale_learning_rate_mup(learning_rate: float, mup_dim: float, mup_base_dim: float) -> float:
+    if learning_rate is None:
+        return learning_rate
+    if mup_dim is None or mup_dim <= 0:
+        raise ValueError(f"mup_dim must be > 0, got {mup_dim}")
+    if mup_base_dim is None or mup_base_dim <= 0:
+        raise ValueError(f"mup_base_dim must be > 0, got {mup_base_dim}")
+    return float(learning_rate) * math.sqrt(float(mup_base_dim) / float(mup_dim))
+
+
 def get_optimizer(args, trainable_params) -> Tuple[str, str, object]:
     # "Optimizer to use: AdamW, AdamW8bit, Lion, SGDNesterov, SGDNesterov8bit, PagedAdamW, PagedAdamW8bit, PagedAdamW32bit, Lion8bit, PagedLion8bit, AdEMAMix8bit, PagedAdEMAMix8bit, DAdaptation(DAdaptAdamPreprint), DAdaptAdaGrad, DAdaptAdam, DAdaptAdan, DAdaptAdanIP, DAdaptLion, DAdaptSGD, Adafactor"
 
@@ -683,6 +765,9 @@ def launch_training_task(
     lr_warmup_steps: int = 0,
     max_grad_norm: float = None,
     show_grad_norm: bool = True,
+    mup_scale: bool = False,
+    mup_base_dim: float = 1.0,
+    mup_dim: Optional[float] = None,
     log_with = None,
     logging_dir: str = None,
     tracker_project_name: str = "diffsynth-training",
@@ -704,6 +789,9 @@ def launch_training_task(
     lr_warmup_steps = _get_arg(args, "lr_warmup_steps", lr_warmup_steps)
     max_grad_norm = _get_arg(args, "max_grad_norm", max_grad_norm)
     show_grad_norm = _get_arg(args, "show_grad_norm", show_grad_norm)
+    mup_scale = _get_arg(args, "mup_scale", mup_scale)
+    mup_base_dim = _get_arg(args, "mup_base_dim", mup_base_dim)
+    mup_dim = _get_arg(args, "mup_dim", mup_dim)
     log_with = _get_arg(args, "log_with", log_with)
     logging_dir = _get_arg(args, "logging_dir", logging_dir)
     tracker_project_name = _get_arg(args, "tracker_project_name", tracker_project_name)
@@ -713,6 +801,14 @@ def launch_training_task(
     save_steps = _get_arg(args, "save_steps", save_steps)
     save_epochs = _get_arg(args, "save_epochs", save_epochs)
     num_epochs = _get_arg(args, "num_epochs", num_epochs)
+
+    if mup_scale:
+        if mup_dim is None:
+            mup_dim = _infer_mup_dim(model)
+        if mup_dim is None:
+            raise ValueError("mup_scale=True but failed to infer mup_dim from model. Please pass mup_dim.")
+        learning_rate = _scale_learning_rate_mup(learning_rate, mup_dim, mup_base_dim)
+        args.learning_rate = learning_rate
 
     trainable_params = [param for param in model.parameters() if param.requires_grad]
     if optimizer_args is not None:
