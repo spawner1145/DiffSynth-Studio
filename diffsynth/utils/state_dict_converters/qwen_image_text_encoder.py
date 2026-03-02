@@ -30,7 +30,9 @@ def QwenImageTextEncoderStateDictConverter(state_dict):
             k = k.replace("model.", "model.language_model.", 1)
         state_dict_[k] = v
 
-    if "model.lm_head.weight" not in state_dict_:
+    is_qwen35_like = is_qwen35_conditional_checkpoint or has_wrapped_qwen35_prefix
+
+    if is_qwen35_like and "model.lm_head.weight" not in state_dict_:
         if "model.model.language_model.embed_tokens.weight" in state_dict_:
             state_dict_["model.lm_head.weight"] = state_dict_["model.model.language_model.embed_tokens.weight"]
         elif "model.language_model.embed_tokens.weight" in state_dict_:
