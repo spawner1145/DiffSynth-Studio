@@ -1,7 +1,7 @@
 import torch, accelerate
 from typing import List, Optional, Any
 
-from transformers import AutoTokenizer
+from transformers import AutoProcessor
 from diffsynth.core import UnifiedDataset, load_model
 from diffsynth.diffusion import (
     DiffusionTrainingModule,
@@ -9,8 +9,8 @@ from diffsynth.diffusion import (
     ModelLogger,
     launch_training_task,
 )
-from diffsynth.models.z_image_text_encoder import ZImageTextEncoder
-from diffsynth.utils.state_dict_converters.z_image_text_encoder import ZImageTextEncoderStateDictConverter
+from diffsynth.models.qwen_image_text_encoder import QwenImageTextEncoder
+from diffsynth.utils.state_dict_converters.qwen_image_text_encoder import QwenImageTextEncoderStateDictConverter
 from diffsynth.models.flux2_vae import Flux2VAE
 from diffsynth.models.complextro_dit import ComplextroImageDiT
 from diffsynth.pipelines.complextro import ComplextroPipeline
@@ -20,9 +20,9 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
     def __init__(
         self,
         device,
-        qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/qwen3/model.safetensors",
+        qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/qwen3_5/model.safetensors",
         flux2_vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
-        qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3",
+        qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5",
         complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e43-s19221.safetensors",
         #complextro_dit_file="",
         train_omni: bool = False,
@@ -35,12 +35,12 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         self.pipe = ComplextroPipeline(device=device, torch_dtype=torch.bfloat16)
 
         self.pipe.text_encoder = load_model(
-            ZImageTextEncoder,
+            QwenImageTextEncoder,
             qwen_model_file,
-            config={"model_size": "0.6B"},
+            config={"model_type": "qwen3_5", "model_size": "0.8B"},
             torch_dtype=torch.bfloat16,
             device=device,
-            state_dict_converter=ZImageTextEncoderStateDictConverter,
+            state_dict_converter=QwenImageTextEncoderStateDictConverter,
         )
         self.pipe.vae = load_model(
             Flux2VAE,
@@ -48,7 +48,8 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             torch_dtype=torch.bfloat16,
             device=device,
         )
-        self.pipe.tokenizer = AutoTokenizer.from_pretrained(qwen_tokenizer_dir)
+        self.pipe.processor = AutoProcessor.from_pretrained(qwen_tokenizer_dir)
+        self.pipe.tokenizer = self.pipe.processor.tokenizer
 
         self.pipe.vram_management_enabled = self.pipe.check_vram_management_state()
         
@@ -63,18 +64,19 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         else:
             self.pipe.dit = ComplextroImageDiT(**self.complextro_model_config).to(dtype=torch.bfloat16, device=device)
 
-        text_hidden_size = int(self.pipe.text_encoder.model.config.hidden_size)
+        text_config = getattr(self.pipe.text_encoder.model.config, "text_config", self.pipe.text_encoder.model.config)
+        text_hidden_size = int(text_config.hidden_size)
         dit_text_dim = int(self.pipe.dit.txt_in.in_features)
         if text_hidden_size != dit_text_dim:
             raise ValueError(
                 f"Text encoder hidden_size ({text_hidden_size}) != Complextro text_embed_dim ({dit_text_dim}). "
-                f"Please align ZImageTextEncoder model_size and ComplextroImageDiT(text_embed_dim=...)."
+                f"Please align QwenImageTextEncoder(model_type='qwen3_5', model_size='0.8B') and ComplextroImageDiT(text_embed_dim=...)."
             )
 
         self.pipe.freeze_except(["dit"])
         self.pipe.scheduler.set_timesteps(1000, training=True)
 
-    def _normalize_omni_edit_images(self, edit_value: Any, batch_size: int) -> Optional[List[List[Any]]]:
+    def _normalize_edit_images(self, edit_value: Any, batch_size: int) -> Optional[List[List[Any]]]:
         if edit_value is None:
             return None
         if not isinstance(edit_value, list):
@@ -141,16 +143,13 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         batch_size = self._infer_batch_size(prompt_value, image_value)
         height, width = self._infer_image_hw(image_value)
 
-        omni_edit_images = None
+        edit_images = self._normalize_edit_images(data.get("edit_image", None), batch_size)
+
         omni_noise_mask = None
-        if self.train_omni:
-            omni_edit_images = self._normalize_omni_edit_images(
-                data.get("edit_image", data.get("condition_images", None)),
-                batch_size,
-            )
+        if self.train_omni and edit_images is not None:
             omni_noise_mask = self._normalize_omni_noise_mask(
                 data.get("image_noise_mask", None),
-                omni_edit_images,
+                edit_images,
                 batch_size,
             )
 
@@ -162,8 +161,8 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             "width": width,
             "batch_size": batch_size,
             "cfg_scale": 1,
-            "edit_image": omni_edit_images,
-            "omni_mode": self.train_omni and omni_edit_images is not None,
+            "edit_image": edit_images,
+            "omni_mode": self.train_omni and edit_images is not None,
             "image_noise_mask": omni_noise_mask,
             "use_gradient_checkpointing": False,
             "use_gradient_checkpointing_offload": False,
@@ -190,7 +189,7 @@ if __name__ == "__main__":
 
     2) Omni/编辑训练模式（train_omni = True）
             - 在普通字段基础上可选增加：
-                - edit_image 或 condition_images:
+                - edit_image:
                     a) List[str] / List[PIL]，表示所有样本共享同一组条件图
                     b) List[List[str]] / List[List[PIL]]，每个样本独立条件图组
                     c) 当 batch>1 且长度等于 batch_size 的平铺 List，会自动视作每样本1张条件图
@@ -203,8 +202,39 @@ if __name__ == "__main__":
     3) Batch 与分桶兼容性
             - 脚本中 batch_size 会由 prompt/image 两侧自动取最大值，避免单边长度触发错配。
             - UnifiedDataset 在 enable_bucket=True 时，会按 bucket_data_key='image' 建桶，并对 data_file_keys
-                中存在的图像字段都应用 main_data_operator；因此 edit_image/condition_images 也可自动读取与缩放。
+                中存在的图像字段都应用 main_data_operator；因此 edit_image 也可自动读取与缩放。
             - 建议 bucket_base_reso、min/max_bucket_reso 与 height_division_factor/width_division_factor 保持 16 的倍数。
+
+    4) 关于“非 Omni 也可读参考图”的说明（重点）
+            - 当前 Complextro 的 PromptEmbedder 已接入 Qwen3.5 多模态聊天模板。
+            - 这意味着在 omni_mode=False 时，仍可向文本编码器传 edit_image，作为视觉上下文参与 prompt 编码。
+            - 但 omni_mode=False 不会启用 omni latent 路径；它只影响 TE 编码，不做条件 latent 拼接。
+
+    5) 元数据示例（有参考图）
+            - CSV 示例（单参考图，最稳妥）
+                列名建议至少包含: image,prompt,edit_image
+
+                image,prompt,edit_image
+                train/target_0001.jpg,"保持人物主体，改成二次元手办风格",refs/ref_0001.jpg
+                train/target_0002.jpg,"保持构图，改成像素风",refs/ref_0002.jpg
+
+            - JSON 示例（支持单图或多图参考）
+                [
+                    {
+                        "image": "train/target_0001.jpg",
+                        "prompt": "保持人物主体，改成二次元手办风格",
+                        "edit_image": "refs/ref_0001.jpg"
+                    },
+                    {
+                        "image": "train/target_0002.jpg",
+                        "prompt": "保持主体配色，增强金属质感",
+                        "edit_image": ["refs/ref_0002a.jpg", "refs/ref_0002b.jpg"]
+                    }
+                ]
+
+            - 路径规则：
+                metadata 里的相对路径会拼接到 UnifiedDataset 的 base_path；
+                如果你写绝对路径，也可以直接读取。
     """
 
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=8)
@@ -230,7 +260,7 @@ if __name__ == "__main__":
         ],
     }
 
-    data_file_keys = ("image", "edit_image", "condition_images") if train_omni else ("image",)
+    data_file_keys = ("image", "edit_image")
 
     train_resolution = (512, 512)
     max_bucket_reso = 1024

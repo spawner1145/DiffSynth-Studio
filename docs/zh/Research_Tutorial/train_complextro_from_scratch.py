@@ -1,7 +1,7 @@
 import torch, accelerate
 from typing import List, Optional, Any
 
-from transformers import AutoTokenizer
+from transformers import AutoProcessor
 from diffsynth.core import UnifiedDataset, load_model
 from diffsynth.diffusion import (
     DiffusionTrainingModule,
@@ -9,8 +9,8 @@ from diffsynth.diffusion import (
     ModelLogger,
     launch_training_task,
 )
-from diffsynth.models.z_image_text_encoder import ZImageTextEncoder
-from diffsynth.utils.state_dict_converters.z_image_text_encoder import ZImageTextEncoderStateDictConverter
+from diffsynth.models.qwen_image_text_encoder import QwenImageTextEncoder
+from diffsynth.utils.state_dict_converters.qwen_image_text_encoder import QwenImageTextEncoderStateDictConverter
 from diffsynth.models.flux2_vae import Flux2VAE
 from diffsynth.models.complextro_dit import ComplextroImageDiT
 from diffsynth.pipelines.complextro import ComplextroPipeline
@@ -20,9 +20,9 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
     def __init__(
         self,
         device,
-        qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/sakiko/model.safetensors",
+        qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/qwen3_5/model.safetensors",
         flux2_vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
-        qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/sakiko",
+        qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5",
         train_omni: bool = False,
         complextro_model_config: Optional[dict] = None,
     ):
@@ -33,12 +33,12 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         self.pipe = ComplextroPipeline(device=device, torch_dtype=torch.bfloat16)
 
         self.pipe.text_encoder = load_model(
-            ZImageTextEncoder,
+            QwenImageTextEncoder,
             qwen_model_file,
-            config={"model_size": "0.6B"},
+            config={"model_type": "qwen3_5", "model_size": "0.8B"},
             torch_dtype=torch.bfloat16,
             device=device,
-            state_dict_converter=ZImageTextEncoderStateDictConverter,
+            state_dict_converter=QwenImageTextEncoderStateDictConverter,
         )
         self.pipe.vae = load_model(
             Flux2VAE,
@@ -46,17 +46,19 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             torch_dtype=torch.bfloat16,
             device=device,
         )
-        self.pipe.tokenizer = AutoTokenizer.from_pretrained(qwen_tokenizer_dir)
+        self.pipe.processor = AutoProcessor.from_pretrained(qwen_tokenizer_dir)
+        self.pipe.tokenizer = self.pipe.processor.tokenizer
 
         self.pipe.vram_management_enabled = self.pipe.check_vram_management_state()
         self.pipe.dit = ComplextroImageDiT(**self.complextro_model_config).to(dtype=torch.bfloat16, device=device)
 
-        text_hidden_size = int(self.pipe.text_encoder.model.config.hidden_size)
+        text_config = getattr(self.pipe.text_encoder.model.config, "text_config", self.pipe.text_encoder.model.config)
+        text_hidden_size = int(text_config.hidden_size)
         dit_text_dim = int(self.pipe.dit.txt_in.in_features)
         if text_hidden_size != dit_text_dim:
             raise ValueError(
                 f"Text encoder hidden_size ({text_hidden_size}) != Complextro text_embed_dim ({dit_text_dim}). "
-                f"Please align ZImageTextEncoder model_size and ComplextroImageDiT(text_embed_dim=...)."
+                f"Please align QwenImageTextEncoder(model_type='qwen3_5', model_size='0.8B') and ComplextroImageDiT(text_embed_dim=...)."
             )
 
         self.pipe.freeze_except(["dit"])

@@ -2,10 +2,10 @@ import os
 import torch
 from PIL import Image
 
-from transformers import AutoTokenizer
+from transformers import AutoProcessor
 from diffsynth.core import load_model
-from diffsynth.models.z_image_text_encoder import ZImageTextEncoder
-from diffsynth.utils.state_dict_converters.z_image_text_encoder import ZImageTextEncoderStateDictConverter
+from diffsynth.models.qwen_image_text_encoder import QwenImageTextEncoder
+from diffsynth.utils.state_dict_converters.qwen_image_text_encoder import QwenImageTextEncoderStateDictConverter
 from diffsynth.models.flux2_vae import Flux2VAE
 from diffsynth.models.complextro_dit import ComplextroImageDiT
 from diffsynth.models.siglip2_image_encoder import Siglip2ImageEncoder428M
@@ -15,10 +15,10 @@ from diffsynth.pipelines.complextro import ComplextroPipeline
 def build_complextro_pipe(
     device="cuda",
     torch_dtype=torch.bfloat16,
-    qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/qwen3/model.safetensors",
+    qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/qwen3_5/model.safetensors",
     flux2_vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
     complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v1/model-e3-s10059.safetensors",
-    qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3",
+    qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5",
     siglip_model_file=None,
     complextro_model_config=None,
 ):
@@ -27,12 +27,12 @@ def build_complextro_pipe(
         complextro_model_config = {}
 
     pipe.text_encoder = load_model(
-        ZImageTextEncoder,
+        QwenImageTextEncoder,
         qwen_model_file,
-        config={"model_size": "0.6B"},
+        config={"model_type": "qwen3_5", "model_size": "0.8B"},
         torch_dtype=torch_dtype,
         device=device,
-        state_dict_converter=ZImageTextEncoderStateDictConverter,
+        state_dict_converter=QwenImageTextEncoderStateDictConverter,
     )
     pipe.vae = load_model(
         Flux2VAE,
@@ -40,7 +40,8 @@ def build_complextro_pipe(
         torch_dtype=torch_dtype,
         device=device,
     )
-    pipe.tokenizer = AutoTokenizer.from_pretrained(qwen_tokenizer_dir)
+    pipe.processor = AutoProcessor.from_pretrained(qwen_tokenizer_dir)
+    pipe.tokenizer = pipe.processor.tokenizer
     pipe.dit = load_model(
         ComplextroImageDiT,
         complextro_dit_file,
@@ -49,12 +50,13 @@ def build_complextro_pipe(
         device=device,
     )
 
-    text_hidden_size = int(pipe.text_encoder.model.config.hidden_size)
+    text_config = getattr(pipe.text_encoder.model.config, "text_config", pipe.text_encoder.model.config)
+    text_hidden_size = int(text_config.hidden_size)
     dit_text_dim = int(pipe.dit.txt_in.in_features)
     if text_hidden_size != dit_text_dim:
         raise ValueError(
             f"Text encoder hidden_size ({text_hidden_size}) != Complextro text_embed_dim ({dit_text_dim}). "
-            f"Please align ZImageTextEncoder model_size and ComplextroImageDiT(text_embed_dim=...)."
+            f"Please align QwenImageTextEncoder(model_type='qwen3_5', model_size='0.8B') and ComplextroImageDiT(text_embed_dim=...)."
         )
 
     if siglip_model_file is not None and os.path.exists(siglip_model_file):
@@ -85,10 +87,10 @@ if __name__ == "__main__":
     pipe = build_complextro_pipe(
         device=device,
         torch_dtype=dtype,
-        qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/qwen3/model.safetensors",
+        qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/qwen3_5/model.safetensors",
         flux2_vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
         complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v1/model-e3-s10059.safetensors",
-        qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3",
+        qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5",
         siglip_model_file=None,
         complextro_model_config=complextro_model_config,
     )

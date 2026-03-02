@@ -8,9 +8,9 @@ from ..diffusion import FlowMatchScheduler
 from ..core import ModelConfig
 from ..diffusion.base_pipeline import BasePipeline, PipelineUnit
 
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoProcessor
 from ..models.complextro_dit import ComplextroImageDiT
-from ..models.z_image_text_encoder import ZImageTextEncoder
+from ..models.qwen_image_text_encoder import QwenImageTextEncoder
 from ..models.flux2_vae import Flux2VAE
 from ..models.siglip2_image_encoder import Siglip2ImageEncoder428M
 
@@ -25,11 +25,12 @@ class ComplextroPipeline(BasePipeline):
             width_division_factor=16,
         )
         self.scheduler = FlowMatchScheduler("FLUX.2")
-        self.text_encoder: ZImageTextEncoder = None
+        self.text_encoder: QwenImageTextEncoder = None
         self.dit: ComplextroImageDiT = None
         self.vae: Flux2VAE = None
         self.image_encoder: Siglip2ImageEncoder428M = None
         self.tokenizer: AutoTokenizer = None
+        self.processor: AutoProcessor = None
         self.in_iteration_models = ("dit",)
         self.units = [
             ComplextroUnit_ShapeChecker(),
@@ -47,19 +48,25 @@ class ComplextroPipeline(BasePipeline):
         torch_dtype: torch.dtype = torch.bfloat16,
         device: Union[str, torch.device] = get_device_type(),
         model_configs: list[ModelConfig] = [],
-        tokenizer_config: ModelConfig = ModelConfig(model_id="Tongyi-MAI/Z-Image-Turbo", origin_file_pattern="tokenizer/"),
+        tokenizer_config: ModelConfig = ModelConfig(model_id="Qwen/Qwen3.5-0.8B", origin_file_pattern="tokenizer/"),
+        processor_config: ModelConfig = ModelConfig(model_id="Qwen/Qwen3.5-0.8B", origin_file_pattern="tokenizer/"),
         vram_limit: float = None,
     ):
         pipe = ComplextroPipeline(device=device, torch_dtype=torch_dtype)
         model_pool = pipe.download_and_load_models(model_configs, vram_limit)
 
-        pipe.text_encoder = model_pool.fetch_model("z_image_text_encoder")
+        pipe.text_encoder = model_pool.fetch_model("qwen_image_text_encoder")
         pipe.dit = model_pool.fetch_model("complextro_dit")
         pipe.vae = model_pool.fetch_model("flux2_vae")
         pipe.image_encoder = model_pool.fetch_model("siglip_vision_model_428m")
         if tokenizer_config is not None:
             tokenizer_config.download_if_necessary()
             pipe.tokenizer = AutoTokenizer.from_pretrained(tokenizer_config.path)
+        if processor_config is not None:
+            processor_config.download_if_necessary()
+            pipe.processor = AutoProcessor.from_pretrained(processor_config.path)
+            if pipe.tokenizer is None and hasattr(pipe.processor, "tokenizer"):
+                pipe.tokenizer = pipe.processor.tokenizer
 
         pipe.vram_management_enabled = pipe.check_vram_management_state()
         return pipe
@@ -167,40 +174,100 @@ class ComplextroUnit_PromptEmbedder(PipelineUnit):
             seperate_cfg=True,
             input_params_posi={"prompt": "prompt"},
             input_params_nega={"prompt": "negative_prompt"},
+            input_params=("edit_image",),
             output_params=("prompt_emb", "prompt_emb_mask"),
             onload_model_names=("text_encoder",),
         )
 
-    def _apply_template(self, tokenizer, prompt: str):
-        if hasattr(tokenizer, "apply_chat_template"):
-            return tokenizer.apply_chat_template(
-                [{"role": "user", "content": prompt}],
+    def _normalize_image_groups(self, edit_image, batch_size):
+        if edit_image is None:
+            return [None] * batch_size
+        if isinstance(edit_image, list) and len(edit_image) > 0 and isinstance(edit_image[0], list):
+            if len(edit_image) == batch_size:
+                return edit_image
+            if len(edit_image) == 1:
+                return [edit_image[0] for _ in range(batch_size)]
+            return [edit_image[i % len(edit_image)] for i in range(batch_size)]
+        images = edit_image if isinstance(edit_image, list) else [edit_image]
+        return [images for _ in range(batch_size)]
+
+    def _build_chat_content(self, prompt: str, images):
+        if images is None or len(images) == 0:
+            return prompt
+        content = [{"type": "image", "image": image} for image in images]
+        content.append({"type": "text", "text": prompt})
+        return content
+
+    def _apply_template(self, template_source, prompt: str, images=None):
+        content = self._build_chat_content(prompt, images)
+        if hasattr(template_source, "apply_chat_template"):
+            return template_source.apply_chat_template(
+                [{"role": "user", "content": content}],
                 tokenize=False,
                 add_generation_prompt=True,
                 enable_thinking=False,
             )
         return prompt
 
-    def process(self, pipe: ComplextroPipeline, prompt):
+    def process(self, pipe: ComplextroPipeline, prompt, edit_image=None):
         pipe.load_models_to_device(self.onload_model_names)
         prompts = [prompt] if isinstance(prompt, str) else list(prompt)
-        texts = [self._apply_template(pipe.tokenizer, p) for p in prompts]
+        image_groups = self._normalize_image_groups(edit_image, len(prompts))
 
-        model_inputs = pipe.tokenizer(
-            texts,
-            padding="max_length",
-            truncation=True,
-            max_length=512,
-            return_tensors="pt",
-        ).to(pipe.device)
+        template_source = pipe.processor if pipe.processor is not None else pipe.tokenizer
+        if template_source is None:
+            raise ValueError("ComplextroPipeline requires tokenizer or processor for prompt encoding.")
 
-        output = pipe.text_encoder(
-            input_ids=model_inputs.input_ids,
-            attention_mask=model_inputs.attention_mask,
-            output_hidden_states=True,
-            use_cache=False,
-        )
-        prompt_emb = output.hidden_states[-2].to(dtype=pipe.torch_dtype, device=pipe.device) # 暂时保留意见，-1好像效果一般
+        texts = []
+        flat_images = []
+        has_any_image = False
+        for prompt_item, images in zip(prompts, image_groups):
+            local_images = images
+            if isinstance(prompt_item, str) and prompt_item.strip() == "":
+                local_images = None
+            texts.append(self._apply_template(template_source, prompt_item, local_images))
+            if local_images is not None and len(local_images) > 0:
+                has_any_image = True
+                flat_images.extend(local_images)
+
+        if pipe.processor is not None:
+            model_inputs = pipe.processor(
+                text=texts,
+                images=flat_images if has_any_image else None,
+                padding="max_length",
+                truncation=True,
+                max_length=1024,
+                return_tensors="pt",
+            ).to(pipe.device)
+        else:
+            model_inputs = pipe.tokenizer(
+                texts,
+                padding="max_length",
+                truncation=True,
+                max_length=1024,
+                return_tensors="pt",
+            ).to(pipe.device)
+
+        model_kwargs = {
+            "input_ids": model_inputs.input_ids,
+            "attention_mask": model_inputs.attention_mask,
+            "output_hidden_states": True,
+            "use_cache": False,
+        }
+        if hasattr(model_inputs, "pixel_values"):
+            model_kwargs["pixel_values"] = model_inputs.pixel_values
+        if hasattr(model_inputs, "pixel_values_videos"):
+            model_kwargs["pixel_values_videos"] = model_inputs.pixel_values_videos
+        if hasattr(model_inputs, "image_grid_thw"):
+            model_kwargs["image_grid_thw"] = model_inputs.image_grid_thw
+        if hasattr(model_inputs, "video_grid_thw"):
+            model_kwargs["video_grid_thw"] = model_inputs.video_grid_thw
+        if hasattr(model_inputs, "mm_token_type_ids"):
+            model_kwargs["mm_token_type_ids"] = model_inputs.mm_token_type_ids
+
+        output = pipe.text_encoder(**model_kwargs)
+        hidden_states = output.hidden_states if hasattr(output, "hidden_states") else output
+        prompt_emb = hidden_states[-2].to(dtype=pipe.torch_dtype, device=pipe.device) # 暂时保留意见，-1好像效果一般
         prompt_emb_mask = model_inputs.attention_mask.to(device=pipe.device, dtype=torch.long)
         return {"prompt_emb": prompt_emb, "prompt_emb_mask": prompt_emb_mask}
 
