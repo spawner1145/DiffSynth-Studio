@@ -13,6 +13,14 @@ qwen_image_series = [
         "state_dict_converter": "diffsynth.utils.state_dict_converters.qwen_image_text_encoder.QwenImageTextEncoderStateDictConverter",
     },
     {
+        # Example: ModelConfig(model_id="Qwen/Qwen3.5-0.8B", origin_file_pattern="*.safetensors")
+        "model_hash": "1467b562b0f639266b8535f850a0bae2",
+        "model_name": "qwen_image_text_encoder",
+        "model_class": "diffsynth.models.qwen_image_text_encoder.QwenImageTextEncoder",
+        "state_dict_converter": "diffsynth.utils.state_dict_converters.qwen_image_text_encoder.QwenImageTextEncoderStateDictConverter",
+        "extra_kwargs": {"model_type": "qwen3_5", "model_size": "0.8B"},
+    },
+    {
         # Example: ModelConfig(model_id="Qwen/Qwen-Image", origin_file_pattern="vae/diffusion_pytorch_model.safetensors")
         "model_hash": "ed4ea5824d55ec3107b09815e318123a",
         "model_name": "qwen_image_vae",
