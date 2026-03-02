@@ -1,20 +1,33 @@
 def QwenImageTextEncoderStateDictConverter(state_dict):
-    has_new_prefix = False
-    for k in state_dict:
-        if k.startswith("model.visual.") or k.startswith("model.language_model."):
-            has_new_prefix = True
-            break
+    keys = list(state_dict.keys())
+
+    has_wrapped_qwen35_prefix = any(k.startswith("model.model.visual.") for k in keys) or any(
+        k.startswith("model.model.language_model.") for k in keys
+    )
+
+    is_qwen35_conditional_checkpoint = (
+        any(k.startswith("model.visual.") for k in keys)
+        and any(k.startswith("model.language_model.") for k in keys)
+        and not has_wrapped_qwen35_prefix
+    )
 
     state_dict_ = {}
-    for k in state_dict:
-        v = state_dict[k]
-        if has_new_prefix:
+    for k, v in state_dict.items():
+        if k.startswith("mtp."):
+            continue
+
+        if is_qwen35_conditional_checkpoint:
+            if k.startswith("model."):
+                k = "model." + k
+            elif k.startswith("lm_head."):
+                k = "model." + k
             state_dict_[k] = v
             continue
 
         if k.startswith("visual."):
             k = "model." + k
-        elif k.startswith("model."):
+        elif k.startswith("model.") and not k.startswith("model.visual.") and not k.startswith("model.language_model."):
             k = k.replace("model.", "model.language_model.", 1)
         state_dict_[k] = v
+
     return state_dict_
