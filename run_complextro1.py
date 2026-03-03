@@ -15,10 +15,10 @@ from diffsynth.pipelines.complextro import ComplextroPipeline
 def build_complextro_pipe(
     device="cuda",
     torch_dtype=torch.bfloat16,
-    qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/qwen3_5/model.safetensors",
+    qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw/model.safetensors",
     flux2_vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
     complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e3-s10059.safetensors",
-    qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5",
+    qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw",
     siglip_model_file=None,
     complextro_model_config=None,
 ):
@@ -85,13 +85,19 @@ if __name__ == "__main__":
 
     3) omni_mode=True 的含义：
         - 在 TE 读图之外，还会启用 omni 路径（edit latents / image_noise_mask）。
+
+        4) Prompt 扩展语法：
+                - `<prompt start>` 前为 system prompt，后为 user 正文。
+                    例："你是风格控制助手<prompt start>生成可爱像素风角色"
+                - `<break>` 会把正文拆成多个段，分别编码后再拼接。
+                    例："系统提示<prompt start>主体描述<break>风格描述<break>背景描述"
     """
     device = "cuda"
     dtype = torch.bfloat16
     # 需要和训练时候配置一样
     complextro_model_config = {
-        "num_layers": 12,
-        "num_refiner_layers": 1,
+        "num_layers": 8,
+        "num_refiner_layers": 0,
         "hidden_size": 3072,
         "num_attention_heads": 24,
         "attention_head_dim": 128,
@@ -101,10 +107,10 @@ if __name__ == "__main__":
     pipe = build_complextro_pipe(
         device=device,
         torch_dtype=dtype,
-        qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/qwen3_5/model.safetensors",
+        qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw/model.safetensors-00001-of-00001.safetensors",
         flux2_vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
-        complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e36-s120708.safetensors",
-        qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5",
+        complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v0/model-e4-s67044.safetensors",
+        qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw",
         siglip_model_file=None,
         complextro_model_config=complextro_model_config,
     )

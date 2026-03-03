@@ -20,11 +20,11 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
     def __init__(
         self,
         device,
-        qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/qwen3_5/model.safetensors",
+        qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw/model.safetensors-00001-of-00001.safetensors",
         flux2_vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
-        qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5",
-        complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e43-s19221.safetensors",
-        #complextro_dit_file="",
+        qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw",
+        #complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e43-s19221.safetensors",
+        complextro_dit_file="",
         train_omni: bool = False,
         complextro_model_config: Optional[dict] = None,
     ):
@@ -137,8 +137,30 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             return int(first_image.shape[-2]), int(first_image.shape[-1])
         raise ValueError("Cannot infer image height/width from data['image']")
 
+    def _normalize_negative_prompt(self, prompt_value: Any, neg_prompt_value: Any):
+        if isinstance(prompt_value, str):
+            if isinstance(neg_prompt_value, list):
+                return neg_prompt_value[0] if len(neg_prompt_value) > 0 else ""
+            return "" if neg_prompt_value is None else neg_prompt_value
+
+        prompt_batch = len(prompt_value)
+        if neg_prompt_value is None:
+            return [""] * prompt_batch
+        if isinstance(neg_prompt_value, str):
+            return [neg_prompt_value] * prompt_batch
+        if not isinstance(neg_prompt_value, list):
+            return [str(neg_prompt_value)] * prompt_batch
+        if len(neg_prompt_value) == prompt_batch:
+            return neg_prompt_value
+        if len(neg_prompt_value) == 1:
+            return [neg_prompt_value[0]] * prompt_batch
+        if len(neg_prompt_value) == 0:
+            return [""] * prompt_batch
+        return [neg_prompt_value[i % len(neg_prompt_value)] for i in range(prompt_batch)]
+
     def forward(self, data):
         prompt_value = data["prompt"]
+        neg_prompt_value = self._normalize_negative_prompt(prompt_value, data.get("neg_prompt", ""))
         image_value = data["image"]
         batch_size = self._infer_batch_size(prompt_value, image_value)
         height, width = self._infer_image_hw(image_value)
@@ -154,7 +176,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             )
 
         inputs_posi = {"prompt": prompt_value}
-        inputs_nega = {"negative_prompt": ""}
+        inputs_nega = {"negative_prompt": neg_prompt_value}
         inputs_shared = {
             "input_image": image_value,
             "height": height,
@@ -185,7 +207,16 @@ if __name__ == "__main__":
             - 必需字段：
                 - image: 图像路径或路径列表（由 UnifiedDataset + default_image_operator 读取为 PIL）
                 - prompt: 字符串或字符串列表
+            - 可选字段：
+                - neg_prompt: 负面提示词（支持字符串或字符串列表；列名固定为 neg_prompt）
             - 训练目标：单图生成（不使用编辑条件图）
+
+    1.1) Prompt 扩展语法（正面/负面都支持）
+            - `<prompt start>` 前为 system prompt，后为 user 正文。
+                例："你是风格助手<prompt start>保留主体，做二次元化"
+            - `<break>` 将正文拆成多段，分别编码后拼接。
+                例："系统提示<prompt start>主体描述<break>风格描述<break>背景描述"
+            - 若字符串中不含 `<prompt start>`，则按“无 system prompt”处理。
 
     2) Omni/编辑训练模式（train_omni = True）
             - 在普通字段基础上可选增加：
@@ -213,21 +244,27 @@ if __name__ == "__main__":
     5) 元数据示例（有参考图）
             - CSV 示例（单参考图，最稳妥）
                 列名建议至少包含: image,prompt,edit_image
+                如需负面提示词可额外添加: neg_prompt
 
                 image,prompt,edit_image
                 train/target_0001.jpg,"保持人物主体，改成二次元手办风格",refs/ref_0001.jpg
                 train/target_0002.jpg,"保持构图，改成像素风",refs/ref_0002.jpg
+
+                image,prompt,neg_prompt,edit_image
+                train/target_0003.jpg,"你是写实风格助手<prompt start>保持主体<break>增强材质细节","你是约束助手<prompt start>低质量，模糊，水印",refs/ref_0003.jpg
 
             - JSON 示例（支持单图或多图参考）
                 [
                     {
                         "image": "train/target_0001.jpg",
                         "prompt": "保持人物主体，改成二次元手办风格",
+                        "neg_prompt": "低质量，模糊，水印",
                         "edit_image": "refs/ref_0001.jpg"
                     },
                     {
                         "image": "train/target_0002.jpg",
                         "prompt": "保持主体配色，增强金属质感",
+                        "neg_prompt": "你是约束助手<prompt start>低质量<break>噪点<break>过饱和",
                         "edit_image": ["refs/ref_0002a.jpg", "refs/ref_0002b.jpg"]
                     }
                 ]
@@ -237,36 +274,36 @@ if __name__ == "__main__":
                 如果你写绝对路径，也可以直接读取。
     """
 
-    accelerator = accelerate.Accelerator(gradient_accumulation_steps=8)
+    accelerator = accelerate.Accelerator(gradient_accumulation_steps=1)
     train_omni = False
 
     # 1.05 B 配置
     # 你也可以改成更深更宽(一般是直接改num_layers和num_refiner_layers)；需要满足 hidden_size = num_attention_heads * attention_head_dim
     # 默认是num_layers=60，num_refiner_layers=2的配置
     complextro_model_config = {
-        "num_layers": 12,
+        "num_layers": 8,
         "num_refiner_layers": 0,
         "hidden_size": 3072,
         "num_attention_heads": 24,
         "attention_head_dim": 128,
         "rope_axes_dim": [16, 56, 56],
-        "enable_tread_routing": True,
+        "enable_tread_routing": False,
         "tread_routes": [
             {
                 "selection_ratio": 0.5,
                 "start_layer_idx": 2,
-                "end_layer_idx": 8,
+                "end_layer_idx": 4,
             }
         ],
     }
 
-    data_file_keys = ("image", "edit_image")
+    data_file_keys = ("image", "edit_image", "condition_images") if train_omni else ("image",)
 
-    train_resolution = (512, 512)
+    train_resolution = (256,256)
     max_bucket_reso = 1024
     dataset = UnifiedDataset(
-        base_path="/root/autodl-tmp/DiffSynth-Studio/danbooru/images",
-        metadata_path="/root/autodl-tmp/DiffSynth-Studio/danbooru/metadata.csv",
+        base_path="/root/autodl-tmp/DiffSynth-Studio/data/images",
+        metadata_path="/root/autodl-tmp/DiffSynth-Studio/data/metadata_merged.csv",
         max_data_items=10000000,
         data_file_keys=data_file_keys,
         enable_bucket=True,
@@ -277,7 +314,7 @@ if __name__ == "__main__":
         bucket_data_key="image",
         bucket_base_reso=train_resolution,
         main_data_operator=UnifiedDataset.default_image_operator(
-            base_path="/root/autodl-tmp/DiffSynth-Studio/danbooru/images",
+            base_path="/root/autodl-tmp/DiffSynth-Studio/data/images",
             height=None,
             width=None,
             max_pixels=max_bucket_reso * max_bucket_reso,
@@ -292,7 +329,7 @@ if __name__ == "__main__":
         complextro_model_config=complextro_model_config,
     )
     model_logger = ModelLogger(
-        "models/Complextro/v3", # dit输出文件夹
+        "models/Complextro/v0", # dit输出文件夹
         remove_prefix_in_ckpt="pipe.dit.",
     )
 
@@ -301,12 +338,12 @@ if __name__ == "__main__":
         dataset,
         model,
         model_logger,
-        batch_size=15,
-        learning_rate=1e-3,
-        optimizer_type="pytorch_optimizer.Adan",
-        lr_scheduler_type="constant_with_warmup",
-        lr_warmup_steps=100,
-        mup_scale=True,
+        batch_size=2,
+        learning_rate=1e-4,
+        optimizer_type="adamw",
+        lr_scheduler_type="constant",
+        lr_warmup_steps=0,
+        mup_scale=False,
         mup_base_dim=1.0,
         mup_dim=complextro_model_config.get("hidden_size", None),
         max_grad_norm=1.0,

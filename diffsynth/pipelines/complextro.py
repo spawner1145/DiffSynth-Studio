@@ -2,6 +2,7 @@ import torch
 from PIL import Image
 from typing import Union, List, Optional
 from tqdm import tqdm
+import inspect
 
 from ..core.device.npu_compatible_device import get_device_type
 from ..diffusion import FlowMatchScheduler
@@ -198,6 +199,24 @@ class ComplextroUnit_PromptEmbedder(PipelineUnit):
         content.append({"type": "text", "text": prompt})
         return content
 
+    def _split_prompt_segments(self, prompt_text: str):
+        if prompt_text is None:
+            return [""]
+        segments = [segment.strip() for segment in str(prompt_text).split("<break>")]
+        segments = [segment for segment in segments if segment != ""]
+        return segments if len(segments) > 0 else [""]
+
+    def _parse_system_and_user(self, text_segment: str):
+        marker = "<prompt start>"
+        if marker not in text_segment:
+            return None, text_segment
+        system_prompt, user_prompt = text_segment.split(marker, 1)
+        system_prompt = system_prompt.strip()
+        user_prompt = user_prompt.strip()
+        if system_prompt == "":
+            system_prompt = None
+        return system_prompt, user_prompt
+
     def process(self, pipe: ComplextroPipeline, prompt, edit_image=None):
         pipe.load_models_to_device(self.onload_model_names)
         prompts = [prompt] if isinstance(prompt, str) else list(prompt)
@@ -209,31 +228,52 @@ class ComplextroUnit_PromptEmbedder(PipelineUnit):
 
         has_any_image = False
         conversations = []
-        for prompt_item, images in zip(prompts, image_groups):
+        segment_owner = []
+        for owner_id, (prompt_item, images) in enumerate(zip(prompts, image_groups)):
             local_images = images
             if isinstance(prompt_item, str) and prompt_item.strip() == "":
                 local_images = None
             if local_images is not None and len(local_images) > 0:
                 has_any_image = True
-            content = self._build_chat_content(prompt_item, local_images)
-            conversations.append([{"role": "user", "content": content}])
+            prompt_segments = self._split_prompt_segments(prompt_item)
+            for prompt_segment in prompt_segments:
+                system_prompt, user_prompt = self._parse_system_and_user(prompt_segment)
+                user_prompt = "" if user_prompt is None else user_prompt
+                messages = []
+                if system_prompt is not None:
+                    messages.append({
+                        "role": "system",
+                        "content": [{"type": "text", "text": system_prompt}],
+                    })
+                messages.append({
+                    "role": "user",
+                    "content": self._build_chat_content(user_prompt, local_images),
+                })
+                conversations.append(messages)
+                segment_owner.append(owner_id)
+
+        if len(prompts) == 0:
+            return {"prompt_emb": torch.empty(0, device=pipe.device), "prompt_emb_mask": torch.empty(0, device=pipe.device, dtype=torch.long)}
 
         if has_any_image and pipe.processor is None:
             raise ValueError("Image prompts require an AutoProcessor; tokenizer-only mode cannot encode images.")
         if not hasattr(template_source, "apply_chat_template"):
             raise ValueError("Selected tokenizer/processor does not support apply_chat_template.")
 
-        model_inputs = template_source.apply_chat_template(
-            conversations,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
-            padding="max_length",
-            truncation=True,
-            max_length=1024,
-            add_generation_prompt=True,
-            enable_thinking=False,
-        ).to(pipe.device)
+        template_kwargs = {
+            "tokenize": True,
+            "return_dict": True,
+            "return_tensors": "pt",
+            "padding": "max_length",
+            "truncation": True,
+            "max_length": 1024,
+            "add_generation_prompt": True,
+        }
+        signature = inspect.signature(template_source.apply_chat_template)
+        if "enable_thinking" in signature.parameters:
+            template_kwargs["enable_thinking"] = False
+
+        model_inputs = template_source.apply_chat_template(conversations, **template_kwargs).to(pipe.device)
 
         model_kwargs = {
             "input_ids": model_inputs.input_ids,
@@ -254,8 +294,37 @@ class ComplextroUnit_PromptEmbedder(PipelineUnit):
 
         output = pipe.text_encoder(**model_kwargs)
         hidden_states = output.hidden_states if hasattr(output, "hidden_states") else output
-        prompt_emb = hidden_states[-2].to(dtype=pipe.torch_dtype, device=pipe.device) # 暂时保留意见，-1好像效果一般
-        prompt_emb_mask = model_inputs.attention_mask.to(device=pipe.device, dtype=torch.long)
+        segment_emb = hidden_states[-2].to(dtype=pipe.torch_dtype, device=pipe.device) # 暂时保留意见，-1好像效果一般
+        segment_mask = model_inputs.attention_mask.to(device=pipe.device, dtype=torch.long)
+
+        emb_groups = [[] for _ in range(len(prompts))]
+        mask_groups = [[] for _ in range(len(prompts))]
+        for seg_id, owner_id in enumerate(segment_owner):
+            valid_length = int(segment_mask[seg_id].sum().item())
+            if valid_length <= 0:
+                continue
+            emb_groups[owner_id].append(segment_emb[seg_id, :valid_length])
+            mask_groups[owner_id].append(segment_mask[seg_id, :valid_length])
+
+        hidden_dim = segment_emb.shape[-1]
+        merged_emb = []
+        merged_mask = []
+        for owner_id in range(len(prompts)):
+            if len(emb_groups[owner_id]) == 0:
+                merged_emb.append(torch.zeros((1, hidden_dim), dtype=pipe.torch_dtype, device=pipe.device))
+                merged_mask.append(torch.ones((1,), dtype=torch.long, device=pipe.device))
+                continue
+            merged_emb.append(torch.cat(emb_groups[owner_id], dim=0))
+            merged_mask.append(torch.cat(mask_groups[owner_id], dim=0))
+
+        target_seq_len = 1024
+        prompt_emb = torch.zeros((len(prompts), target_seq_len, hidden_dim), dtype=pipe.torch_dtype, device=pipe.device)
+        prompt_emb_mask = torch.zeros((len(prompts), target_seq_len), dtype=torch.long, device=pipe.device)
+        for batch_id, (emb_item, mask_item) in enumerate(zip(merged_emb, merged_mask)):
+            local_len = min(int(emb_item.shape[0]), target_seq_len)
+            prompt_emb[batch_id, :local_len] = emb_item[:local_len]
+            prompt_emb_mask[batch_id, :local_len] = mask_item[:local_len]
+
         return {"prompt_emb": prompt_emb, "prompt_emb_mask": prompt_emb_mask}
 
 
