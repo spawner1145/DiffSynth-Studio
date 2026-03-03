@@ -193,21 +193,10 @@ class ComplextroUnit_PromptEmbedder(PipelineUnit):
 
     def _build_chat_content(self, prompt: str, images):
         if images is None or len(images) == 0:
-            return prompt
+            return [{"type": "text", "text": prompt}]
         content = [{"type": "image", "image": image} for image in images]
         content.append({"type": "text", "text": prompt})
         return content
-
-    def _apply_template(self, template_source, prompt: str, images=None):
-        content = self._build_chat_content(prompt, images)
-        if hasattr(template_source, "apply_chat_template"):
-            return template_source.apply_chat_template(
-                [{"role": "user", "content": content}],
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=False,
-            )
-        return prompt
 
     def process(self, pipe: ComplextroPipeline, prompt, edit_image=None):
         pipe.load_models_to_device(self.onload_model_names)
@@ -218,35 +207,33 @@ class ComplextroUnit_PromptEmbedder(PipelineUnit):
         if template_source is None:
             raise ValueError("ComplextroPipeline requires tokenizer or processor for prompt encoding.")
 
-        texts = []
-        flat_images = []
         has_any_image = False
+        conversations = []
         for prompt_item, images in zip(prompts, image_groups):
             local_images = images
             if isinstance(prompt_item, str) and prompt_item.strip() == "":
                 local_images = None
-            texts.append(self._apply_template(template_source, prompt_item, local_images))
             if local_images is not None and len(local_images) > 0:
                 has_any_image = True
-                flat_images.extend(local_images)
+            content = self._build_chat_content(prompt_item, local_images)
+            conversations.append([{"role": "user", "content": content}])
 
-        if pipe.processor is not None:
-            model_inputs = pipe.processor(
-                text=texts,
-                images=flat_images if has_any_image else None,
-                padding="max_length",
-                truncation=True,
-                max_length=1024,
-                return_tensors="pt",
-            ).to(pipe.device)
-        else:
-            model_inputs = pipe.tokenizer(
-                texts,
-                padding="max_length",
-                truncation=True,
-                max_length=1024,
-                return_tensors="pt",
-            ).to(pipe.device)
+        if has_any_image and pipe.processor is None:
+            raise ValueError("Image prompts require an AutoProcessor; tokenizer-only mode cannot encode images.")
+        if not hasattr(template_source, "apply_chat_template"):
+            raise ValueError("Selected tokenizer/processor does not support apply_chat_template.")
+
+        model_inputs = template_source.apply_chat_template(
+            conversations,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+            padding="max_length",
+            truncation=True,
+            max_length=1024,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        ).to(pipe.device)
 
         model_kwargs = {
             "input_ids": model_inputs.input_ids,
