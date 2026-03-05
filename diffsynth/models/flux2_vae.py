@@ -1940,8 +1940,13 @@ class Flux2VAE(torch.nn.Module):
         batch_norm_eps: float = 1e-4,
         batch_norm_momentum: float = 0.1,
         patch_size: Tuple[int, int] = (2, 2),
+        use_alpha_layer: bool = False,
     ):
         super().__init__()
+
+        if use_alpha_layer:
+            in_channels = 4
+            out_channels = 4
 
         # pass init params to Encoder
         self.encoder = Encoder(
@@ -1981,6 +1986,7 @@ class Flux2VAE(torch.nn.Module):
 
         self.use_slicing = False
         self.use_tiling = False
+        self.use_alpha_layer = use_alpha_layer
 
     @property
     # Copied from diffusers.models.unets.unet_2d_condition.UNet2DConditionModel.attn_processors

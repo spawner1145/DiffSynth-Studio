@@ -1509,6 +1509,14 @@ class ComplextroImageDiT(torch.nn.Module):
                     raise ValueError("height/width required when latents are tokenized and sequence is not square.")
                 latent_h = latent_w = side
 
+        expected_channels = int(self.img_in.in_features)
+        actual_channels = int(image_tokens.shape[-1])
+        if actual_channels != expected_channels:
+            raise ValueError(
+                f"Latent channel mismatch for ComplextroImageDiT: got {actual_channels}, expected {expected_channels}. "
+                f"Please align DiT(in_channels) with Flux2VAE latent channels/patching config."
+            )
+
         text_tokens = self.txt_in(self.txt_norm(prompt_emb))
         image_tokens = self.img_in(image_tokens)
 

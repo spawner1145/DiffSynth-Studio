@@ -44,6 +44,24 @@ class ComplextroPipeline(BasePipeline):
         ]
         self.model_fn = model_fn_complextro
 
+    def _get_vae_input_channels(self) -> Optional[int]:
+        if self.vae is None:
+            return None
+        if hasattr(self.vae, "encoder") and hasattr(self.vae.encoder, "conv_in"):
+            return int(self.vae.encoder.conv_in.in_channels)
+        return None
+
+    def _normalize_image_mode_for_vae(self, image):
+        expected_channels = self._get_vae_input_channels()
+        if expected_channels not in (3, 4):
+            return image
+        target_mode = "RGBA" if expected_channels == 4 else "RGB"
+        if isinstance(image, list):
+            return [self._normalize_image_mode_for_vae(i) for i in image]
+        if isinstance(image, Image.Image) and image.mode != target_mode:
+            return image.convert(target_mode)
+        return image
+
     @staticmethod
     def from_pretrained(
         torch_dtype: torch.dtype = torch.bfloat16,
@@ -336,8 +354,9 @@ class ComplextroUnit_NoiseInitializer(PipelineUnit):
         )
 
     def process(self, pipe: ComplextroPipeline, height, width, seed, rand_device, batch_size=1):
+        latent_channels = int(pipe.dit.img_in.in_features) if pipe.dit is not None else 128
         noise = pipe.generate_noise(
-            (int(batch_size), 128, height // 16, width // 16),
+            (int(batch_size), latent_channels, height // 16, width // 16),
             seed=seed,
             rand_device=rand_device,
             rand_torch_dtype=pipe.torch_dtype,
@@ -357,6 +376,7 @@ class ComplextroUnit_InputImageEmbedder(PipelineUnit):
         if input_image is None:
             return {"latents": noise, "input_latents": None}
         pipe.load_models_to_device(self.onload_model_names)
+        input_image = pipe._normalize_image_mode_for_vae(input_image)
         if isinstance(input_image, list):
             image = torch.cat([pipe.preprocess_image(img) for img in input_image], dim=0)
         else:
@@ -399,6 +419,7 @@ class ComplextroUnit_EditImageEmbedder(PipelineUnit):
         if edit_image is None:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
+        edit_image = pipe._normalize_image_mode_for_vae(edit_image)
         if isinstance(edit_image, list) and len(edit_image) > 0 and isinstance(edit_image[0], list):
             edit_latents = []
             for image_group in edit_image:

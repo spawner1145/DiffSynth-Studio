@@ -20,6 +20,7 @@ def build_complextro_pipe(
     complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e3-s10059.safetensors",
     qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw",
     siglip_model_file=None,
+    use_alpha_layer_vae: bool = False,
     complextro_model_config=None,
 ):
     pipe = ComplextroPipeline(device=device, torch_dtype=torch_dtype)
@@ -37,6 +38,7 @@ def build_complextro_pipe(
     pipe.vae = load_model(
         Flux2VAE,
         flux2_vae_file,
+        config={"use_alpha_layer": use_alpha_layer_vae},
         torch_dtype=torch_dtype,
         device=device,
     )
@@ -112,6 +114,7 @@ if __name__ == "__main__":
         complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v0/model-e4-s67044.safetensors",
         qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw",
         siglip_model_file=None,
+        use_alpha_layer_vae=False,
         complextro_model_config=complextro_model_config,
     )
 

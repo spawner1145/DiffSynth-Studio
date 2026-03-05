@@ -26,6 +26,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         #complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e43-s19221.safetensors",
         complextro_dit_file="",
         train_omni: bool = False,
+        use_alpha_layer_vae: bool = False,
         complextro_model_config: Optional[dict] = None,
     ):
         super().__init__()
@@ -45,6 +46,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         self.pipe.vae = load_model(
             Flux2VAE,
             flux2_vae_file,
+            config={"use_alpha_layer": use_alpha_layer_vae},
             torch_dtype=torch.bfloat16,
             device=device,
         )
@@ -276,6 +278,7 @@ if __name__ == "__main__":
 
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=1)
     train_omni = False
+    use_alpha_layer_vae = False
 
     # 1.05 B 配置
     # 你也可以改成更深更宽(一般是直接改num_layers和num_refiner_layers)；需要满足 hidden_size = num_attention_heads * attention_head_dim
@@ -326,6 +329,7 @@ if __name__ == "__main__":
     model = ComplextroTrainingModule(
         device=accelerator.device,
         train_omni=train_omni,
+        use_alpha_layer_vae=use_alpha_layer_vae,
         complextro_model_config=complextro_model_config,
     )
     model_logger = ModelLogger(
