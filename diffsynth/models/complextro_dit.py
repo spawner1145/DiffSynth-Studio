@@ -491,10 +491,33 @@ class ComplextroSingleTransformerBlock(nn.Module):
                 raise ValueError("temb must be provided when modulation is enabled.")
 
             if token_type_ids is not None:
+                target_batch = hidden_states.shape[0]
+
                 if temb.ndim == 2:
+                    if temb.shape[0] == 1 and target_batch > 1:
+                        temb = temb.expand(target_batch, -1)
+                    elif temb.shape[0] != target_batch:
+                        raise ValueError("temb batch size must match hidden_states batch size.")
                     temb = temb.unsqueeze(1).expand(-1, hidden_states.shape[1], -1)
-                elif temb.ndim == 3 and temb.shape[1] != hidden_states.shape[1]:
-                    raise ValueError("temb sequence length must match hidden_states when token_type_ids is provided.")
+                elif temb.ndim == 3:
+                    if temb.shape[0] == 1 and target_batch > 1:
+                        temb = temb.expand(target_batch, -1, -1)
+                    elif temb.shape[0] != target_batch:
+                        raise ValueError("temb batch size must match hidden_states batch size.")
+                    if temb.shape[1] == 1 and hidden_states.shape[1] > 1:
+                        temb = temb.expand(-1, hidden_states.shape[1], -1)
+                    elif temb.shape[1] != hidden_states.shape[1]:
+                        raise ValueError("temb sequence length must match hidden_states when token_type_ids is provided.")
+                else:
+                    raise ValueError("temb must be 2D or 3D when token_type_ids is provided.")
+
+                if token_type_ids.shape[0] == 1 and target_batch > 1:
+                    token_type_ids = token_type_ids.expand(target_batch, -1)
+                elif token_type_ids.shape[0] != target_batch:
+                    raise ValueError("token_type_ids batch size must match hidden_states batch size.")
+                if token_type_ids.shape[1] != hidden_states.shape[1]:
+                    raise ValueError("token_type_ids sequence length must match hidden_states sequence length.")
+
                 token_type_ids = token_type_ids.to(device=hidden_states.device, dtype=torch.long).clamp(
                     TOKEN_TYPE_TEXT, TOKEN_TYPE_SIGLIP
                 )
