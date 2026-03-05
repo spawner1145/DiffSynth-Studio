@@ -7,6 +7,9 @@ from .general_modules import TimestepEmbeddings, RMSNorm, AdaLayerNorm
 from ..core.gradient import gradient_checkpoint_forward
 
 SEQ_MULTI_OF = 32
+TOKEN_TYPE_TEXT = 0
+TOKEN_TYPE_IMAGE = 1
+TOKEN_TYPE_SIGLIP = 2
 
 try:
     import flash_attn_interface
@@ -386,77 +389,6 @@ class ComplextroFeedForward(nn.Module):
             hidden_states = module(hidden_states)
         return hidden_states
 
-class ComplextroDoubleStreamAttention(nn.Module):
-    def __init__(
-        self,
-        dim_a,
-        dim_b,
-        num_heads,
-        head_dim,
-    ):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-
-        self.to_q = nn.Linear(dim_a, dim_a)
-        self.to_k = nn.Linear(dim_a, dim_a)
-        self.to_v = nn.Linear(dim_a, dim_a)
-        self.norm_q = RMSNorm(head_dim, eps=1e-6)
-        self.norm_k = RMSNorm(head_dim, eps=1e-6)
-
-        self.add_q_proj = nn.Linear(dim_b, dim_b)
-        self.add_k_proj = nn.Linear(dim_b, dim_b)
-        self.add_v_proj = nn.Linear(dim_b, dim_b)
-        self.norm_added_q = RMSNorm(head_dim, eps=1e-6)
-        self.norm_added_k = RMSNorm(head_dim, eps=1e-6)
-
-        self.to_out = torch.nn.Sequential(nn.Linear(dim_a, dim_a))
-        self.to_add_out = nn.Linear(dim_b, dim_b)
-
-    def forward(
-        self,
-        image: torch.FloatTensor,
-        text: torch.FloatTensor,
-        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        enable_fp8_attention: bool = False,
-    ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
-        img_q, img_k, img_v = self.to_q(image), self.to_k(image), self.to_v(image)
-        txt_q, txt_k, txt_v = self.add_q_proj(text), self.add_k_proj(text), self.add_v_proj(text)
-        seq_txt = txt_q.shape[1]
-
-        img_q = rearrange(img_q, 'b s (h d) -> b h s d', h=self.num_heads)
-        img_k = rearrange(img_k, 'b s (h d) -> b h s d', h=self.num_heads)
-        img_v = rearrange(img_v, 'b s (h d) -> b h s d', h=self.num_heads)
-
-        txt_q = rearrange(txt_q, 'b s (h d) -> b h s d', h=self.num_heads)
-        txt_k = rearrange(txt_k, 'b s (h d) -> b h s d', h=self.num_heads)
-        txt_v = rearrange(txt_v, 'b s (h d) -> b h s d', h=self.num_heads)
-
-        img_q, img_k = self.norm_q(img_q), self.norm_k(img_k)
-        txt_q, txt_k = self.norm_added_q(txt_q), self.norm_added_k(txt_k)
-        
-        if image_rotary_emb is not None:
-            img_freqs, txt_freqs = image_rotary_emb
-            img_q = apply_rotary_emb_complextro(img_q, img_freqs)
-            img_k = apply_rotary_emb_complextro(img_k, img_freqs)
-            txt_q = apply_rotary_emb_complextro(txt_q, txt_freqs)
-            txt_k = apply_rotary_emb_complextro(txt_k, txt_freqs)
-
-        joint_q = torch.cat([txt_q, img_q], dim=2)
-        joint_k = torch.cat([txt_k, img_k], dim=2)
-        joint_v = torch.cat([txt_v, img_v], dim=2)
-
-        joint_attn_out = complextro_image_flash_attention(joint_q, joint_k, joint_v, num_heads=joint_q.shape[1], attention_mask=attention_mask, enable_fp8_attention=enable_fp8_attention).to(joint_q.dtype)
-
-        txt_attn_output = joint_attn_out[:, :seq_txt, :]
-        img_attn_output = joint_attn_out[:, seq_txt:, :]
-
-        img_attn_output = self.to_out(img_attn_output)
-        txt_attn_output = self.to_add_out(txt_attn_output)
-
-        return img_attn_output, txt_attn_output
-
 
 class ComplextroSingleStreamAttention(nn.Module):
     def __init__(
@@ -505,123 +437,6 @@ class ComplextroSingleStreamAttention(nn.Module):
         return attn_out
 
 
-class ComplextroImageTransformerBlock(nn.Module):
-    def __init__(
-        self, 
-        dim: int, 
-        num_attention_heads: int, 
-        attention_head_dim: int, 
-        eps: float = 1e-6,
-    ):    
-        super().__init__()
-        
-        self.dim = dim
-        self.num_attention_heads = num_attention_heads
-        self.attention_head_dim = attention_head_dim
-
-        self.img_mod = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(dim, 6 * dim), 
-        )
-        self.img_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.attn = ComplextroDoubleStreamAttention(
-            dim_a=dim,
-            dim_b=dim,
-            num_heads=num_attention_heads,
-            head_dim=attention_head_dim,
-        )
-        self.img_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.img_mlp = ComplextroFeedForward(dim=dim, dim_out=dim)
-
-        self.txt_mod = nn.Sequential(
-            nn.SiLU(),
-            nn.Linear(dim, 6 * dim, bias=True), 
-        )
-        self.txt_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.txt_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.txt_mlp = ComplextroFeedForward(dim=dim, dim_out=dim)
-    
-    def _modulate(self, x, mod_params, index=None):
-        shift, scale, gate = mod_params.chunk(3, dim=-1)
-        if index is not None:
-            # Assuming mod_params batch dim is 2*actual_batch (chunked into 2 parts)
-            # So shift, scale, gate have shape [2*actual_batch, d]
-            actual_batch = shift.size(0) // 2
-            shift_0, shift_1 = shift[:actual_batch], shift[actual_batch:]  # each: [actual_batch, d]
-            scale_0, scale_1 = scale[:actual_batch], scale[actual_batch:]
-            gate_0, gate_1 = gate[:actual_batch], gate[actual_batch:]
-
-            # index: [b, l] where b is actual batch size
-            # Expand to [b, l, 1] to match feature dimension
-            index_expanded = index.unsqueeze(-1)  # [b, l, 1]
-
-            # Expand chunks to [b, 1, d] then broadcast to [b, l, d]
-            shift_0_exp = shift_0.unsqueeze(1)  # [b, 1, d]
-            shift_1_exp = shift_1.unsqueeze(1)  # [b, 1, d]
-            scale_0_exp = scale_0.unsqueeze(1)
-            scale_1_exp = scale_1.unsqueeze(1)
-            gate_0_exp = gate_0.unsqueeze(1)
-            gate_1_exp = gate_1.unsqueeze(1)
-
-            # Use torch.where to select based on index
-            shift_result = torch.where(index_expanded == 0, shift_0_exp, shift_1_exp)
-            scale_result = torch.where(index_expanded == 0, scale_0_exp, scale_1_exp)
-            gate_result = torch.where(index_expanded == 0, gate_0_exp, gate_1_exp)
-        else:
-            shift_result = shift.unsqueeze(1)
-            scale_result = scale.unsqueeze(1)
-            gate_result = gate.unsqueeze(1)
-
-        return x * (1 + scale_result) + shift_result, gate_result
-
-    def forward(
-        self,
-        image: torch.Tensor,  
-        text: torch.Tensor,
-        temb: torch.Tensor, 
-        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        enable_fp8_attention = False,
-        modulate_index: Optional[List[int]] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-
-        img_mod_attn, img_mod_mlp = self.img_mod(temb).chunk(2, dim=-1)  # [B, 3*dim] each
-        if modulate_index is not None:
-            temb = torch.chunk(temb, 2, dim=0)[0]
-        txt_mod_attn, txt_mod_mlp = self.txt_mod(temb).chunk(2, dim=-1)  # [B, 3*dim] each
-
-        img_normed = self.img_norm1(image)
-        img_modulated, img_gate = self._modulate(img_normed, img_mod_attn, index=modulate_index)
-
-        txt_normed = self.txt_norm1(text)
-        txt_modulated, txt_gate = self._modulate(txt_normed, txt_mod_attn)
-
-        img_attn_out, txt_attn_out = self.attn(
-            image=img_modulated,
-            text=txt_modulated,
-            image_rotary_emb=image_rotary_emb,
-            attention_mask=attention_mask,
-            enable_fp8_attention=enable_fp8_attention,
-        )
-        
-        image = image + img_gate * img_attn_out
-        text = text + txt_gate * txt_attn_out
-
-        img_normed_2 = self.img_norm2(image)
-        img_modulated_2, img_gate_2 = self._modulate(img_normed_2, img_mod_mlp, index=modulate_index)
-
-        txt_normed_2 = self.txt_norm2(text)
-        txt_modulated_2, txt_gate_2 = self._modulate(txt_normed_2, txt_mod_mlp)
-
-        img_mlp_out = self.img_mlp(img_modulated_2)
-        txt_mlp_out = self.txt_mlp(txt_modulated_2)
-
-        image = image + img_gate_2 * img_mlp_out
-        text = text + txt_gate_2 * txt_mlp_out
-
-        return text, image
-
-
 class ComplextroSingleTransformerBlock(nn.Module):
     def __init__(
         self,
@@ -652,11 +467,21 @@ class ComplextroSingleTransformerBlock(nn.Module):
                 nn.SiLU(),
                 nn.Linear(dim, 6 * dim),
             )
+            self.modulation_mlps = nn.ModuleList(
+                [
+                    nn.Sequential(
+                        nn.SiLU(),
+                        nn.Linear(dim, 6 * dim),
+                    )
+                    for _ in range(3)
+                ]
+            )
 
     def forward(
         self,
         hidden_states: torch.Tensor,
         temb: Optional[torch.Tensor] = None,
+        token_type_ids: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         enable_fp8_attention: bool = False,
@@ -664,10 +489,26 @@ class ComplextroSingleTransformerBlock(nn.Module):
         if self.modulation:
             if temb is None:
                 raise ValueError("temb must be provided when modulation is enabled.")
-            mod = self.modulation_mlp(temb)
-            if mod.ndim == 2:
-                mod = mod.unsqueeze(1)
+
+            if token_type_ids is not None:
+                if temb.ndim == 2:
+                    temb = temb.unsqueeze(1).expand(-1, hidden_states.shape[1], -1)
+                elif temb.ndim == 3 and temb.shape[1] != hidden_states.shape[1]:
+                    raise ValueError("temb sequence length must match hidden_states when token_type_ids is provided.")
+                token_type_ids = token_type_ids.to(device=hidden_states.device, dtype=torch.long).clamp(
+                    TOKEN_TYPE_TEXT, TOKEN_TYPE_SIGLIP
+                )
+                mod_candidates = torch.stack([mlp(temb) for mlp in self.modulation_mlps], dim=2)
+                gather_index = token_type_ids.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, mod_candidates.shape[-1])
+                mod = torch.gather(mod_candidates, dim=2, index=gather_index).squeeze(2)
+            else:
+                mod = self.modulation_mlp(temb)
+                if mod.ndim == 2:
+                    mod = mod.unsqueeze(1)
+
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=-1)
+            gate_msa = torch.tanh(gate_msa)
+            gate_mlp = torch.tanh(gate_mlp)
 
             normed = self.norm1(hidden_states)
             normed = normed * (1 + scale_msa) + shift_msa
@@ -827,6 +668,29 @@ class ComplextroImageDiT(torch.nn.Module):
         if "image_pad_token" not in state_dict:
             state_dict = dict(state_dict)
             state_dict["image_pad_token"] = self.image_pad_token.detach().clone()
+
+        if not isinstance(state_dict, dict):
+            state_dict = dict(state_dict)
+
+        for module_prefix, module in self.named_modules():
+            if not isinstance(module, ComplextroSingleTransformerBlock) or not getattr(module, "modulation", False):
+                continue
+
+            base_prefix = f"{module_prefix}.modulation_mlp.1"
+            base_weight_key = f"{base_prefix}.weight"
+            base_bias_key = f"{base_prefix}.bias"
+
+            if base_weight_key not in state_dict or base_bias_key not in state_dict:
+                continue
+
+            for head_idx in range(3):
+                head_prefix = f"{module_prefix}.modulation_mlps.{head_idx}.1"
+                head_weight_key = f"{head_prefix}.weight"
+                head_bias_key = f"{head_prefix}.bias"
+                if head_weight_key not in state_dict:
+                    state_dict[head_weight_key] = state_dict[base_weight_key].detach().clone()
+                if head_bias_key not in state_dict:
+                    state_dict[head_bias_key] = state_dict[base_bias_key].detach().clone()
 
         if self.siglip_pad_token is not None:
             if "siglip_pad_token" not in state_dict:
@@ -1221,6 +1085,7 @@ class ComplextroImageDiT(torch.nn.Module):
             unified_list = []
             freqs_list = []
             temb_list = []
+            token_type_list = []
             valid_masks_list = []
             seq_lens = []
             x_sizes = []
@@ -1500,6 +1365,9 @@ class ComplextroImageDiT(torch.nn.Module):
                     conditioning_noisy[b : b + 1],
                     conditioning_clean[b : b + 1],
                 ).squeeze(0)
+                unified_token_types = [TOKEN_TYPE_TEXT] * txt_seq_len + [TOKEN_TYPE_IMAGE] * image_tokens.shape[0]
+                if sig_tokens is not None:
+                    unified_token_types = unified_token_types + [TOKEN_TYPE_SIGLIP] * sig_tokens.shape[0]
 
                 # Align omni unified order with z_image_dit: [cap, x, siglip]
                 unified = torch.cat([text_tokens_b, image_tokens] + ([sig_tokens] if sig_tokens is not None else []), dim=0)
@@ -1508,6 +1376,7 @@ class ComplextroImageDiT(torch.nn.Module):
                 unified_list.append(unified)
                 freqs_list.append(unified_freqs)
                 temb_list.append(unified_temb)
+                token_type_list.append(torch.tensor(unified_token_types, dtype=torch.long, device=prompt_emb.device))
                 valid_masks_list.append(torch.tensor(unified_token_valid_mask, dtype=torch.bool, device=prompt_emb.device))
                 seq_lens.append(unified.shape[0])
                 x_sizes.append(size_list)
@@ -1523,6 +1392,7 @@ class ComplextroImageDiT(torch.nn.Module):
                 token_valid_masks=valid_masks_list,
             )
             unified_temb = pad_sequence(temb_list, batch_first=True, padding_value=0.0)
+            unified_token_types = pad_sequence(token_type_list, batch_first=True, padding_value=TOKEN_TYPE_TEXT)
 
             use_tread_routing = self.training and self.tread_router is not None
             route_idx = 0
@@ -1530,19 +1400,25 @@ class ComplextroImageDiT(torch.nn.Module):
             route_ids_keep = None
             routed_key_mask = None
             routed_unified_temb = unified_temb
+            routed_unified_token_types = unified_token_types
             route_original_unified = None
             route_original_freqs = None
             route_original_temb = None
+            route_original_token_types = None
 
             for block_idx, block in enumerate(self.transformer_blocks):
                 if use_tread_routing and current_route is not None and block_idx == current_route["start_layer_idx"]:
                     route_original_unified = unified
                     route_original_freqs = unified_freqs
                     route_original_temb = unified_temb
+                    route_original_token_types = unified_token_types
                     route_ids_keep = self.tread_router.get_mask(unified, selection_rate=current_route["selection_ratio"])
                     unified = self.tread_router.start_route(unified, route_ids_keep)
                     unified_freqs = self.tread_router.start_route(unified_freqs, route_ids_keep)
                     routed_unified_temb = self.tread_router.start_route(unified_temb, route_ids_keep)
+                    routed_unified_token_types = self.tread_router.start_route(
+                        unified_token_types.unsqueeze(-1), route_ids_keep
+                    ).squeeze(-1)
                     if key_mask is not None:
                         routed_key_mask = key_mask.gather(
                             -1,
@@ -1553,6 +1429,7 @@ class ComplextroImageDiT(torch.nn.Module):
 
                 active_key_mask = routed_key_mask if route_ids_keep is not None else key_mask
                 active_temb = routed_unified_temb if route_ids_keep is not None else unified_temb
+                active_token_types = routed_unified_token_types if route_ids_keep is not None else unified_token_types
 
                 unified = gradient_checkpoint_forward(
                     block,
@@ -1560,6 +1437,7 @@ class ComplextroImageDiT(torch.nn.Module):
                     use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
                     hidden_states=unified,
                     temb=active_temb,
+                    token_type_ids=active_token_types,
                     image_rotary_emb=unified_freqs,
                     attention_mask=active_key_mask,
                 )
@@ -1568,12 +1446,19 @@ class ComplextroImageDiT(torch.nn.Module):
                     unified = self.tread_router.end_route(unified, route_ids_keep, route_original_unified)
                     unified_freqs = self.tread_router.end_route(unified_freqs, route_ids_keep, route_original_freqs)
                     unified_temb = self.tread_router.end_route(routed_unified_temb, route_ids_keep, route_original_temb)
+                    unified_token_types = self.tread_router.end_route(
+                        routed_unified_token_types.unsqueeze(-1),
+                        route_ids_keep,
+                        route_original_token_types.unsqueeze(-1),
+                    ).squeeze(-1)
                     route_ids_keep = None
                     routed_key_mask = None
                     routed_unified_temb = unified_temb
+                    routed_unified_token_types = unified_token_types
                     route_original_unified = None
                     route_original_freqs = None
                     route_original_temb = None
+                    route_original_token_types = None
                     route_idx += 1
                     current_route = self.tread_routes[route_idx] if route_idx < len(self.tread_routes) else None
 
@@ -1700,6 +1585,7 @@ class ComplextroImageDiT(torch.nn.Module):
         # (keep optional siglip support by appending after cap when present)
         unified_list = []
         freqs_list = []
+        token_type_list = []
         seq_lens = []
         x_seqlen = image_tokens.shape[1]
         x_pos_offsets = []
@@ -1723,12 +1609,15 @@ class ComplextroImageDiT(torch.nn.Module):
                 siglip_freqs = img_freqs_all[x_seqlen : x_seqlen + siglip_len]
                 unified_b = torch.cat([image_b, text_b, siglip_b], dim=0)
                 freqs_b = torch.cat([img_freqs, txt_freqs, siglip_freqs], dim=0)
+                unified_type_b = [TOKEN_TYPE_IMAGE] * x_seqlen + [TOKEN_TYPE_TEXT] * txt_len + [TOKEN_TYPE_SIGLIP] * siglip_len
             else:
                 unified_b = torch.cat([image_b, text_b], dim=0)
                 freqs_b = torch.cat([img_freqs, txt_freqs], dim=0)
+                unified_type_b = [TOKEN_TYPE_IMAGE] * x_seqlen + [TOKEN_TYPE_TEXT] * txt_len
 
             unified_list.append(unified_b)
             freqs_list.append(freqs_b)
+            token_type_list.append(torch.tensor(unified_type_b, dtype=torch.long, device=image_tokens.device))
             seq_lens.append(unified_b.shape[0])
             x_pos_offsets.append((0, x_seqlen))
 
@@ -1739,6 +1628,7 @@ class ComplextroImageDiT(torch.nn.Module):
             dtype=image_tokens.dtype,
             device=image_tokens.device,
         )
+        unified_token_types = pad_sequence(token_type_list, batch_first=True, padding_value=TOKEN_TYPE_TEXT)
 
         use_tread_routing = self.training and self.tread_router is not None
         route_idx = 0
@@ -1747,14 +1637,20 @@ class ComplextroImageDiT(torch.nn.Module):
         routed_key_mask = None
         route_original_unified = None
         route_original_freqs = None
+        route_original_token_types = None
+        routed_unified_token_types = unified_token_types
 
         for block_idx, block in enumerate(self.transformer_blocks):
             if use_tread_routing and current_route is not None and block_idx == current_route["start_layer_idx"]:
                 route_original_unified = unified
                 route_original_freqs = unified_freqs
+                route_original_token_types = unified_token_types
                 route_ids_keep = self.tread_router.get_mask(unified, selection_rate=current_route["selection_ratio"])
                 unified = self.tread_router.start_route(unified, route_ids_keep)
                 unified_freqs = self.tread_router.start_route(unified_freqs, route_ids_keep)
+                routed_unified_token_types = self.tread_router.start_route(
+                    unified_token_types.unsqueeze(-1), route_ids_keep
+                ).squeeze(-1)
                 if key_mask is not None:
                     routed_key_mask = key_mask.gather(
                         -1,
@@ -1764,6 +1660,7 @@ class ComplextroImageDiT(torch.nn.Module):
                     routed_key_mask = None
 
             active_key_mask = routed_key_mask if route_ids_keep is not None else key_mask
+            active_token_types = routed_unified_token_types if route_ids_keep is not None else unified_token_types
 
             unified = gradient_checkpoint_forward(
                 block,
@@ -1771,6 +1668,7 @@ class ComplextroImageDiT(torch.nn.Module):
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
                 hidden_states=unified,
                 temb=conditioning,
+                token_type_ids=active_token_types,
                 image_rotary_emb=unified_freqs,
                 attention_mask=active_key_mask,
             )
@@ -1778,10 +1676,17 @@ class ComplextroImageDiT(torch.nn.Module):
             if use_tread_routing and current_route is not None and block_idx == current_route["end_layer_idx"]:
                 unified = self.tread_router.end_route(unified, route_ids_keep, route_original_unified)
                 unified_freqs = self.tread_router.end_route(unified_freqs, route_ids_keep, route_original_freqs)
+                unified_token_types = self.tread_router.end_route(
+                    routed_unified_token_types.unsqueeze(-1),
+                    route_ids_keep,
+                    route_original_token_types.unsqueeze(-1),
+                ).squeeze(-1)
                 route_ids_keep = None
                 routed_key_mask = None
+                routed_unified_token_types = unified_token_types
                 route_original_unified = None
                 route_original_freqs = None
+                route_original_token_types = None
                 route_idx += 1
                 current_route = self.tread_routes[route_idx] if route_idx < len(self.tread_routes) else None
 
