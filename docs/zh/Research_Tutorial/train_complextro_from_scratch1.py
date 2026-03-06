@@ -144,8 +144,8 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             return [[v] for v in edit_latent_value]
         return [edit_latent_value for _ in range(batch_size)]
 
-    def _normalize_omni_noise_mask(self, noise_mask_value: Any, edit_images: Optional[List[List[Any]]], batch_size: int):
-        if edit_images is None:
+    def _normalize_omni_noise_mask(self, noise_mask_value: Any, condition_groups: Optional[List[List[Any]]], batch_size: int):
+        if condition_groups is None:
             return None
 
         def fit_len(mask, cond_num):
@@ -159,19 +159,19 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             return local[:need_len]
 
         if noise_mask_value is None:
-            return [[0] * len(group) + [1] for group in edit_images]
+            return [[0] * len(group) + [1] for group in condition_groups]
         if not isinstance(noise_mask_value, list):
-            return [[int(noise_mask_value)] * len(group) + [1] for group in edit_images]
+            return [[int(noise_mask_value)] * len(group) + [1] for group in condition_groups]
         if len(noise_mask_value) == 0:
-            return [[0] * len(group) + [1] for group in edit_images]
+            return [[0] * len(group) + [1] for group in condition_groups]
         if isinstance(noise_mask_value[0], list):
             if len(noise_mask_value) == batch_size:
-                return [fit_len(noise_mask_value[i], len(edit_images[i])) for i in range(batch_size)]
+                return [fit_len(noise_mask_value[i], len(condition_groups[i])) for i in range(batch_size)]
             if len(noise_mask_value) == 1:
-                return [fit_len(noise_mask_value[0], len(edit_images[i])) for i in range(batch_size)]
+                return [fit_len(noise_mask_value[0], len(condition_groups[i])) for i in range(batch_size)]
             mask_num = len(noise_mask_value)
-            return [fit_len(noise_mask_value[i % mask_num], len(edit_images[i])) for i in range(batch_size)]
-        return [fit_len(noise_mask_value, len(edit_images[i])) for i in range(batch_size)]
+            return [fit_len(noise_mask_value[i % mask_num], len(condition_groups[i])) for i in range(batch_size)]
+        return [fit_len(noise_mask_value, len(condition_groups[i])) for i in range(batch_size)]
 
     def _infer_batch_size(self, prompt_value: Any, image_value: Any) -> int:
         prompt_batch = 1 if isinstance(prompt_value, str) else len(prompt_value)
@@ -218,11 +218,12 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         edit_images = self._normalize_edit_images(data.get("edit_image", None), batch_size)
         edit_latent_inputs = self._normalize_edit_latent_inputs(data.get("edit_latent", None), batch_size)
 
+        omni_condition_groups = edit_images if edit_images is not None else edit_latent_inputs
         omni_noise_mask = None
-        if self.train_omni and edit_images is not None:
+        if self.train_omni and omni_condition_groups is not None:
             omni_noise_mask = self._normalize_omni_noise_mask(
                 data.get("image_noise_mask", None),
-                edit_images,
+                omni_condition_groups,
                 batch_size,
             )
 
@@ -236,7 +237,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             "cfg_scale": 1,
             "edit_image": edit_images,
             "edit_latent": edit_latent_inputs,
-            "omni_mode": self.train_omni and edit_images is not None,
+            "omni_mode": self.train_omni and omni_condition_groups is not None,
             "image_noise_mask": omni_noise_mask,
             "use_gradient_checkpointing": False,
             "use_gradient_checkpointing_offload": False,
@@ -394,7 +395,11 @@ if __name__ == "__main__":
         ],
     }
 
-    data_file_keys = ("image", "edit_image", "edit_latent") if train_omni else ("image",)
+    data_file_keys = (
+        ("image", "edit_image", "edit_latent")
+        if train_omni
+        else ("image", "edit_image")
+    )
 
     train_resolution = (256,256)
     max_bucket_reso = 1024
