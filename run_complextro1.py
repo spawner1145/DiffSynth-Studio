@@ -19,7 +19,7 @@ def build_complextro_pipe(
     flux2_vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
     complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e3-s10059.safetensors",
     qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw",
-    siglip_model_file=None,
+    siglip_model_file="",
     use_alpha_layer_vae: bool = False,
     complextro_model_config=None,
 ):
@@ -29,8 +29,11 @@ def build_complextro_pipe(
     else:
         complextro_model_config = dict(complextro_model_config)
 
-    siglip_enabled = siglip_model_file is not None and os.path.exists(siglip_model_file)
+    siglip_model_file = "" if siglip_model_file is None else str(siglip_model_file).strip()
+    siglip_enabled = bool(siglip_model_file)
     if siglip_enabled:
+        if not os.path.exists(siglip_model_file):
+            raise FileNotFoundError(f"SigLIP model file not found: {siglip_model_file}")
         expected_siglip_feat_dim = 1152
         configured_siglip_feat_dim = complextro_model_config.get("siglip_feat_dim", None)
         if configured_siglip_feat_dim is None:
@@ -131,7 +134,7 @@ if __name__ == "__main__":
         flux2_vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
         complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v0/model-e4-s67044.safetensors",
         qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw",
-        siglip_model_file=None,
+        siglip_model_file="",
         use_alpha_layer_vae=False,
         complextro_model_config=complextro_model_config,
     )

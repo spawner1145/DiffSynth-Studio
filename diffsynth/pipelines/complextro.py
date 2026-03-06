@@ -77,6 +77,26 @@ class ComplextroPipeline(BasePipeline):
         return self._normalize_image_mode_for_vae(image)
 
     @staticmethod
+    def _is_nested_list(value) -> bool:
+        return isinstance(value, list) and len(value) > 0 and isinstance(value[0], list)
+
+    @classmethod
+    def _normalize_grouped_batch_input(cls, value, batch_size: int):
+        if value is None or batch_size <= 1:
+            return value
+        if cls._is_nested_list(value):
+            if len(value) == batch_size:
+                return value
+            if len(value) == 1:
+                return [value[0] for _ in range(batch_size)]
+            return [value[i % len(value)] for i in range(batch_size)]
+
+        values = value if isinstance(value, list) else [value]
+        if len(values) == batch_size:
+            return [[item] for item in values]
+        return [list(values) for _ in range(batch_size)]
+
+    @staticmethod
     def from_pretrained(
         torch_dtype: torch.dtype = torch.bfloat16,
         device: Union[str, torch.device] = get_device_type(),
@@ -135,11 +155,20 @@ class ComplextroPipeline(BasePipeline):
             batch_size = max(batch_size, len(prompt))
         if isinstance(input_image, list):
             batch_size = max(batch_size, len(input_image))
+        if self._is_nested_list(edit_image):
+            batch_size = max(batch_size, len(edit_image))
+        if self._is_nested_list(edit_latent):
+            batch_size = max(batch_size, len(edit_latent))
+        if self._is_nested_list(image_noise_mask):
+            batch_size = max(batch_size, len(image_noise_mask))
 
         if isinstance(prompt, str) and batch_size > 1:
             prompt = [prompt] * batch_size
         if isinstance(negative_prompt, str) and batch_size > 1:
             negative_prompt = [negative_prompt] * batch_size
+
+        edit_image = self._normalize_grouped_batch_input(edit_image, batch_size)
+        edit_latent = self._normalize_grouped_batch_input(edit_latent, batch_size)
 
         inputs_posi = {"prompt": prompt}
         inputs_nega = {"negative_prompt": negative_prompt}
@@ -224,6 +253,8 @@ class ComplextroUnit_PromptEmbedder(PipelineUnit):
                 return [edit_image[0] for _ in range(batch_size)]
             return [edit_image[i % len(edit_image)] for i in range(batch_size)]
         images = edit_image if isinstance(edit_image, list) else [edit_image]
+        if batch_size > 1 and len(images) == batch_size:
+            return [[image] for image in images]
         return [images for _ in range(batch_size)]
 
     def _build_chat_content(self, prompt: str, images):
@@ -461,11 +492,46 @@ class ComplextroUnit_EditImageEmbedder(PipelineUnit):
             return [[value] for value in values]
         return [values for _ in range(batch_size)]
 
+    @staticmethod
+    def _normalize_image_groups(edit_image, batch_size):
+        if edit_image is None:
+            return [None] * batch_size
+        if isinstance(edit_image, list) and len(edit_image) > 0 and isinstance(edit_image[0], list):
+            if len(edit_image) == batch_size:
+                return edit_image
+            if len(edit_image) == 1:
+                return [edit_image[0] for _ in range(batch_size)]
+            return [edit_image[i % len(edit_image)] for i in range(batch_size)]
+        values = edit_image if isinstance(edit_image, list) else [edit_image]
+        if batch_size > 1 and len(values) == batch_size:
+            return [[value] for value in values]
+        return [values for _ in range(batch_size)]
+
+    @staticmethod
+    def _infer_group_count(edit_image, edit_latent) -> int:
+        candidates = []
+        if isinstance(edit_image, list) and len(edit_image) > 0 and isinstance(edit_image[0], list):
+            candidates.append(len(edit_image))
+        if isinstance(edit_latent, list) and len(edit_latent) > 0 and isinstance(edit_latent[0], list):
+            candidates.append(len(edit_latent))
+        return max(candidates) if len(candidates) > 0 else 1
+
     def _resolve_group_latent_inputs(self, edit_image_group, edit_latent_group):
-        image_group = edit_image_group if isinstance(edit_image_group, list) else [edit_image_group]
+        image_group = [] if edit_image_group is None else (edit_image_group if isinstance(edit_image_group, list) else [edit_image_group])
         latent_group = [] if edit_latent_group is None else edit_latent_group
         if not isinstance(latent_group, list):
             latent_group = [latent_group]
+
+        if len(image_group) == 0:
+            resolved_group = []
+            keep_mask = []
+            for latent_value in latent_group:
+                if self._is_pad_marker(latent_value) or self._is_same_as_edit_image_marker(latent_value):
+                    raise ValueError("edit_latent markers '0'/'1' require matching edit_image inputs.")
+                resolved_group.append(latent_value)
+                keep_mask.append(True)
+            return resolved_group, keep_mask
+
         if len(latent_group) > len(image_group):
             raise ValueError("edit_latent entries must be less than or equal to edit_image entries.")
 
@@ -490,18 +556,15 @@ class ComplextroUnit_EditImageEmbedder(PipelineUnit):
         return resolved_group, keep_mask
 
     def process(self, pipe: ComplextroPipeline, edit_image, edit_latent, edit_image_auto_resize):
-        if edit_image is None:
+        if edit_image is None and edit_latent is None:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
         from ..core.data.operators import ImageCropAndResize
         resize_operator = ImageCropAndResize(max_pixels=1024 * 1024, height_division_factor=16, width_division_factor=16)
 
-        if isinstance(edit_image, list) and len(edit_image) > 0 and isinstance(edit_image[0], list):
-            image_groups = edit_image
-        else:
-            image_groups = [edit_image if isinstance(edit_image, list) else [edit_image]]
-
-        latent_groups = self._normalize_latent_groups(edit_latent, len(image_groups))
+        group_count = self._infer_group_count(edit_image, edit_latent)
+        image_groups = self._normalize_image_groups(edit_image, group_count)
+        latent_groups = self._normalize_latent_groups(edit_latent, group_count)
 
         edit_latents = []
         edit_latent_mask = []
@@ -517,7 +580,7 @@ class ComplextroUnit_EditImageEmbedder(PipelineUnit):
             edit_latents.append(group_latents)
             edit_latent_mask.append(keep_mask)
 
-        if not (isinstance(edit_image, list) and len(edit_image) > 0 and isinstance(edit_image[0], list)):
+        if group_count == 1 and not pipe._is_nested_list(edit_image) and not pipe._is_nested_list(edit_latent):
             edit_latents = edit_latents[0]
             edit_latent_mask = edit_latent_mask[0]
         return {"edit_latents": edit_latents, "edit_latent_mask": edit_latent_mask}

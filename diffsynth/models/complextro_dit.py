@@ -1022,6 +1022,59 @@ class ComplextroImageDiT(torch.nn.Module):
         img_freqs = torch.cat(segment_freqs, dim=0)
         return img_freqs, txt_freqs
 
+    def _build_omni_unified_freqs(
+        self,
+        image_sizes: List[Optional[Tuple[int, int]]],
+        image_lengths: List[int],
+        txt_seq_len: int,
+        device: torch.device,
+        siglip_sizes: Optional[List[Optional[Tuple[int, int]]]] = None,
+        siglip_lengths: Optional[List[int]] = None,
+        siglip_ref_sizes: Optional[List[Optional[Tuple[int, int]]]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        image_freqs, _ = self._build_omni_image_freqs(
+            image_sizes=image_sizes,
+            image_lengths=image_lengths,
+            txt_seq_len=1,
+            device=device,
+        )
+
+        txt_ref_shapes = [(1, height, width) for size in image_sizes if size is not None for height, width in [size]]
+        if siglip_sizes is not None:
+            txt_ref_shapes.extend(
+                (1, height, width) for size in siglip_sizes if size is not None for height, width in [size]
+            )
+        if len(txt_ref_shapes) == 0:
+            txt_ref_shapes = [(1, 1, 1)]
+
+        _, txt_freqs = self.pos_embed(txt_ref_shapes, [txt_seq_len], device=device)
+        txt_freqs = txt_freqs[:txt_seq_len]
+
+        siglip_freqs = None
+        if siglip_sizes is not None and siglip_lengths is not None:
+            if siglip_ref_sizes is None:
+                siglip_ref_sizes = [None] * len(siglip_sizes)
+            template_freq = self._build_2d_freqs(1, 1, device=device)[:1]
+            siglip_segments = []
+            for size, ref_size, total_len in zip(siglip_sizes, siglip_ref_sizes, siglip_lengths):
+                if size is None:
+                    siglip_segments.append(template_freq.repeat(total_len, 1))
+                    continue
+
+                sig_h, sig_w = size
+                if ref_size is not None:
+                    ref_h, ref_w = ref_size
+                    local = self._build_scaled_siglip_freqs(sig_h, sig_w, ref_h, ref_w, device=device)
+                else:
+                    local = self._build_2d_freqs(sig_h, sig_w, device=device)
+                if total_len > local.shape[0]:
+                    local = torch.cat([local, local[-1:].repeat(total_len - local.shape[0], 1)], dim=0)
+                siglip_segments.append(local[:total_len])
+
+            siglip_freqs = torch.cat(siglip_segments, dim=0) if len(siglip_segments) > 0 else None
+
+        return image_freqs, txt_freqs, siglip_freqs
+
 
     def process_entity_masks(self, latents, prompt_emb, prompt_emb_mask, entity_prompt_emb, entity_prompt_emb_mask, entity_masks, height, width, image, img_shapes):
         # prompt_emb
@@ -1426,7 +1479,7 @@ class ComplextroImageDiT(torch.nn.Module):
                 sig_token_noise_mask = prepared_sig_noise_masks[b]
                 sig_token_valid_mask = prepared_sig_valid_masks[b]
 
-                img_freqs, txt_freqs = self._build_omni_image_freqs(
+                img_freqs, txt_freqs, sig_freqs = self._build_omni_unified_freqs(
                     image_sizes=size_list,
                     image_lengths=length_list,
                     txt_seq_len=txt_seq_len,
@@ -1454,7 +1507,10 @@ class ComplextroImageDiT(torch.nn.Module):
 
                 # Align omni unified order with base branch: [x, cap, siglip]
                 unified = torch.cat([image_tokens, text_tokens_b] + ([sig_tokens] if sig_tokens is not None else []), dim=0)
-                unified_freqs = torch.cat([img_freqs, txt_freqs], dim=0)
+                unified_freqs = torch.cat(
+                    [img_freqs, txt_freqs] + ([sig_freqs] if sig_freqs is not None else []),
+                    dim=0,
+                )
 
                 unified_list.append(unified)
                 freqs_list.append(unified_freqs)
