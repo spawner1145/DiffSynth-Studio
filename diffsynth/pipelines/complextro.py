@@ -164,8 +164,13 @@ class ComplextroPipeline(BasePipeline):
 
         if isinstance(prompt, str) and batch_size > 1:
             prompt = [prompt] * batch_size
+        elif isinstance(prompt, list) and len(prompt) == 1 and batch_size > 1:
+            prompt = prompt * batch_size
+
         if isinstance(negative_prompt, str) and batch_size > 1:
             negative_prompt = [negative_prompt] * batch_size
+        elif isinstance(negative_prompt, list) and len(negative_prompt) == 1 and batch_size > 1:
+            negative_prompt = negative_prompt * batch_size
 
         edit_image = self._normalize_grouped_batch_input(edit_image, batch_size)
         edit_latent = self._normalize_grouped_batch_input(edit_latent, batch_size)
@@ -296,8 +301,6 @@ class ComplextroUnit_PromptEmbedder(PipelineUnit):
         segment_owner = []
         for owner_id, (prompt_item, images) in enumerate(zip(prompts, image_groups)):
             local_images = images
-            if isinstance(prompt_item, str) and prompt_item.strip() == "":
-                local_images = None
             if local_images is not None and len(local_images) > 0:
                 local_images = [pipe._prepare_multimodal_image(image) for image in local_images]
                 has_any_image = True
