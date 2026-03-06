@@ -26,6 +26,19 @@ def build_complextro_pipe(
     pipe = ComplextroPipeline(device=device, torch_dtype=torch_dtype)
     if complextro_model_config is None:
         complextro_model_config = {}
+    else:
+        complextro_model_config = dict(complextro_model_config)
+
+    siglip_enabled = siglip_model_file is not None and os.path.exists(siglip_model_file)
+    if siglip_enabled:
+        expected_siglip_feat_dim = 1152
+        configured_siglip_feat_dim = complextro_model_config.get("siglip_feat_dim", None)
+        if configured_siglip_feat_dim is None:
+            complextro_model_config["siglip_feat_dim"] = expected_siglip_feat_dim
+        elif int(configured_siglip_feat_dim) != expected_siglip_feat_dim:
+            raise ValueError(
+                f"siglip_feat_dim ({configured_siglip_feat_dim}) must match Siglip2ImageEncoder428M output dim ({expected_siglip_feat_dim})."
+            )
 
     pipe.text_encoder = load_model(
         QwenImageTextEncoder,
@@ -61,7 +74,7 @@ def build_complextro_pipe(
             f"Please align QwenImageTextEncoder(model_type='qwen3_5', model_size='0.8B') and ComplextroImageDiT(text_embed_dim=...)."
         )
 
-    if siglip_model_file is not None and os.path.exists(siglip_model_file):
+    if siglip_enabled:
         pipe.image_encoder = load_model(
             Siglip2ImageEncoder428M,
             siglip_model_file,
@@ -87,6 +100,11 @@ if __name__ == "__main__":
 
     3) omni_mode=True 的含义：
         - 在 TE 读图之外，还会启用 omni 路径（edit latents / image_noise_mask）。
+        - `edit_image` 用于 TE / SigLIP 视觉参考。
+        - `edit_latent` 用于 condition latent，可与 `edit_image` 分开传。
+        - `edit_latent="0"` 表示该槽位插入等长 pad token。
+        - `edit_latent="1"` 表示该槽位直接复用同位 `edit_image`。
+        - `edit_latent` 也可以写独立图片路径，此时会单独读取那张图做 VAE 编码。
 
         4) Prompt 扩展语法：
                 - `<prompt start>` 前为 system prompt，后为 user 正文。
@@ -154,7 +172,9 @@ if __name__ == "__main__":
 
     # Omni 示例
     # 使用前先加载 SigLIP 模型（build_complextro_pipe 里传 siglip_model_file），并准备条件图。
-    # cond_images = [Image.open("cond1.jpg").convert("RGB"), Image.open("cond2.jpg").convert("RGB")]
+    # 这里 edit_image / edit_latent 都支持直接写路径。
+    # cond_images = ["cond1.jpg", "cond2.jpg", "cond3.jpg"]
+    # cond_latents = ["1", "0", "latent_ref_3.jpg"]
     # omni_out = pipe(
     #     prompt="keep subject identity, turn into anime style",
     #     negative_prompt="",
@@ -165,6 +185,7 @@ if __name__ == "__main__":
     #     width=256,
     #     omni_mode=True,
     #     edit_image=cond_images,
+    #     edit_latent=cond_latents,
     #     image_noise_mask=[0, 0, 1],
     # )
     # omni_out.save("complextro_omni.jpg")

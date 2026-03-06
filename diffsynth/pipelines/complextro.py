@@ -1,6 +1,6 @@
 import torch
 from PIL import Image
-from typing import Union, List, Optional
+from typing import Union, List, Optional, Any
 from tqdm import tqdm
 import inspect
 
@@ -62,6 +62,20 @@ class ComplextroPipeline(BasePipeline):
             return image.convert(target_mode)
         return image
 
+    def _load_image(self, image, convert_mode: Optional[str] = None):
+        if isinstance(image, str):
+            image = Image.open(image)
+        if convert_mode is not None and isinstance(image, Image.Image) and image.mode != convert_mode:
+            image = image.convert(convert_mode)
+        return image
+
+    def _prepare_multimodal_image(self, image):
+        return self._load_image(image, convert_mode="RGB")
+
+    def _prepare_vae_image(self, image):
+        image = self._load_image(image)
+        return self._normalize_image_mode_for_vae(image)
+
     @staticmethod
     def from_pretrained(
         torch_dtype: torch.dtype = torch.bfloat16,
@@ -99,6 +113,7 @@ class ComplextroPipeline(BasePipeline):
         input_image: Image.Image = None,
         denoising_strength: float = 1.0,
         edit_image: Union[Image.Image, List[Image.Image]] = None,
+        edit_latent: Optional[Any] = None,
         edit_image_auto_resize: bool = True,
         omni_mode: bool = False,
         image_noise_mask: Optional[Union[List[int], List[List[int]]]] = None,
@@ -133,6 +148,7 @@ class ComplextroPipeline(BasePipeline):
             "input_image": input_image,
             "denoising_strength": denoising_strength,
             "edit_image": edit_image,
+            "edit_latent": edit_latent,
             "edit_image_auto_resize": edit_image_auto_resize,
             "omni_mode": omni_mode,
             "image_noise_mask": image_noise_mask,
@@ -213,7 +229,7 @@ class ComplextroUnit_PromptEmbedder(PipelineUnit):
     def _build_chat_content(self, prompt: str, images):
         if images is None or len(images) == 0:
             return [{"type": "text", "text": prompt}]
-        content = [{"type": "image", "image": image} for image in images]
+        content = [{"type": "image", "image": pipe_image} for pipe_image in images]
         content.append({"type": "text", "text": prompt})
         return content
 
@@ -252,6 +268,7 @@ class ComplextroUnit_PromptEmbedder(PipelineUnit):
             if isinstance(prompt_item, str) and prompt_item.strip() == "":
                 local_images = None
             if local_images is not None and len(local_images) > 0:
+                local_images = [pipe._prepare_multimodal_image(image) for image in local_images]
                 has_any_image = True
             prompt_segments = self._split_prompt_segments(prompt_item)
             for prompt_segment in prompt_segments:
@@ -401,40 +418,109 @@ class ComplextroUnit_EditImageAutoResize(PipelineUnit):
             return {}
         from ..core.data.operators import ImageCropAndResize
         operator = ImageCropAndResize(max_pixels=1024 * 1024, height_division_factor=16, width_division_factor=16)
-        if not isinstance(edit_image, list):
-            edit_image = [edit_image]
-        edit_image = [operator(img) for img in edit_image]
+        if isinstance(edit_image, list) and len(edit_image) > 0 and isinstance(edit_image[0], list):
+            edit_image = [[operator(pipe._prepare_multimodal_image(img)) for img in image_group] for image_group in edit_image]
+        elif isinstance(edit_image, list):
+            edit_image = [operator(pipe._prepare_multimodal_image(img)) for img in edit_image]
+        else:
+            edit_image = operator(pipe._prepare_multimodal_image(edit_image))
         return {"edit_image": edit_image}
 
 
 class ComplextroUnit_EditImageEmbedder(PipelineUnit):
     def __init__(self):
         super().__init__(
-            input_params=("edit_image",),
-            output_params=("edit_latents",),
+            input_params=("edit_image", "edit_latent", "edit_image_auto_resize"),
+            output_params=("edit_latents", "edit_latent_mask"),
             onload_model_names=("vae",),
         )
 
-    def process(self, pipe: ComplextroPipeline, edit_image):
+    @staticmethod
+    def _is_pad_marker(value) -> bool:
+        if value is None:
+            return True
+        if isinstance(value, str):
+            return value.strip() in ("", "0")
+        return value == 0
+
+    @staticmethod
+    def _is_same_as_edit_image_marker(value) -> bool:
+        return isinstance(value, str) and value.strip() == "1"
+
+    def _normalize_latent_groups(self, edit_latent, batch_size):
+        if edit_latent is None:
+            return [None] * batch_size
+        if isinstance(edit_latent, list) and len(edit_latent) > 0 and isinstance(edit_latent[0], list):
+            if len(edit_latent) == batch_size:
+                return edit_latent
+            if len(edit_latent) == 1:
+                return [edit_latent[0] for _ in range(batch_size)]
+            return [edit_latent[i % len(edit_latent)] for i in range(batch_size)]
+        values = edit_latent if isinstance(edit_latent, list) else [edit_latent]
+        if batch_size > 1 and len(values) == batch_size:
+            return [[value] for value in values]
+        return [values for _ in range(batch_size)]
+
+    def _resolve_group_latent_inputs(self, edit_image_group, edit_latent_group):
+        image_group = edit_image_group if isinstance(edit_image_group, list) else [edit_image_group]
+        latent_group = [] if edit_latent_group is None else edit_latent_group
+        if not isinstance(latent_group, list):
+            latent_group = [latent_group]
+        if len(latent_group) > len(image_group):
+            raise ValueError("edit_latent entries must be less than or equal to edit_image entries.")
+
+        resolved_group = []
+        keep_mask = []
+        for idx, image_value in enumerate(image_group):
+            if idx >= len(latent_group):
+                resolved_group.append(image_value)
+                keep_mask.append(False)
+                continue
+
+            latent_value = latent_group[idx]
+            if self._is_pad_marker(latent_value):
+                resolved_group.append(image_value)
+                keep_mask.append(False)
+            elif self._is_same_as_edit_image_marker(latent_value):
+                resolved_group.append(image_value)
+                keep_mask.append(True)
+            else:
+                resolved_group.append(latent_value)
+                keep_mask.append(True)
+        return resolved_group, keep_mask
+
+    def process(self, pipe: ComplextroPipeline, edit_image, edit_latent, edit_image_auto_resize):
         if edit_image is None:
             return {}
         pipe.load_models_to_device(self.onload_model_names)
-        edit_image = pipe._normalize_image_mode_for_vae(edit_image)
+        from ..core.data.operators import ImageCropAndResize
+        resize_operator = ImageCropAndResize(max_pixels=1024 * 1024, height_division_factor=16, width_division_factor=16)
+
         if isinstance(edit_image, list) and len(edit_image) > 0 and isinstance(edit_image[0], list):
-            edit_latents = []
-            for image_group in edit_image:
-                group_latents = []
-                for image in image_group:
-                    image_tensor = pipe.preprocess_image(image).to(device=pipe.device, dtype=pipe.torch_dtype)
-                    group_latents.append(pipe.vae.encode(image_tensor))
-                edit_latents.append(group_latents)
+            image_groups = edit_image
         else:
-            images = edit_image if isinstance(edit_image, list) else [edit_image]
-            edit_latents = []
-            for image in images:
-                image_tensor = pipe.preprocess_image(image).to(device=pipe.device, dtype=pipe.torch_dtype)
-                edit_latents.append(pipe.vae.encode(image_tensor))
-        return {"edit_latents": edit_latents}
+            image_groups = [edit_image if isinstance(edit_image, list) else [edit_image]]
+
+        latent_groups = self._normalize_latent_groups(edit_latent, len(image_groups))
+
+        edit_latents = []
+        edit_latent_mask = []
+        for image_group, latent_group in zip(image_groups, latent_groups):
+            resolved_group, keep_mask = self._resolve_group_latent_inputs(image_group, latent_group)
+            group_latents = []
+            for latent_source in resolved_group:
+                latent_image = pipe._prepare_vae_image(latent_source)
+                if edit_image_auto_resize:
+                    latent_image = resize_operator(latent_image)
+                image_tensor = pipe.preprocess_image(latent_image).to(device=pipe.device, dtype=pipe.torch_dtype)
+                group_latents.append(pipe.vae.encode(image_tensor))
+            edit_latents.append(group_latents)
+            edit_latent_mask.append(keep_mask)
+
+        if not (isinstance(edit_image, list) and len(edit_image) > 0 and isinstance(edit_image[0], list)):
+            edit_latents = edit_latents[0]
+            edit_latent_mask = edit_latent_mask[0]
+        return {"edit_latents": edit_latents, "edit_latent_mask": edit_latent_mask}
 
 
 class ComplextroUnit_EditImageEmbedderSiglip(PipelineUnit):
@@ -452,11 +538,11 @@ class ComplextroUnit_EditImageEmbedderSiglip(PipelineUnit):
         if isinstance(edit_image, list) and len(edit_image) > 0 and isinstance(edit_image[0], list):
             image_embeds = []
             for image_group in edit_image:
-                group_embeds = [pipe.image_encoder(image, device=pipe.device).to(pipe.torch_dtype) for image in image_group]
+                group_embeds = [pipe.image_encoder(pipe._prepare_multimodal_image(image), device=pipe.device).to(pipe.torch_dtype) for image in image_group]
                 image_embeds.append(group_embeds)
         else:
             images = edit_image if isinstance(edit_image, list) else [edit_image]
-            image_embeds = [pipe.image_encoder(image, device=pipe.device).to(pipe.torch_dtype) for image in images]
+            image_embeds = [pipe.image_encoder(pipe._prepare_multimodal_image(image), device=pipe.device).to(pipe.torch_dtype) for image in images]
         return {"image_embeds": image_embeds}
 
 
@@ -477,6 +563,7 @@ def model_fn_complextro(
     prompt_emb=None,
     prompt_emb_mask=None,
     edit_latents=None,
+    edit_latent_mask=None,
     image_embeds=None,
     omni_mode: bool = False,
     image_noise_mask: Optional[Union[List[int], List[List[int]]]] = None,
@@ -504,6 +591,7 @@ def model_fn_complextro(
 
         lat_groups = to_batch_groups(edit_latents, batch_size)
         sig_groups = to_batch_groups(image_embeds, batch_size)
+        keep_groups = to_batch_groups(edit_latent_mask, batch_size) if edit_latent_mask is not None else None
 
         if image_noise_mask is None:
             mask = [_build_omni_noise_mask(len(g), None) for g in lat_groups]
@@ -519,9 +607,16 @@ def model_fn_complextro(
 
         latents_omni = []
         siglip_omni = []
+        latent_keep_mask = []
         for b in range(batch_size):
             cond_list = [latent_item[0] for latent_item in lat_groups[b]]
             latents_omni.append(cond_list + [latents[b]])
+
+            if keep_groups is not None:
+                local_keep = [bool(v) for v in keep_groups[b][: len(cond_list)]]
+                if len(local_keep) < len(cond_list):
+                    local_keep = local_keep + [False] * (len(cond_list) - len(local_keep))
+                latent_keep_mask.append(local_keep + [True])
 
             if image_embeds is not None:
                 cond_sig = sig_groups[b]
@@ -535,6 +630,7 @@ def model_fn_complextro(
             prompt_emb=prompt_emb,
             prompt_emb_mask=prompt_emb_mask,
             image_noise_mask=mask,
+            edit_latent_mask=latent_keep_mask if keep_groups is not None else None,
             siglip_feats=siglip_arg,
             use_gradient_checkpointing=use_gradient_checkpointing,
             use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,

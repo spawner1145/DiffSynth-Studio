@@ -8,8 +8,9 @@ from ..core.gradient import gradient_checkpoint_forward
 
 SEQ_MULTI_OF = 32
 TOKEN_TYPE_TEXT = 0
-TOKEN_TYPE_IMAGE = 1
+TOKEN_TYPE_TARGET_IMAGE = 1
 TOKEN_TYPE_SIGLIP = 2
+TOKEN_TYPE_COND_IMAGE = 3
 
 try:
     import flash_attn_interface
@@ -473,7 +474,7 @@ class ComplextroSingleTransformerBlock(nn.Module):
                         nn.SiLU(),
                         nn.Linear(dim, 6 * dim),
                     )
-                    for _ in range(3)
+                    for _ in range(4)
                 ]
             )
 
@@ -519,7 +520,7 @@ class ComplextroSingleTransformerBlock(nn.Module):
                     raise ValueError("token_type_ids sequence length must match hidden_states sequence length.")
 
                 token_type_ids = token_type_ids.to(device=hidden_states.device, dtype=torch.long).clamp(
-                    TOKEN_TYPE_TEXT, TOKEN_TYPE_SIGLIP
+                    TOKEN_TYPE_TEXT, TOKEN_TYPE_COND_IMAGE
                 )
                 mod_candidates = torch.stack([mlp(temb) for mlp in self.modulation_mlps], dim=2)
                 gather_index = token_type_ids.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, mod_candidates.shape[-1])
@@ -706,14 +707,28 @@ class ComplextroImageDiT(torch.nn.Module):
             if base_weight_key not in state_dict or base_bias_key not in state_dict:
                 continue
 
-            for head_idx in range(3):
+            for head_idx in range(4):
                 head_prefix = f"{module_prefix}.modulation_mlps.{head_idx}.1"
                 head_weight_key = f"{head_prefix}.weight"
                 head_bias_key = f"{head_prefix}.bias"
                 if head_weight_key not in state_dict:
-                    state_dict[head_weight_key] = state_dict[base_weight_key].detach().clone()
+                    if head_idx == TOKEN_TYPE_COND_IMAGE:
+                        old_image_weight_key = f"{module_prefix}.modulation_mlps.{TOKEN_TYPE_TARGET_IMAGE}.1.weight"
+                        if old_image_weight_key in state_dict:
+                            state_dict[head_weight_key] = state_dict[old_image_weight_key].detach().clone()
+                        else:
+                            state_dict[head_weight_key] = state_dict[base_weight_key].detach().clone()
+                    else:
+                        state_dict[head_weight_key] = state_dict[base_weight_key].detach().clone()
                 if head_bias_key not in state_dict:
-                    state_dict[head_bias_key] = state_dict[base_bias_key].detach().clone()
+                    if head_idx == TOKEN_TYPE_COND_IMAGE:
+                        old_image_bias_key = f"{module_prefix}.modulation_mlps.{TOKEN_TYPE_TARGET_IMAGE}.1.bias"
+                        if old_image_bias_key in state_dict:
+                            state_dict[head_bias_key] = state_dict[old_image_bias_key].detach().clone()
+                        else:
+                            state_dict[head_bias_key] = state_dict[base_bias_key].detach().clone()
+                    else:
+                        state_dict[head_bias_key] = state_dict[base_bias_key].detach().clone()
 
         if self.siglip_pad_token is not None:
             if "siglip_pad_token" not in state_dict:
@@ -915,6 +930,19 @@ class ComplextroImageDiT(torch.nn.Module):
         return flags
 
     @staticmethod
+    def _resolve_omni_condition_keep_flags(
+        latent_items: List[Optional[torch.Tensor]],
+        edit_latent_mask_item: Optional[List[bool]],
+    ) -> List[bool]:
+        if edit_latent_mask_item is None:
+            return [True] * len(latent_items)
+
+        flags = [bool(v) for v in edit_latent_mask_item]
+        if len(flags) < len(latent_items):
+            flags = flags + [True] * (len(latent_items) - len(flags))
+        return flags[: len(latent_items)]
+
+    @staticmethod
     def _build_per_token_temb(
         token_noise_mask: List[int],
         temb_noisy: torch.Tensor,
@@ -1086,6 +1114,7 @@ class ComplextroImageDiT(torch.nn.Module):
         width=None,
         siglip_feats: Optional[torch.Tensor] = None,
         image_noise_mask: Optional[List[List[int]]] = None,
+        edit_latent_mask: Optional[List[List[bool]]] = None,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
     ):
@@ -1099,6 +1128,8 @@ class ComplextroImageDiT(torch.nn.Module):
                 raise ValueError("siglip_feats must be List[List[Tensor]] when latents is omni-mode.")
             if image_noise_mask is not None and (not isinstance(image_noise_mask, list) or not isinstance(image_noise_mask[0], list)):
                 raise ValueError("image_noise_mask must be List[List[int]] when latents is omni-mode.")
+            if edit_latent_mask is not None and (not isinstance(edit_latent_mask, list) or not isinstance(edit_latent_mask[0], list)):
+                raise ValueError("edit_latent_mask must be List[List[bool]] when latents is omni-mode.")
 
             batch_size = len(latents)
             text_tokens = self.txt_in(self.txt_norm(prompt_emb))
@@ -1118,6 +1149,7 @@ class ComplextroImageDiT(torch.nn.Module):
             prepared_image_tokens = []
             prepared_image_freqs_for_refiner = []
             prepared_image_temb = []
+            prepared_image_token_types = []
             prepared_image_noise_masks = []
             prepared_image_valid_masks = []
             prepared_size_lists = []
@@ -1139,6 +1171,10 @@ class ComplextroImageDiT(torch.nn.Module):
                     latents[b],
                     image_noise_mask[b] if image_noise_mask is not None and b < len(image_noise_mask) else None,
                 )
+                keep_flags = self._resolve_omni_condition_keep_flags(
+                    latents[b],
+                    edit_latent_mask[b] if edit_latent_mask is not None and b < len(edit_latent_mask) else None,
+                )
 
                 image_tokens_list = []
                 size_list = []
@@ -1147,6 +1183,7 @@ class ComplextroImageDiT(torch.nn.Module):
                 image_token_valid_mask = []
                 for img_idx, img in enumerate(latents[b]):
                     local_noise_flag = noise_flags[img_idx]
+                    local_keep_flag = keep_flags[img_idx]
                     if img is None:
                         pad_len = SEQ_MULTI_OF
                         image_tokens_list.append(
@@ -1159,11 +1196,17 @@ class ComplextroImageDiT(torch.nn.Module):
                         continue
                     tokens, (h, w) = self._flatten_latent(img)
                     tokens, original_len, total_len = self._pad_tokens(tokens, pad_token=self.image_pad_token)
-                    image_tokens_list.append(tokens)
+                    if local_keep_flag:
+                        image_tokens_list.append(tokens)
+                        image_token_valid_mask.extend([1] * original_len + [0] * (total_len - original_len))
+                    else:
+                        image_tokens_list.append(
+                            self.image_pad_token.to(device=prompt_emb.device, dtype=prompt_emb.dtype).repeat(total_len, 1)
+                        )
+                        image_token_valid_mask.extend([0] * total_len)
                     size_list.append((h, w))
                     length_list.append(total_len)
                     image_token_noise_mask.extend([local_noise_flag] * total_len)
-                    image_token_valid_mask.extend([1] * original_len + [0] * (total_len - original_len))
 
                 image_tokens = torch.cat(image_tokens_list, dim=0)
                 image_tokens = self.img_in(image_tokens)
@@ -1180,6 +1223,13 @@ class ComplextroImageDiT(torch.nn.Module):
                 )
                 prepared_image_freqs_for_refiner.append(image_freqs_for_refiner)
                 prepared_image_temb.append(image_temb.squeeze(0))
+                image_token_types = []
+                for image_idx, image_len in enumerate(length_list):
+                    token_type = TOKEN_TYPE_TARGET_IMAGE if image_idx == len(length_list) - 1 else TOKEN_TYPE_COND_IMAGE
+                    image_token_types.extend([token_type] * image_len)
+                prepared_image_token_types.append(
+                    torch.tensor(image_token_types, dtype=torch.long, device=prompt_emb.device)
+                )
 
                 txt_seq_len = (
                     int(prompt_emb_mask[b].sum().item())
@@ -1219,13 +1269,13 @@ class ComplextroImageDiT(torch.nn.Module):
                             sig_token_valid_mask.extend([0] * pad_len)
                             continue
                         sig_tok, (sh, sw) = self._flatten_siglip(sig)
-                        sig_raw_list.append(sig_tok)
-                        sig_raw_lens.append(sig_tok.shape[0])
                         sig_shapes.append((sh, sw))
                         sig_original_len = sig_tok.shape[0]
                         sig_total_len = sig_original_len + ((-sig_original_len) % SEQ_MULTI_OF)
                         sig_lengths.append(sig_total_len)
                         sig_token_noise_mask.extend([local_noise_flag] * sig_total_len)
+                        sig_raw_list.append(sig_tok)
+                        sig_raw_lens.append(sig_tok.shape[0])
                         sig_token_valid_mask.extend([1] * sig_original_len + [0] * (sig_total_len - sig_original_len))
 
                     embedded_sig_chunks = []
@@ -1279,6 +1329,11 @@ class ComplextroImageDiT(torch.nn.Module):
                 torch.tensor(mask, dtype=torch.bool, device=prompt_emb.device)
                 for mask in prepared_image_valid_masks
             ]
+            batched_image_token_types = pad_sequence(
+                prepared_image_token_types,
+                batch_first=True,
+                padding_value=TOKEN_TYPE_TEXT,
+            )
 
             image_refiner_seq_lens = [sum(length_list) for length_list in prepared_length_lists]
             batched_image_tokens, batched_image_freqs_for_refiner, image_refiner_key_mask = self._build_padded_unified(
@@ -1297,6 +1352,7 @@ class ComplextroImageDiT(torch.nn.Module):
                     use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
                     hidden_states=batched_image_tokens,
                     temb=batched_image_temb,
+                    token_type_ids=batched_image_token_types,
                     image_rotary_emb=batched_image_freqs_for_refiner,
                     attention_mask=image_refiner_key_mask,
                 )
@@ -1381,20 +1437,24 @@ class ComplextroImageDiT(torch.nn.Module):
                 )
 
                 txt_token_noise_mask = [0] * txt_seq_len
-                unified_token_noise_mask = txt_token_noise_mask + image_token_noise_mask + sig_token_noise_mask
-                unified_token_valid_mask = [1] * txt_seq_len + image_token_valid_mask + sig_token_valid_mask
+                unified_token_noise_mask = image_token_noise_mask + txt_token_noise_mask + sig_token_noise_mask
+                unified_token_valid_mask = image_token_valid_mask + [1] * txt_seq_len + sig_token_valid_mask
                 unified_temb = self._build_per_token_temb(
                     unified_token_noise_mask,
                     conditioning_noisy[b : b + 1],
                     conditioning_clean[b : b + 1],
                 ).squeeze(0)
-                unified_token_types = [TOKEN_TYPE_TEXT] * txt_seq_len + [TOKEN_TYPE_IMAGE] * image_tokens.shape[0]
+                unified_token_types = []
+                for image_idx, image_len in enumerate(length_list):
+                    token_type = TOKEN_TYPE_TARGET_IMAGE if image_idx == len(length_list) - 1 else TOKEN_TYPE_COND_IMAGE
+                    unified_token_types.extend([token_type] * image_len)
+                unified_token_types.extend([TOKEN_TYPE_TEXT] * txt_seq_len)
                 if sig_tokens is not None:
                     unified_token_types = unified_token_types + [TOKEN_TYPE_SIGLIP] * sig_tokens.shape[0]
 
-                # Align omni unified order with z_image_dit: [cap, x, siglip]
-                unified = torch.cat([text_tokens_b, image_tokens] + ([sig_tokens] if sig_tokens is not None else []), dim=0)
-                unified_freqs = torch.cat([txt_freqs, img_freqs], dim=0)
+                # Align omni unified order with base branch: [x, cap, siglip]
+                unified = torch.cat([image_tokens, text_tokens_b] + ([sig_tokens] if sig_tokens is not None else []), dim=0)
+                unified_freqs = torch.cat([img_freqs, txt_freqs], dim=0)
 
                 unified_list.append(unified)
                 freqs_list.append(unified_freqs)
@@ -1404,7 +1464,7 @@ class ComplextroImageDiT(torch.nn.Module):
                 seq_lens.append(unified.shape[0])
                 x_sizes.append(size_list)
                 x_lengths.append(length_list)
-                x_pos_offsets.append((txt_seq_len, txt_seq_len + sum(length_list)))
+                x_pos_offsets.append((0, sum(length_list)))
 
             unified, unified_freqs, key_mask = self._build_padded_unified(
                 unified_list,
@@ -1556,6 +1616,12 @@ class ComplextroImageDiT(torch.nn.Module):
         image_freqs_for_refiner = image_freqs_single[:x_seqlen].unsqueeze(0).repeat(image_tokens.shape[0], 1, 1)
 
         conditioning = self.time_text_embed(timestep, image_tokens.dtype)
+        image_token_types = torch.full(
+            (image_tokens.shape[0], image_tokens.shape[1]),
+            TOKEN_TYPE_TARGET_IMAGE,
+            dtype=torch.long,
+            device=image_tokens.device,
+        )
 
         # Refine image tokens (noise) and text tokens (context)
         for block in self.noise_refiner:
@@ -1565,6 +1631,7 @@ class ComplextroImageDiT(torch.nn.Module):
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
                 hidden_states=image_tokens,
                 temb=conditioning,
+                token_type_ids=image_token_types,
                 image_rotary_emb=image_freqs_for_refiner,
             )
 
@@ -1640,11 +1707,11 @@ class ComplextroImageDiT(torch.nn.Module):
                 siglip_freqs = img_freqs_all[x_seqlen : x_seqlen + siglip_len]
                 unified_b = torch.cat([image_b, text_b, siglip_b], dim=0)
                 freqs_b = torch.cat([img_freqs, txt_freqs, siglip_freqs], dim=0)
-                unified_type_b = [TOKEN_TYPE_IMAGE] * x_seqlen + [TOKEN_TYPE_TEXT] * txt_len + [TOKEN_TYPE_SIGLIP] * siglip_len
+                unified_type_b = [TOKEN_TYPE_TARGET_IMAGE] * x_seqlen + [TOKEN_TYPE_TEXT] * txt_len + [TOKEN_TYPE_SIGLIP] * siglip_len
             else:
                 unified_b = torch.cat([image_b, text_b], dim=0)
                 freqs_b = torch.cat([img_freqs, txt_freqs], dim=0)
-                unified_type_b = [TOKEN_TYPE_IMAGE] * x_seqlen + [TOKEN_TYPE_TEXT] * txt_len
+                unified_type_b = [TOKEN_TYPE_TARGET_IMAGE] * x_seqlen + [TOKEN_TYPE_TEXT] * txt_len
 
             unified_list.append(unified_b)
             freqs_list.append(freqs_b)
