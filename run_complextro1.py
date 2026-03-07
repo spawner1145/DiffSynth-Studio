@@ -140,7 +140,7 @@ if __name__ == "__main__":
     pipe = build_complextro_pipe(
         device=device,
         torch_dtype=dtype,
-        qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw/model.safetensors-00001-of-00001.safetensors",
+        qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/Qwen3_5_2b_claude_heretic/model.safetensors",
         flux2_vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
         complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v0/model-e4-s67044.safetensors",
         qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw",
