@@ -569,7 +569,7 @@ class ComplextroImageDiT(torch.nn.Module):
         use_layer3d_rope: bool = False,
         use_additional_t_cond: bool = False,
         in_channels: int = 128,
-        text_embed_dim: int = 1024,
+        text_embed_dim: Optional[int] = None,
         siglip_feat_dim: Optional[int] = None,
         hidden_size: int = 3072,
         num_attention_heads: int = 24,
@@ -590,6 +590,11 @@ class ComplextroImageDiT(torch.nn.Module):
         if sum(rope_axes_dim) != attention_head_dim:
             raise ValueError(
                 f"sum(rope_axes_dim)={sum(rope_axes_dim)} must equal attention_head_dim={attention_head_dim}."
+            )
+        if text_embed_dim is None:
+            raise ValueError(
+                "text_embed_dim must be provided for ComplextroImageDiT. "
+                "Set it from text_encoder.model.config.text_config.hidden_size."
             )
 
         self.hidden_size = hidden_size

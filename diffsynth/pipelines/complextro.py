@@ -97,12 +97,31 @@ class ComplextroPipeline(BasePipeline):
         return [list(values) for _ in range(batch_size)]
 
     @staticmethod
+    def _get_text_hidden_size(text_encoder: Optional[QwenImageTextEncoder]) -> Optional[int]:
+        if text_encoder is None:
+            return None
+        text_config = getattr(text_encoder.model.config, "text_config", text_encoder.model.config)
+        return int(text_config.hidden_size)
+
+    @classmethod
+    def _validate_text_encoder_dit_alignment(cls, text_encoder: Optional[QwenImageTextEncoder], dit: Optional[ComplextroImageDiT]):
+        if text_encoder is None or dit is None:
+            return
+        text_hidden_size = cls._get_text_hidden_size(text_encoder)
+        dit_text_dim = int(dit.txt_in.in_features)
+        if text_hidden_size != dit_text_dim:
+            raise ValueError(
+                f"Text encoder hidden_size ({text_hidden_size}) != Complextro text_embed_dim ({dit_text_dim}). "
+                "Please load a ComplextroImageDiT checkpoint/config whose text_embed_dim matches the text encoder."
+            )
+
+    @staticmethod
     def from_pretrained(
         torch_dtype: torch.dtype = torch.bfloat16,
         device: Union[str, torch.device] = get_device_type(),
         model_configs: list[ModelConfig] = [],
-        tokenizer_config: ModelConfig = ModelConfig(model_id="Qwen/Qwen3.5-0.8B", origin_file_pattern="tokenizer/"),
-        processor_config: ModelConfig = ModelConfig(model_id="Qwen/Qwen3.5-0.8B", origin_file_pattern="tokenizer/"),
+        tokenizer_config: ModelConfig = ModelConfig(model_id="Qwen/Qwen3.5-2B", origin_file_pattern="tokenizer/"),
+        processor_config: ModelConfig = ModelConfig(model_id="Qwen/Qwen3.5-2B", origin_file_pattern="tokenizer/"),
         vram_limit: float = None,
     ):
         pipe = ComplextroPipeline(device=device, torch_dtype=torch_dtype)
@@ -121,6 +140,7 @@ class ComplextroPipeline(BasePipeline):
             if pipe.tokenizer is None and hasattr(pipe.processor, "tokenizer"):
                 pipe.tokenizer = pipe.processor.tokenizer
 
+        pipe._validate_text_encoder_dit_alignment(pipe.text_encoder, pipe.dit)
         pipe.vram_management_enabled = pipe.check_vram_management_state()
         return pipe
 

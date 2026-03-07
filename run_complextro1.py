@@ -19,6 +19,7 @@ def build_complextro_pipe(
     flux2_vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
     complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e3-s10059.safetensors",
     qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw",
+    qwen_model_size: str = "2B",
     siglip_model_file="",
     use_alpha_layer_vae: bool = False,
     complextro_model_config=None,
@@ -46,7 +47,7 @@ def build_complextro_pipe(
     pipe.text_encoder = load_model(
         QwenImageTextEncoder,
         qwen_model_file,
-        config={"model_type": "qwen3_5", "model_size": "0.8B"},
+        config={"model_type": "qwen3_5", "model_size": qwen_model_size},
         torch_dtype=torch_dtype,
         device=device,
         state_dict_converter=QwenImageTextEncoderStateDictConverter,
@@ -60,6 +61,17 @@ def build_complextro_pipe(
     )
     pipe.processor = AutoProcessor.from_pretrained(qwen_tokenizer_dir)
     pipe.tokenizer = pipe.processor.tokenizer
+
+    text_config = getattr(pipe.text_encoder.model.config, "text_config", pipe.text_encoder.model.config)
+    text_hidden_size = int(text_config.hidden_size)
+    configured_text_dim = complextro_model_config.get("text_embed_dim", None)
+    if configured_text_dim is None:
+        complextro_model_config["text_embed_dim"] = text_hidden_size
+    elif int(configured_text_dim) != text_hidden_size:
+        raise ValueError(
+            f"complextro_model_config['text_embed_dim'] ({configured_text_dim}) must match text encoder hidden_size ({text_hidden_size})."
+        )
+
     pipe.dit = load_model(
         ComplextroImageDiT,
         complextro_dit_file,
@@ -68,13 +80,11 @@ def build_complextro_pipe(
         device=device,
     )
 
-    text_config = getattr(pipe.text_encoder.model.config, "text_config", pipe.text_encoder.model.config)
-    text_hidden_size = int(text_config.hidden_size)
     dit_text_dim = int(pipe.dit.txt_in.in_features)
     if text_hidden_size != dit_text_dim:
         raise ValueError(
             f"Text encoder hidden_size ({text_hidden_size}) != Complextro text_embed_dim ({dit_text_dim}). "
-            f"Please align QwenImageTextEncoder(model_type='qwen3_5', model_size='0.8B') and ComplextroImageDiT(text_embed_dim=...)."
+            f"Please align QwenImageTextEncoder(model_type='qwen3_5', model_size='{qwen_model_size}') and ComplextroImageDiT(text_embed_dim=...)."
         )
 
     if siglip_enabled:
@@ -91,7 +101,7 @@ def build_complextro_pipe(
 
 if __name__ == "__main__":
     """
-    Complextro + Qwen3.5-0.8B 使用说明（推理）
+    Complextro + Qwen3.5 使用说明（推理）
 
     1) omni_mode=False 也可以读取参考图：
         - 现在文本编码阶段会走 Qwen3.5 的多模态聊天模板。
@@ -134,6 +144,7 @@ if __name__ == "__main__":
         flux2_vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
         complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v0/model-e4-s67044.safetensors",
         qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw",
+        qwen_model_size="2B",
         siglip_model_file="",
         use_alpha_layer_vae=False,
         complextro_model_config=complextro_model_config,

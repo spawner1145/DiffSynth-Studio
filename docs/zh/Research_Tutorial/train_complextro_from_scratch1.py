@@ -26,6 +26,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw/model.safetensors-00001-of-00001.safetensors",
         flux2_vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
         qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw",
+        qwen_model_size: str = "2B",
         siglip_model_file="",
         #complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e43-s19221.safetensors",
         complextro_dit_file="",
@@ -52,7 +53,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         self.pipe.text_encoder = load_model(
             QwenImageTextEncoder,
             qwen_model_file,
-            config={"model_type": "qwen3_5", "model_size": "0.8B"},
+            config={"model_type": "qwen3_5", "model_size": qwen_model_size},
             torch_dtype=torch.bfloat16,
             device=device,
             state_dict_converter=QwenImageTextEncoderStateDictConverter,
@@ -76,6 +77,16 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             )
 
         self.pipe.vram_management_enabled = self.pipe.check_vram_management_state()
+
+        text_config = getattr(self.pipe.text_encoder.model.config, "text_config", self.pipe.text_encoder.model.config)
+        text_hidden_size = int(text_config.hidden_size)
+        configured_text_dim = self.complextro_model_config.get("text_embed_dim", None)
+        if configured_text_dim is None:
+            self.complextro_model_config["text_embed_dim"] = text_hidden_size
+        elif int(configured_text_dim) != text_hidden_size:
+            raise ValueError(
+                f"complextro_model_config['text_embed_dim'] ({configured_text_dim}) must match text encoder hidden_size ({text_hidden_size})."
+            )
         
         if complextro_dit_file:
             self.pipe.dit = load_model(
@@ -88,13 +99,11 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         else:
             self.pipe.dit = ComplextroImageDiT(**self.complextro_model_config).to(dtype=torch.bfloat16, device=device)
 
-        text_config = getattr(self.pipe.text_encoder.model.config, "text_config", self.pipe.text_encoder.model.config)
-        text_hidden_size = int(text_config.hidden_size)
         dit_text_dim = int(self.pipe.dit.txt_in.in_features)
         if text_hidden_size != dit_text_dim:
             raise ValueError(
                 f"Text encoder hidden_size ({text_hidden_size}) != Complextro text_embed_dim ({dit_text_dim}). "
-                f"Please align QwenImageTextEncoder(model_type='qwen3_5', model_size='0.8B') and ComplextroImageDiT(text_embed_dim=...)."
+                f"Please align QwenImageTextEncoder(model_type='qwen3_5', model_size='{qwen_model_size}') and ComplextroImageDiT(text_embed_dim=...)."
             )
 
         self.pipe.freeze_except(["dit"])
@@ -433,6 +442,7 @@ if __name__ == "__main__":
 
     model = ComplextroTrainingModule(
         device=accelerator.device,
+        qwen_model_size="2B",
         siglip_model_file=siglip_model_file,
         train_omni=train_omni,
         use_alpha_layer_vae=use_alpha_layer_vae,
