@@ -25,7 +25,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         device,
         qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/Qwen3_5_2b_claude_heretic/model.safetensors",
         flux2_vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
-        qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw",
+        qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/Qwen3_5_2b_claude_heretic",
         qwen_model_size: str = "2B",
         siglip_model_file="",
         #complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e43-s19221.safetensors",
@@ -196,17 +196,25 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             return int(first_image.shape[-2]), int(first_image.shape[-1])
         raise ValueError("Cannot infer image height/width from data['image']")
 
-    def _normalize_negative_prompt(self, prompt_value: Any, neg_prompt_value: Any):
+    def _normalize_prompt(self, prompt_value: Any, batch_size: int):
         if isinstance(prompt_value, str):
-            if isinstance(neg_prompt_value, list):
-                return neg_prompt_value[0] if len(neg_prompt_value) > 0 else ""
-            return "" if neg_prompt_value is None else neg_prompt_value
+            return prompt_value if batch_size == 1 else [prompt_value] * batch_size
+        if not isinstance(prompt_value, list):
+            return [str(prompt_value)] * batch_size
+        if len(prompt_value) == batch_size:
+            return prompt_value
+        if len(prompt_value) == 1:
+            return prompt_value * batch_size
+        if len(prompt_value) == 0:
+            return [""] * batch_size
+        return [prompt_value[i % len(prompt_value)] for i in range(batch_size)]
 
-        prompt_batch = len(prompt_value)
+    def _normalize_negative_prompt(self, prompt_value: Any, neg_prompt_value: Any):
+        prompt_batch = 1 if isinstance(prompt_value, str) else len(prompt_value)
         if neg_prompt_value is None:
             return [""] * prompt_batch
         if isinstance(neg_prompt_value, str):
-            return [neg_prompt_value] * prompt_batch
+            return neg_prompt_value if prompt_batch == 1 else [neg_prompt_value] * prompt_batch
         if not isinstance(neg_prompt_value, list):
             return [str(neg_prompt_value)] * prompt_batch
         if len(neg_prompt_value) == prompt_batch:
@@ -219,9 +227,10 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
 
     def forward(self, data):
         prompt_value = data["prompt"]
-        neg_prompt_value = self._normalize_negative_prompt(prompt_value, data.get("neg_prompt", ""))
         image_value = data["image"]
         batch_size = self._infer_batch_size(prompt_value, image_value)
+        prompt_value = self._normalize_prompt(prompt_value, batch_size)
+        neg_prompt_value = self._normalize_negative_prompt(prompt_value, data.get("neg_prompt", ""))
         height, width = self._infer_image_hw(image_value)
 
         edit_images = self._normalize_edit_images(data.get("edit_image", None), batch_size)
@@ -354,7 +363,7 @@ if __name__ == "__main__":
     """
 
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=1)
-    train_omni = False
+    train_omni = True
     use_alpha_layer_vae = False
     siglip_model_file = ""
 
@@ -413,13 +422,13 @@ if __name__ == "__main__":
     train_resolution = (256,256)
     max_bucket_reso = 1024
     dataset = UnifiedDataset(
-        base_path="/root/autodl-tmp/DiffSynth-Studio/data/images",
-        metadata_path="/root/autodl-tmp/DiffSynth-Studio/data/metadata_merged.csv",
+        base_path="/root/autodl-tmp/DiffSynth-Studio/edit/images",
+        metadata_path="/root/autodl-tmp/DiffSynth-Studio/edit/metadata_merged.jsonl",
         max_data_items=10000000,
         data_file_keys=data_file_keys,
         special_operator_map={
             "edit_latent": build_optional_edit_latent_operator(
-                base_path="/root/autodl-tmp/DiffSynth-Studio/data/images",
+                base_path="/root/autodl-tmp/DiffSynth-Studio/edit/images",
                 max_pixels=max_bucket_reso * max_bucket_reso,
             ),
         },
@@ -431,7 +440,7 @@ if __name__ == "__main__":
         bucket_data_key="image",
         bucket_base_reso=train_resolution,
         main_data_operator=UnifiedDataset.default_image_operator(
-            base_path="/root/autodl-tmp/DiffSynth-Studio/data/images",
+            base_path="/root/autodl-tmp/DiffSynth-Studio/edit/images",
             height=None,
             width=None,
             max_pixels=max_bucket_reso * max_bucket_reso,
@@ -449,7 +458,7 @@ if __name__ == "__main__":
         complextro_model_config=complextro_model_config,
     )
     model_logger = ModelLogger(
-        "models/Complextro/v0", # dit输出文件夹
+        "models/Complextro/edit", # dit输出文件夹
         remove_prefix_in_ckpt="pipe.dit.",
     )
 

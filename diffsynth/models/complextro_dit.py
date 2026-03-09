@@ -990,8 +990,7 @@ class ComplextroImageDiT(torch.nn.Module):
         siglip_lengths: Optional[List[int]] = None,
         siglip_ref_sizes: Optional[List[Optional[Tuple[int, int]]]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        all_img_freqs, txt_freqs = self.pos_embed([(1, 1, 1)], [txt_seq_len], device=device)
-        txt_freqs = txt_freqs[:txt_seq_len]
+        all_img_freqs, _ = self.pos_embed([(1, 1, 1)], [1], device=device)
         template_freq = all_img_freqs[:1]
         segment_freqs = []
 
@@ -1023,6 +1022,17 @@ class ComplextroImageDiT(torch.nn.Module):
                 if total_len > local.shape[0]:
                     local = torch.cat([local, local[-1:].repeat(total_len - local.shape[0], 1)], dim=0)
                 segment_freqs.append(local[:total_len])
+
+        txt_ref_shapes = [(1, height, width) for size in image_sizes if size is not None for height, width in [size]]
+        if siglip_sizes is not None:
+            txt_ref_shapes.extend(
+                (1, height, width) for size in siglip_sizes if size is not None for height, width in [size]
+            )
+        if len(txt_ref_shapes) == 0:
+            txt_ref_shapes = [(1, 1, 1)]
+
+        _, txt_freqs = self.pos_embed(txt_ref_shapes, [txt_seq_len], device=device)
+        txt_freqs = txt_freqs[:txt_seq_len]
 
         img_freqs = torch.cat(segment_freqs, dim=0)
         return img_freqs, txt_freqs
@@ -1190,9 +1200,29 @@ class ComplextroImageDiT(torch.nn.Module):
                 raise ValueError("edit_latent_mask must be List[List[bool]] when latents is omni-mode.")
 
             batch_size = len(latents)
+            if prompt_emb.shape[0] != batch_size:
+                raise ValueError(
+                    f"Omni mode expects prompt_emb batch ({prompt_emb.shape[0]}) to match latent batch ({batch_size})."
+                )
+            if prompt_emb_mask is not None and prompt_emb_mask.shape[0] != batch_size:
+                raise ValueError(
+                    f"Omni mode expects prompt_emb_mask batch ({prompt_emb_mask.shape[0]}) to match latent batch ({batch_size})."
+                )
             text_tokens = self.txt_in(self.txt_norm(prompt_emb))
             conditioning_noisy = self.time_text_embed(timestep, text_tokens.dtype)
             conditioning_clean = self.time_text_embed(torch.ones_like(timestep), text_tokens.dtype)
+            if conditioning_noisy.shape[0] == 1 and batch_size > 1:
+                conditioning_noisy = conditioning_noisy.expand(batch_size, -1)
+            elif conditioning_noisy.shape[0] != batch_size:
+                raise ValueError(
+                    f"Omni mode expects timestep embedding batch ({conditioning_noisy.shape[0]}) to be 1 or match latent batch ({batch_size})."
+                )
+            if conditioning_clean.shape[0] == 1 and batch_size > 1:
+                conditioning_clean = conditioning_clean.expand(batch_size, -1)
+            elif conditioning_clean.shape[0] != batch_size:
+                raise ValueError(
+                    f"Omni mode expects clean timestep embedding batch ({conditioning_clean.shape[0]}) to be 1 or match latent batch ({batch_size})."
+                )
 
             unified_list = []
             freqs_list = []
@@ -1294,7 +1324,7 @@ class ComplextroImageDiT(torch.nn.Module):
                     if prompt_emb_mask is not None
                     else text_tokens.shape[1]
                 )
-                text_tokens_b = text_tokens[b : b + 1, :txt_seq_len]
+                text_tokens_b = text_tokens[b, :txt_seq_len]
 
                 _, txt_freqs_for_refiner = self._build_omni_image_freqs(
                     image_sizes=size_list,
@@ -1302,7 +1332,7 @@ class ComplextroImageDiT(torch.nn.Module):
                     txt_seq_len=txt_seq_len,
                     device=prompt_emb.device,
                 )
-                txt_freqs_for_refiner = txt_freqs_for_refiner[:txt_seq_len].unsqueeze(0)
+                txt_freqs_for_refiner = txt_freqs_for_refiner[:txt_seq_len]
                 prepared_txt_tokens.append(text_tokens_b)
                 prepared_txt_freqs_for_refiner.append(txt_freqs_for_refiner)
                 prepared_txt_seq_lens.append(txt_seq_len)

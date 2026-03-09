@@ -142,8 +142,8 @@ if __name__ == "__main__":
         torch_dtype=dtype,
         qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/Qwen3_5_2b_claude_heretic/model.safetensors",
         flux2_vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
-        complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v0/model-e4-s67044.safetensors",
-        qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw",
+        complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e4-s67044.safetensors",
+        qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/Qwen3_5_2b_claude_heretic",
         qwen_model_size="2B",
         siglip_model_file="",
         use_alpha_layer_vae=False,
@@ -165,7 +165,7 @@ if __name__ == "__main__":
             seed=seed,
             height=256,
             width=256,
-            omni_mode=False,
+            omni_mode=True,
         )
         image.save(f"complextro_image_{seed}.jpg")
 
