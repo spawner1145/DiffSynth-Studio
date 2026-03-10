@@ -200,6 +200,5 @@ if __name__ == "__main__":
     #     omni_mode=True,
     #     edit_image=cond_images,
     #     edit_latent=cond_latents,
-    #     image_noise_mask=[0, 0, 1],
     # )
     # omni_out.save("complextro_omni.jpg")
