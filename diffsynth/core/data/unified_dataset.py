@@ -122,6 +122,8 @@ class UnifiedDataset(torch.utils.data.Dataset):
         bucket_reso_steps=64,
         bucket_data_key=None,
         bucket_base_reso=None,
+        bucket_index_path=None,
+        jsonl_index_path=None,
     ):
         self.base_path = base_path
         self.metadata_path = metadata_path
@@ -138,6 +140,10 @@ class UnifiedDataset(torch.utils.data.Dataset):
         self.bucket_reso_steps = bucket_reso_steps
         self.bucket_data_key = bucket_data_key
         self.bucket_base_reso = bucket_base_reso
+        self.bucket_index_path = bucket_index_path
+        self.jsonl_index_path = jsonl_index_path
+        self.metadata_file_path = None
+        self.jsonl_offsets = []  # list[int], data_id -> file offset
         self.bucket_manager = None
         self.bucket_reso_by_data_id = {}
         self.bucket_info = {}
@@ -154,6 +160,82 @@ class UnifiedDataset(torch.utils.data.Dataset):
         self.load_metadata(metadata_path)
         self.setup_buckets_if_needed()
         self.rebuild_bucket_batches_if_needed()
+
+    def _load_bucket_index(self, index_path, max_reso):
+        """Load precomputed bucket resolutions from a jsonl index file.
+
+        Expected jsonl format (one of following keys is accepted):
+            {"data_id": 0, "bucket": [1024, 576]}
+            {"idx": 0, "reso": [1024, 576]}
+
+        - data_id / idx: 0-based index in self.data (metadata list)
+        - bucket / reso: [width, height] already snapped to bucket_reso_steps
+
+        This function fills self.bucket_reso_by_data_id and self.bucket_info,
+        then UnifiedDataset will reuse the existing batch building logic.
+        """
+        bucket_counts = {}
+        self.bucket_reso_by_data_id = {}
+
+        if index_path is None or not os.path.exists(index_path):
+            raise ValueError(f"Bucket index file not found: {index_path}")
+
+        with open(index_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+
+                data_id = item.get("data_id", item.get("idx", None))
+                reso = item.get("bucket", item.get("reso", None))
+                if data_id is None or reso is None or not isinstance(reso, (list, tuple)) or len(reso) != 2:
+                    continue
+
+                w, h = int(reso[0]), int(reso[1])
+
+                # Basic sanity checks to keep consistency with current bucket constraints.
+                if w < self.min_bucket_reso or h < self.min_bucket_reso:
+                    continue
+                if max(w, h) > self.max_bucket_reso:
+                    continue
+                if w % self.bucket_reso_steps != 0 or h % self.bucket_reso_steps != 0:
+                    continue
+
+                reso_tuple = (w, h)
+                did = int(data_id)
+                if did < 0 or did >= len(self.data):
+                    continue
+
+                self.bucket_reso_by_data_id[did] = reso_tuple
+                bucket_counts[reso_tuple] = bucket_counts.get(reso_tuple, 0) + 1
+
+        if len(self.bucket_reso_by_data_id) == 0:
+            raise ValueError("Bucket index file is provided but no valid items were loaded.")
+
+        self.bucket_info = {
+            "bucket_data_key": self.bucket_data_key,
+            "bucket_no_upscale": self.bucket_no_upscale,
+            "min_bucket_reso": self.min_bucket_reso,
+            "max_bucket_reso": self.max_bucket_reso,
+            "max_reso": [max_reso[0], max_reso[1]] if max_reso is not None else None,
+            "bucket_reso_steps": self.bucket_reso_steps,
+            "num_buckets": len(bucket_counts),
+            "num_bucketed_items": len(self.bucket_reso_by_data_id),
+            "num_skipped_missing_key": 0,
+            "num_skipped_invalid_value": 0,
+            "num_skipped_missing_file": 0,
+            "num_skipped_unreadable": 0,
+            "bucket_counts": {f"{w}x{h}": count for (w, h), count in sorted(bucket_counts.items())},
+        }
+        print(
+            f"Bucket enabled with precomputed index: "
+            f"{self.bucket_info['num_buckets']} buckets, "
+            f"{self.bucket_info['num_bucketed_items']} items."
+        )
     
     @staticmethod
     def default_image_operator(
@@ -205,14 +287,54 @@ class UnifiedDataset(torch.utils.data.Dataset):
                 metadata = json.load(f)
             self.data = metadata
         elif metadata_path.endswith(".jsonl"):
-            metadata = []
-            with open(metadata_path, 'r') as f:
-                for line in f:
-                    metadata.append(json.loads(line.strip()))
-            self.data = metadata
+            self.metadata_file_path = metadata_path
+            if self.jsonl_index_path is not None and os.path.exists(self.jsonl_index_path):
+                offsets = []
+                with open(self.jsonl_index_path, "r", encoding="utf-8") as idx_f:
+                    for line in idx_f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            offsets.append(int(line))
+                        except Exception:
+                            continue
+                self.jsonl_offsets = offsets
+                self.data = []  # metadata records will be read lazily
+                print(f"UnifiedDataset: loaded {len(self.jsonl_offsets)} jsonl offsets from index {self.jsonl_index_path}")
+            else:
+                # Fallback: load all metadata into memory (legacy behavior)
+                metadata = []
+                with open(metadata_path, 'r', encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        metadata.append(json.loads(line))
+                self.data = metadata
         else:
             metadata = pandas.read_csv(metadata_path)
             self.data = [metadata.iloc[i].to_dict() for i in range(len(metadata))]
+
+    def get_record_by_id(self, data_id: int):
+        """Return a single metadata record by id.
+
+        - If jsonl_index_path is provided and jsonl_offsets is populated, we read
+          the corresponding line from the jsonl file lazily.
+        - Otherwise, we fall back to self.data[data_id].
+        """
+        if self.metadata_file_path is not None and self.jsonl_offsets:
+            # Streaming mode for jsonl metadata.
+            if data_id < 0 or data_id >= len(self.jsonl_offsets):
+                raise IndexError("data_id out of range for jsonl metadata")
+            offset = self.jsonl_offsets[data_id]
+            with open(self.metadata_file_path, "r", encoding="utf-8") as f:
+                f.seek(offset)
+                line = f.readline()
+            return json.loads(line.strip())
+
+        # Legacy in-memory behavior
+        return self.data[data_id]
 
     def resolve_data_path(self, path):
         if os.path.isabs(path):
@@ -308,12 +430,23 @@ class UnifiedDataset(torch.utils.data.Dataset):
         if not self.bucket_no_upscale:
             self.bucket_manager.make_buckets()
 
+        # If a precomputed bucket index is provided, use it directly and
+        # skip scanning images from disk.
+        if self.bucket_index_path is not None:
+            self._load_bucket_index(self.bucket_index_path, max_reso)
+            return
+
         bucket_counts = {}
         skipped_missing_key = 0
         skipped_invalid_value = 0
         skipped_missing_file = 0
         skipped_unreadable = 0
-        for data_id, data in enumerate(self.data):
+
+        # Iterate over all items regardless of whether metadata is kept in memory
+        # or accessed lazily via jsonl index.
+        num_items = len(self.jsonl_offsets) if (self.metadata_file_path is not None and self.jsonl_offsets) else len(self.data)
+        for data_id in range(num_items):
+            data = self.get_record_by_id(data_id)
             if bucket_data_key not in data:
                 skipped_missing_key += 1
                 continue

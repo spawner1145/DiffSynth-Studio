@@ -1,1 +1,2 @@
 from .unified_dataset import UnifiedDataset
+from .image_text_pair_dataset import ImageTextPairDataset
