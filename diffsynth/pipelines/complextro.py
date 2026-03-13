@@ -162,6 +162,8 @@ class ComplextroPipeline(BasePipeline):
         seed: int = None,
         rand_device: str = "cpu",
         num_inference_steps: int = 30,
+        use_gradient_checkpointing: bool = False,
+        use_gradient_checkpointing_offload: bool = False,
         progress_bar_cmd=tqdm,
     ):
         self.scheduler.set_timesteps(
@@ -212,6 +214,8 @@ class ComplextroPipeline(BasePipeline):
             "rand_device": rand_device,
             "batch_size": batch_size,
             "num_inference_steps": num_inference_steps,
+            "use_gradient_checkpointing": use_gradient_checkpointing,
+            "use_gradient_checkpointing_offload": use_gradient_checkpointing_offload,
         }
 
         for unit in self.units:
