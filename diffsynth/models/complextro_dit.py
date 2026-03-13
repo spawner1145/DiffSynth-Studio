@@ -693,6 +693,10 @@ class ComplextroImageDiT(torch.nn.Module):
         self.norm_out = AdaLayerNorm(self.hidden_size, single=True)
         self.proj_out = nn.Linear(self.hidden_size, in_channels)
 
+        nn.init.zeros_(self.proj_out.weight)
+        if self.proj_out.bias is not None:
+            nn.init.zeros_(self.proj_out.bias)
+
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
         if "image_pad_token" not in state_dict:
             state_dict = dict(state_dict)
