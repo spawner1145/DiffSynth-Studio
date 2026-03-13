@@ -1,6 +1,7 @@
 import os
 import json
 import argparse
+import imagesize
 from PIL import Image
 
 from diffsynth.core.data import UnifiedDataset, ImageTextPairDataset
@@ -137,6 +138,14 @@ def resolve_path(base_path, p):
     return os.path.join(base_path, p)
 
 
+def probe_image_size(path):
+    width, height = imagesize.get(path)
+    if width > 0 and height > 0:
+        return width, height
+    with Image.open(path) as img:
+        return img.size
+
+
 def build_bucket_index_for_unified(base_path, metadata_path, output_path,
                                    bucket_data_key="image",
                                    max_bucket_reso=1024,
@@ -178,8 +187,7 @@ def build_bucket_index_for_unified(base_path, metadata_path, output_path,
                 continue
 
             try:
-                with Image.open(path) as img:
-                    w, h = img.size
+                w, h = probe_image_size(path)
             except Exception:
                 skipped += 1
                 continue
@@ -225,8 +233,7 @@ def build_bucket_index_for_image_text_pair(data_dir, output_path,
                 skipped += 1
                 continue
             try:
-                with Image.open(image_path) as img:
-                    w, h = img.size
+                w, h = probe_image_size(image_path)
             except Exception:
                 skipped += 1
                 continue

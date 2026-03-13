@@ -1,11 +1,20 @@
 from .operators import LoadImage, ImageCropAndResize, ToAbsolutePath
 from .unified_dataset import BucketManager
 import torch, os, math, random
+import imagesize
 from PIL import Image
 import json
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}
+
+
+def _probe_image_size(image_path):
+    width, height = imagesize.get(image_path)
+    if width > 0 and height > 0:
+        return width, height
+    with Image.open(image_path) as img:
+        return img.size
 
 
 class ImageTextPairDataset(torch.utils.data.Dataset):
@@ -68,6 +77,7 @@ class ImageTextPairDataset(torch.utils.data.Dataset):
         self.seed = 0
         self.current_epoch = 0
         self.current_step = 0
+        self.max_skip_retries = 32
 
         self.pairs = []
         self._scan_pairs()
@@ -205,8 +215,7 @@ class ImageTextPairDataset(torch.utils.data.Dataset):
         skipped = 0
         for data_id, pair in enumerate(self.pairs):
             try:
-                with Image.open(pair["image"]) as img:
-                    w, h = img.size
+                w, h = _probe_image_size(pair["image"])
             except Exception:
                 skipped += 1
                 continue
@@ -309,16 +318,38 @@ class ImageTextPairDataset(torch.utils.data.Dataset):
             "prompt": self._load_text(pair["text"]),
         }
 
+    def _fallback_data_id(self, data_id, attempt, force_reso=None):
+        if force_reso is not None and self.bucket_enabled_batching:
+            candidate_ids = self.bucket_to_data_ids.get(force_reso, [])
+            if candidate_ids:
+                return candidate_ids[(data_id + attempt) % len(candidate_ids)]
+        return (data_id + attempt) % len(self.pairs)
+
+    def _process_single_with_retry(self, data_id, force_reso=None):
+        last_error = None
+        for attempt in range(self.max_skip_retries + 1):
+            candidate_id = self._fallback_data_id(data_id, attempt, force_reso=force_reso)
+            try:
+                return self._process_single(candidate_id, force_reso=force_reso)
+            except Exception as e:
+                last_error = e
+                print(f"[ImageTextPairDataset] skip broken sample data_id={candidate_id}: {e}")
+                continue
+        raise RuntimeError(
+            f"Failed to load a valid sample after {self.max_skip_retries + 1} attempts. "
+            f"Last error: {last_error}"
+        ) from last_error
+
     def __getitem__(self, idx):
         if self.bucket_enabled_batching:
             bucket_reso, batch_idx = self.bucket_batch_indices[idx % len(self.bucket_batch_indices)]
             source_ids = self.bucket_to_data_ids[bucket_reso]
             start = batch_idx * self.batch_size
             batch_ids = source_ids[start:start + self.batch_size]
-            return [self._process_single(did, force_reso=bucket_reso) for did in batch_ids]
+            return [self._process_single_with_retry(did, force_reso=bucket_reso) for did in batch_ids]
         else:
             source_id = idx % len(self.pairs)
-            return self._process_single(source_id)
+            return self._process_single_with_retry(source_id)
 
     def __len__(self):
         if self.bucket_enabled_batching:

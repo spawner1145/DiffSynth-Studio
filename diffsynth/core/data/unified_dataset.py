@@ -1,6 +1,7 @@
 from .operators import *
 import torch, json, pandas, os, math
 import random
+import imagesize
 from PIL import Image
 
 
@@ -154,6 +155,7 @@ class UnifiedDataset(torch.utils.data.Dataset):
         self.seed = 0
         self.current_epoch = 0
         self.current_step = 0
+        self.max_skip_retries = 32
         self.data = []
         self.cached_data = []
         self.load_from_cache = metadata_path is None
@@ -359,6 +361,9 @@ class UnifiedDataset(torch.utils.data.Dataset):
         path = self.resolve_data_path(path)
         if not os.path.exists(path):
             return None
+        width, height = imagesize.get(path)
+        if width > 0 and height > 0:
+            return width, height
         try:
             with Image.open(path) as image:
                 width, height = image.size
@@ -467,12 +472,11 @@ class UnifiedDataset(torch.utils.data.Dataset):
                 skipped_missing_file += 1
                 continue
 
-            try:
-                with Image.open(path) as image:
-                    image_width, image_height = image.size
-            except Exception:
+            size = self.fetch_image_size_from_data_value(value)
+            if size is None:
                 skipped_unreadable += 1
                 continue
+            image_width, image_height = size
 
             reso, _, _ = self.bucket_manager.select_bucket(image_width, image_height)
             self.bucket_reso_by_data_id[data_id] = reso
@@ -587,7 +591,7 @@ class UnifiedDataset(torch.utils.data.Dataset):
         return self.main_data_operator(value)
 
     def process_single_data(self, source_data_id, force_reso=None):
-        data = self.data[source_data_id].copy()
+        data = self.get_record_by_id(source_data_id).copy()
         for key in self.data_file_keys:
             if key in data:
                 if key in self.special_operator_map:
@@ -602,6 +606,40 @@ class UnifiedDataset(torch.utils.data.Dataset):
                     data[key] = self.main_data_operator(data[key])
         return data
 
+    def get_total_items(self):
+        if self.load_from_cache:
+            return len(self.cached_data)
+        if self.metadata_file_path is not None and self.jsonl_offsets:
+            return len(self.jsonl_offsets)
+        return len(self.data)
+
+    def _fallback_source_id(self, source_data_id, attempt, force_reso=None):
+        total_items = self.get_total_items()
+        if total_items <= 0:
+            raise RuntimeError("No data available for fallback sampling.")
+
+        if force_reso is not None and self.bucket_enabled_batching:
+            candidate_ids = self.bucket_to_data_ids.get(force_reso, [])
+            if candidate_ids:
+                return candidate_ids[(source_data_id + attempt) % len(candidate_ids)]
+
+        return (source_data_id + attempt) % total_items
+
+    def process_single_data_with_retry(self, source_data_id, force_reso=None):
+        last_error = None
+        for attempt in range(self.max_skip_retries + 1):
+            candidate_id = self._fallback_source_id(source_data_id, attempt, force_reso=force_reso)
+            try:
+                return self.process_single_data(candidate_id, force_reso=force_reso)
+            except Exception as e:
+                last_error = e
+                print(f"[UnifiedDataset] skip broken sample data_id={candidate_id}: {e}")
+                continue
+        raise RuntimeError(
+            f"Failed to load a valid sample after {self.max_skip_retries + 1} attempts. "
+            f"Last error: {last_error}"
+        ) from last_error
+
     def __getitem__(self, data_id):
         if self.load_from_cache:
             data = self.cached_data[data_id % len(self.cached_data)]
@@ -611,10 +649,11 @@ class UnifiedDataset(torch.utils.data.Dataset):
             source_data_ids = self.bucket_to_data_ids[bucket_reso]
             image_index = batch_index * self.batch_size
             batch_data_ids = source_data_ids[image_index : image_index + self.batch_size]
-            data = [self.process_single_data(source_data_id, force_reso=bucket_reso) for source_data_id in batch_data_ids]
+            data = [self.process_single_data_with_retry(source_data_id, force_reso=bucket_reso) for source_data_id in batch_data_ids]
         else:
-            source_data_id = data_id % len(self.data)
-            data = self.process_single_data(source_data_id)
+            total_items = self.get_total_items()
+            source_data_id = data_id % total_items
+            data = self.process_single_data_with_retry(source_data_id)
         return data
 
     def __len__(self):
@@ -625,9 +664,10 @@ class UnifiedDataset(torch.utils.data.Dataset):
         elif self.bucket_enabled_batching:
             return len(self.bucket_batch_indices)
         else:
+            total_items = self.get_total_items()
             if self.max_data_items is not None:
                 return int(self.max_data_items)
-            return len(self.data) * self.repeat
+            return total_items * self.repeat
         
     def check_data_equal(self, data1, data2):
         # Debug only
