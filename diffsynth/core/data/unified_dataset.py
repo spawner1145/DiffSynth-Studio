@@ -178,6 +178,13 @@ class UnifiedDataset(torch.utils.data.Dataset):
         """
         bucket_counts = {}
         self.bucket_reso_by_data_id = {}
+        total_lines = 0
+        skipped_invalid_json = 0
+        skipped_missing_fields = 0
+        skipped_invalid_reso = 0
+        skipped_out_of_range = 0
+
+        total_items = self.get_total_items()
 
         if index_path is None or not os.path.exists(index_path):
             raise ValueError(f"Bucket index file not found: {index_path}")
@@ -187,36 +194,48 @@ class UnifiedDataset(torch.utils.data.Dataset):
                 line = line.strip()
                 if not line:
                     continue
+                total_lines += 1
                 try:
                     item = json.loads(line)
                 except Exception:
+                    skipped_invalid_json += 1
                     continue
 
                 data_id = item.get("data_id", item.get("idx", None))
                 reso = item.get("bucket", item.get("reso", None))
                 if data_id is None or reso is None or not isinstance(reso, (list, tuple)) or len(reso) != 2:
+                    skipped_missing_fields += 1
                     continue
 
                 w, h = int(reso[0]), int(reso[1])
 
                 # Basic sanity checks to keep consistency with current bucket constraints.
                 if w < self.min_bucket_reso or h < self.min_bucket_reso:
+                    skipped_invalid_reso += 1
                     continue
                 if max(w, h) > self.max_bucket_reso:
+                    skipped_invalid_reso += 1
                     continue
                 if w % self.bucket_reso_steps != 0 or h % self.bucket_reso_steps != 0:
+                    skipped_invalid_reso += 1
                     continue
 
                 reso_tuple = (w, h)
                 did = int(data_id)
-                if did < 0 or did >= len(self.data):
+                if did < 0 or did >= total_items:
+                    skipped_out_of_range += 1
                     continue
 
                 self.bucket_reso_by_data_id[did] = reso_tuple
                 bucket_counts[reso_tuple] = bucket_counts.get(reso_tuple, 0) + 1
 
         if len(self.bucket_reso_by_data_id) == 0:
-            raise ValueError("Bucket index file is provided but no valid items were loaded.")
+            raise ValueError(
+                "Bucket index file is provided but no valid items were loaded. "
+                + f"total_lines={total_lines}, invalid_json={skipped_invalid_json}, "
+                + f"missing_fields={skipped_missing_fields}, invalid_reso={skipped_invalid_reso}, "
+                + f"out_of_range={skipped_out_of_range}, total_items={total_items}."
+            )
 
         self.bucket_info = {
             "bucket_data_key": self.bucket_data_key,
@@ -238,6 +257,13 @@ class UnifiedDataset(torch.utils.data.Dataset):
             f"{self.bucket_info['num_buckets']} buckets, "
             f"{self.bucket_info['num_bucketed_items']} items."
         )
+        skipped_total = skipped_invalid_json + skipped_missing_fields + skipped_invalid_reso + skipped_out_of_range
+        if skipped_total > 0:
+            print(
+                "Bucket index skipped lines: "
+                + f"invalid_json={skipped_invalid_json}, missing_fields={skipped_missing_fields}, "
+                + f"invalid_reso={skipped_invalid_reso}, out_of_range={skipped_out_of_range}"
+            )
     
     @staticmethod
     def default_image_operator(
