@@ -128,6 +128,7 @@ if __name__ == "__main__":
     device = "cuda"
     dtype = torch.bfloat16
     # 需要和训练时候配置一样
+    """
     complextro_model_config = {
         "num_layers": 8,
         "num_refiner_layers": 0,
@@ -135,6 +136,16 @@ if __name__ == "__main__":
         "num_attention_heads": 24,
         "attention_head_dim": 128,
         "rope_axes_dim": [16, 56, 56],
+    }
+    """
+    # 2.25B
+    complextro_model_config = {
+        "num_layers": 10,
+        "num_refiner_layers": 0,
+        "hidden_size": 2304,
+        "num_attention_heads": 24,
+        "attention_head_dim": 96,
+        "rope_axes_dim": [32, 32, 32],
     }
 
     pipe = build_complextro_pipe(

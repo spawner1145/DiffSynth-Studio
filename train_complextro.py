@@ -493,9 +493,9 @@ if __name__ == "__main__":
 
         return operator
 
-    # 1.05 B 配置
     # 你也可以改成更深更宽(一般是直接改num_layers和num_refiner_layers)；需要满足 hidden_size = num_attention_heads * attention_head_dim
     # 默认是num_layers=60，num_refiner_layers=2的配置
+    """
     complextro_model_config = {
         "num_layers": 8,
         "num_refiner_layers": 0,
@@ -503,6 +503,24 @@ if __name__ == "__main__":
         "num_attention_heads": 24,
         "attention_head_dim": 128,
         "rope_axes_dim": [16, 56, 56],
+        "enable_tread_routing": False,
+        "tread_routes": [
+            {
+                "selection_ratio": 0.5,
+                "start_layer_idx": 2,
+                "end_layer_idx": 4,
+            }
+        ],
+    }
+    """
+    # 2.25B
+    complextro_model_config = {
+        "num_layers": 10,
+        "num_refiner_layers": 0,
+        "hidden_size": 2304,
+        "num_attention_heads": 24,
+        "attention_head_dim": 96,
+        "rope_axes_dim": [32, 32, 32],
         "enable_tread_routing": False,
         "tread_routes": [
             {
