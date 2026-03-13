@@ -674,6 +674,12 @@ class ComplextroImageDiT(torch.nn.Module):
         if self.siglip_pad_token is not None:
             nn.init.normal_(self.siglip_pad_token, mean=0.0, std=0.02)
 
+        for module in self.time_text_embed.modules():
+            if isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0.0, std=0.02)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+
         self.transformer_blocks = nn.ModuleList(
             [
                 ComplextroSingleTransformerBlock(
