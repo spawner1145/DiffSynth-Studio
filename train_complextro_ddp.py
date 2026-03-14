@@ -290,8 +290,8 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             "edit_latent": edit_latent_inputs,
             "omni_mode": self.train_omni and omni_condition_groups is not None,
             "image_noise_mask": omni_noise_mask,
-            "use_gradient_checkpointing": False,
-            "use_gradient_checkpointing_offload": False,
+            "use_gradient_checkpointing": True,
+            "use_gradient_checkpointing_offload": True,
         }
 
         for unit in self.pipe.units:
