@@ -1,6 +1,7 @@
 import torch, math, functools
 import torch.nn as nn
 from typing import Tuple, Optional, Union, List
+from collections import OrderedDict
 from einops import rearrange
 from torch.nn.utils.rnn import pad_sequence
 from .general_modules import TimestepEmbeddings, RMSNorm, AdaLayerNorm
@@ -105,7 +106,9 @@ class ComplextroEmbedRope(nn.Module):
             self.rope_params(neg_index, self.axes_dim[1], self.theta),
             self.rope_params(neg_index, self.axes_dim[2], self.theta),
         ], dim=1)
-        self.rope_cache = {}
+        self.rope_cache = OrderedDict()
+        self.rope_cache_device = None
+        self.max_rope_cache_entries = 32
         self.scale_rope = scale_rope
         
     def rope_params(self, index, dim, theta=10000):
@@ -120,6 +123,24 @@ class ComplextroEmbedRope(nn.Module):
         )
         freqs = torch.polar(torch.ones_like(freqs), freqs)
         return freqs
+
+    def _ensure_cache_device(self, device):
+        device_key = str(device)
+        if self.rope_cache_device != device_key:
+            self.rope_cache.clear()
+            self.rope_cache_device = device_key
+
+    def _cache_get(self, key):
+        cached = self.rope_cache.get(key)
+        if cached is not None:
+            self.rope_cache.move_to_end(key)
+        return cached
+
+    def _cache_set(self, key, value):
+        self.rope_cache[key] = value
+        self.rope_cache.move_to_end(key)
+        while len(self.rope_cache) > self.max_rope_cache_entries:
+            self.rope_cache.popitem(last=False)
 
 
     def _expand_pos_freqs_if_needed(self, video_fhw, txt_seq_lens):
@@ -156,14 +177,16 @@ class ComplextroEmbedRope(nn.Module):
         if self.pos_freqs.device != device:
             self.pos_freqs = self.pos_freqs.to(device)
             self.neg_freqs = self.neg_freqs.to(device)
+        self._ensure_cache_device(device)
 
         vid_freqs = []
         max_vid_index = 0
         for idx, fhw in enumerate(video_fhw):
             frame, height, width = fhw
-            rope_key = f"{idx}_{height}_{width}"
+            rope_key = (idx, frame, height, width)
 
-            if rope_key not in self.rope_cache:
+            cached_freqs = self._cache_get(rope_key)
+            if cached_freqs is None:
                 seq_lens = frame * height * width
                 freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
                 freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -181,8 +204,9 @@ class ComplextroEmbedRope(nn.Module):
                     freqs_width = freqs_pos[2][:width].view(1, 1, width, -1).expand(frame, height, width, -1)
 
                 freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
-                self.rope_cache[rope_key] = freqs.clone().contiguous()
-            vid_freqs.append(self.rope_cache[rope_key])
+                cached_freqs = freqs.contiguous()
+                self._cache_set(rope_key, cached_freqs)
+            vid_freqs.append(cached_freqs)
 
             if self.scale_rope:
                 max_vid_index = max(height // 2, width // 2, max_vid_index)
@@ -201,17 +225,20 @@ class ComplextroEmbedRope(nn.Module):
         if self.pos_freqs.device != device:
             self.pos_freqs = self.pos_freqs.to(device)
             self.neg_freqs = self.neg_freqs.to(device)
+        self._ensure_cache_device(device)
 
         vid_freqs = []
         max_vid_index = 0
         for idx, fhw in enumerate(video_fhw):
             frame, height, width = fhw
-            rope_key = f"{idx}_{height}_{width}"
-            if idx > 0 and f"{0}_{height}_{width}" not in self.rope_cache:
+            rope_key = (idx, frame, height, width)
+            rope_key_0 = (0, video_fhw[0][0], video_fhw[0][1], video_fhw[0][2])
+            cached_freqs = self._cache_get(rope_key)
+            cached_freqs_0 = self._cache_get(rope_key_0)
+            if idx > 0 and cached_freqs is None and cached_freqs_0 is not None:
                 frame_0, height_0, width_0 = video_fhw[0]
 
-                rope_key_0 = f"0_{height_0}_{width_0}"
-                spatial_freqs_0 = self.rope_cache[rope_key_0].reshape(frame_0, height_0, width_0, -1)
+                spatial_freqs_0 = cached_freqs_0.reshape(frame_0, height_0, width_0, -1)
                 h_indices = torch.linspace(0, height_0 - 1, height).long()
                 w_indices = torch.linspace(0, width_0 - 1, width).long()
                 h_grid, w_grid = torch.meshgrid(h_indices, w_indices, indexing='ij')
@@ -222,8 +249,9 @@ class ComplextroEmbedRope(nn.Module):
                 sampled_rope[:, :, :, :freqs_frame.shape[-1]] = freqs_frame
 
                 seq_lens = frame * height * width
-                self.rope_cache[rope_key] = sampled_rope.reshape(seq_lens, -1).clone()
-            if rope_key not in self.rope_cache:
+                self._cache_set(rope_key, sampled_rope.reshape(seq_lens, -1).contiguous())
+                cached_freqs = self._cache_get(rope_key)
+            if cached_freqs is None:
                 seq_lens = frame * height * width
                 freqs_pos = self.pos_freqs.split([x // 2 for x in self.axes_dim], dim=1)
                 freqs_neg = self.neg_freqs.split([x // 2 for x in self.axes_dim], dim=1)
@@ -241,8 +269,9 @@ class ComplextroEmbedRope(nn.Module):
                     freqs_width = freqs_pos[2][:width].view(1, 1, width, -1).expand(frame, height, width, -1)
 
                 freqs = torch.cat([freqs_frame, freqs_height, freqs_width], dim=-1).reshape(seq_lens, -1)
-                self.rope_cache[rope_key] = freqs.clone()
-            vid_freqs.append(self.rope_cache[rope_key].contiguous())
+                cached_freqs = freqs.contiguous()
+                self._cache_set(rope_key, cached_freqs)
+            vid_freqs.append(cached_freqs)
 
             if self.scale_rope:
                 max_vid_index = max(height // 2, width // 2, max_vid_index)
@@ -522,9 +551,18 @@ class ComplextroSingleTransformerBlock(nn.Module):
                 token_type_ids = token_type_ids.to(device=hidden_states.device, dtype=torch.long).clamp(
                     TOKEN_TYPE_TEXT, TOKEN_TYPE_COND_IMAGE
                 )
-                mod_candidates = torch.stack([mlp(temb) for mlp in self.modulation_mlps], dim=2)
-                gather_index = token_type_ids.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, mod_candidates.shape[-1])
-                mod = torch.gather(mod_candidates, dim=2, index=gather_index).squeeze(2)
+                flat_temb = temb.reshape(-1, temb.shape[-1])
+                flat_token_type_ids = token_type_ids.reshape(-1)
+                flat_mod = torch.empty(
+                    (flat_temb.shape[0], 6 * self.dim),
+                    device=flat_temb.device,
+                    dtype=flat_temb.dtype,
+                )
+                for type_id, mlp in enumerate(self.modulation_mlps):
+                    type_mask = flat_token_type_ids == type_id
+                    if type_mask.any():
+                        flat_mod[type_mask] = mlp(flat_temb[type_mask])
+                mod = flat_mod.view(*temb.shape[:-1], -1)
             else:
                 mod = self.modulation_mlp(temb)
                 if mod.ndim == 2:
@@ -604,6 +642,10 @@ class ComplextroImageDiT(torch.nn.Module):
         self.enable_tread_routing = bool(enable_tread_routing)
         self.tread_routes = self._normalize_tread_routes(tread_routes)
         self.tread_router = TreadRouter() if self.enable_tread_routing and len(self.tread_routes) > 0 else None
+        self._freq_cache = OrderedDict()
+        self._scaled_siglip_freq_cache = OrderedDict()
+        self._freq_cache_device = None
+        self._max_freq_cache_entries = 32
 
         if not use_layer3d_rope:
             self.pos_embed = ComplextroEmbedRope(theta=10000, axes_dim=self.rope_axes_dim, scale_rope=True)
@@ -991,9 +1033,36 @@ class ComplextroImageDiT(torch.nn.Module):
             temb_clean.unsqueeze(1),
         )
 
+    def _reset_freq_cache_if_needed(self, device: torch.device):
+        device_key = str(device)
+        if self._freq_cache_device != device_key:
+            self._freq_cache.clear()
+            self._scaled_siglip_freq_cache.clear()
+            self._freq_cache_device = device_key
+
+    @staticmethod
+    def _cache_lookup(cache: OrderedDict, key):
+        value = cache.get(key)
+        if value is not None:
+            cache.move_to_end(key)
+        return value
+
+    def _cache_store(self, cache: OrderedDict, key, value: torch.Tensor):
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > self._max_freq_cache_entries:
+            cache.popitem(last=False)
+
     def _build_2d_freqs(self, height: int, width: int, device: torch.device) -> torch.Tensor:
+        self._reset_freq_cache_if_needed(device)
+        cache_key = (height, width)
+        cached = self._cache_lookup(self._freq_cache, cache_key)
+        if cached is not None:
+            return cached
         img_freqs, _ = self.pos_embed([(1, height, width)], [1], device=device)
-        return img_freqs[: height * width]
+        cached = img_freqs[: height * width].contiguous()
+        self._cache_store(self._freq_cache, cache_key, cached)
+        return cached
 
     def _build_scaled_siglip_freqs(
         self,
@@ -1003,13 +1072,19 @@ class ComplextroImageDiT(torch.nn.Module):
         ref_w: int,
         device: torch.device,
     ) -> torch.Tensor:
+        self._reset_freq_cache_if_needed(device)
+        cache_key = (sig_h, sig_w, ref_h, ref_w)
+        cached = self._cache_lookup(self._scaled_siglip_freq_cache, cache_key)
+        if cached is not None:
+            return cached
         ref_freqs = self._build_2d_freqs(ref_h, ref_w, device=device)
         ref_freqs = ref_freqs.view(ref_h, ref_w, -1)
 
         y_idx = torch.linspace(0, max(ref_h - 1, 0), steps=sig_h, device=device).round().long()
         x_idx = torch.linspace(0, max(ref_w - 1, 0), steps=sig_w, device=device).round().long()
-        sampled = ref_freqs[y_idx][:, x_idx]
-        return sampled.reshape(sig_h * sig_w, -1)
+        sampled = ref_freqs[y_idx][:, x_idx].reshape(sig_h * sig_w, -1).contiguous()
+        self._cache_store(self._scaled_siglip_freq_cache, cache_key, sampled)
+        return sampled
 
     def _build_omni_image_freqs(
         self,

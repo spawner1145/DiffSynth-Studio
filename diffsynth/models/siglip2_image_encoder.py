@@ -1,6 +1,7 @@
 from transformers.models.siglip.modeling_siglip import SiglipVisionTransformer, SiglipVisionConfig
 from transformers import SiglipImageProcessor, Siglip2VisionModel, Siglip2VisionConfig, Siglip2ImageProcessorFast
 import torch
+from typing import List, Union
 
 from diffsynth.core.device.npu_compatible_device import get_device_type
 
@@ -123,12 +124,15 @@ class Siglip2ImageEncoder428M(Siglip2VisionModel):
             }
         )
         
-    def forward(self, image, torch_dtype=torch.bfloat16, device="cuda"):
-        siglip_inputs = self.processor(images=[image], return_tensors="pt").to(device)
-        shape = siglip_inputs.spatial_shapes[0]
-        hidden_state = super().forward(**siglip_inputs).last_hidden_state
-        B, N, C = hidden_state.shape
-        hidden_state = hidden_state[:, : shape[0] * shape[1]]
-        hidden_state = hidden_state.view(shape[0], shape[1], C)
-        hidden_state = hidden_state.to(torch_dtype)
-        return hidden_state
+    def forward(self, image: Union[object, List[object]], torch_dtype=torch.bfloat16, device="cuda"):
+        images = image if isinstance(image, list) else [image]
+        siglip_inputs = self.processor(images=images, return_tensors="pt").to(device)
+        spatial_shapes = siglip_inputs.spatial_shapes.tolist()
+        hidden_state = super().forward(**siglip_inputs).last_hidden_state.to(torch_dtype)
+
+        outputs = []
+        for batch_idx, (height, width) in enumerate(spatial_shapes):
+            local = hidden_state[batch_idx, : height * width]
+            outputs.append(local.view(height, width, hidden_state.shape[-1]))
+
+        return outputs if isinstance(image, list) else outputs[0]

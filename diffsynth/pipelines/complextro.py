@@ -144,7 +144,7 @@ class ComplextroPipeline(BasePipeline):
         pipe.vram_management_enabled = pipe.check_vram_management_state()
         return pipe
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def __call__(
         self,
         prompt: Union[str, List[str]],
@@ -626,13 +626,22 @@ class ComplextroUnit_EditImageEmbedderSiglip(PipelineUnit):
             return {}
         pipe.load_models_to_device(self.onload_model_names)
         if isinstance(edit_image, list) and len(edit_image) > 0 and isinstance(edit_image[0], list):
-            image_embeds = []
+            flat_images = []
+            group_sizes = []
             for image_group in edit_image:
-                group_embeds = [pipe.image_encoder(pipe._prepare_multimodal_image(image), device=pipe.device).to(pipe.torch_dtype) for image in image_group]
-                image_embeds.append(group_embeds)
+                prepared_group = [pipe._prepare_multimodal_image(image) for image in image_group]
+                flat_images.extend(prepared_group)
+                group_sizes.append(len(prepared_group))
+            flat_embeds = pipe.image_encoder(flat_images, device=pipe.device)
+            image_embeds = []
+            offset = 0
+            for group_size in group_sizes:
+                image_embeds.append(flat_embeds[offset : offset + group_size])
+                offset += group_size
         else:
             images = edit_image if isinstance(edit_image, list) else [edit_image]
-            image_embeds = [pipe.image_encoder(pipe._prepare_multimodal_image(image), device=pipe.device).to(pipe.torch_dtype) for image in images]
+            prepared_images = [pipe._prepare_multimodal_image(image) for image in images]
+            image_embeds = pipe.image_encoder(prepared_images, device=pipe.device)
         return {"image_embeds": image_embeds}
 
 
