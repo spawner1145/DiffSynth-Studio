@@ -147,86 +147,88 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         self.pipe.freeze_except(["dit"])
         self.pipe.scheduler.set_timesteps(1000, training=True)
 
-    def _normalize_edit_images(self, edit_value: Any, batch_size: int) -> Optional[List[List[Any]]]:
-        if isinstance(edit_value, float) and edit_value != edit_value:
-            return None
-        if edit_value is None:
-            return None
-        if not isinstance(edit_value, list):
-            return [[edit_value] for _ in range(batch_size)]
-        if len(edit_value) == 0:
-            return None
-        if isinstance(edit_value[0], list):
-            if len(edit_value) == batch_size:
-                return edit_value
-            if len(edit_value) == 1:
-                return [edit_value[0] for _ in range(batch_size)]
-            return edit_value[:batch_size]
+    @staticmethod
+    def _is_nan_scalar(value: Any) -> bool:
+        return isinstance(value, float) and value != value
 
-        if batch_size > 1 and len(edit_value) == batch_size:
-            return [[v] for v in edit_value]
-        return [edit_value for _ in range(batch_size)]
-
-    def _normalize_edit_latent_inputs(
-        self,
-        edit_latent_value: Any,
-        batch_size: int,
-    ) -> Optional[List[List[Any]]]:
-        if edit_latent_value is None or (isinstance(edit_latent_value, float) and edit_latent_value != edit_latent_value):
-            return None
-
-        if not isinstance(edit_latent_value, list):
-            return [[edit_latent_value] for _ in range(batch_size)]
-        if len(edit_latent_value) == 0:
-            return None
-        if isinstance(edit_latent_value[0], list):
-            if len(edit_latent_value) == batch_size:
-                return edit_latent_value
-            if len(edit_latent_value) == 1:
-                return [edit_latent_value[0] for _ in range(batch_size)]
-            latent_num = len(edit_latent_value)
-            return [edit_latent_value[i % latent_num] for i in range(batch_size)]
-
-        if batch_size > 1 and len(edit_latent_value) == batch_size:
-            return [[v] for v in edit_latent_value]
-        return [edit_latent_value for _ in range(batch_size)]
-
-    def _normalize_omni_noise_mask(self, noise_mask_value: Any, condition_groups: Optional[List[List[Any]]], batch_size: int):
-        if condition_groups is None:
-            return None
-
-        def fit_len(mask, cond_num):
-            if mask is None:
-                return [0] * cond_num + [1]
-            local = [int(v) for v in mask]
-            need_len = cond_num + 1
-            if len(local) < need_len:
-                tail = local[-1] if len(local) > 0 else 1
-                local = local + [tail] * (need_len - len(local))
-            return local[:need_len]
-
-        if noise_mask_value is None:
-            return [[0] * len(group) + [1] for group in condition_groups]
-        if not isinstance(noise_mask_value, list):
-            return [[int(noise_mask_value)] * len(group) + [1] for group in condition_groups]
-        if len(noise_mask_value) == 0:
-            return [[0] * len(group) + [1] for group in condition_groups]
-        if isinstance(noise_mask_value[0], list):
-            if len(noise_mask_value) == batch_size:
-                return [fit_len(noise_mask_value[i], len(condition_groups[i])) for i in range(batch_size)]
-            if len(noise_mask_value) == 1:
-                return [fit_len(noise_mask_value[0], len(condition_groups[i])) for i in range(batch_size)]
-            mask_num = len(noise_mask_value)
-            return [fit_len(noise_mask_value[i % mask_num], len(condition_groups[i])) for i in range(batch_size)]
-        return [fit_len(noise_mask_value, len(condition_groups[i])) for i in range(batch_size)]
+    @classmethod
+    def _is_missing_value(cls, value: Any) -> bool:
+        return value is None or cls._is_nan_scalar(value)
 
     def _infer_batch_size(self, prompt_value: Any, image_value: Any) -> int:
-        prompt_batch = 1 if isinstance(prompt_value, str) else len(prompt_value)
-        image_batch = len(image_value) if isinstance(image_value, (list, tuple)) else 1
+        image_batch = int(image_value.shape[0]) if isinstance(image_value, torch.Tensor) and image_value.ndim >= 1 else (
+            len(image_value) if isinstance(image_value, (list, tuple)) else 1
+        )
+        prompt_batch = len(prompt_value) if isinstance(prompt_value, (list, tuple)) and not isinstance(prompt_value, str) else 1
         return max(prompt_batch, image_batch)
 
-    def _infer_image_hw(self, image_value: Any):
-        first_image = image_value[0] if isinstance(image_value, (list, tuple)) else image_value
+    def _split_batch_value(self, value: Any, batch_size: int) -> List[Any]:
+        if batch_size <= 1:
+            return [value]
+        if isinstance(value, torch.Tensor):
+            if value.ndim == 0:
+                return [value for _ in range(batch_size)]
+            if int(value.shape[0]) != batch_size:
+                raise ValueError(f"Tensor batch dimension {value.shape[0]} does not match batch_size {batch_size}.")
+            return [value[i] for i in range(batch_size)]
+        if isinstance(value, tuple):
+            value = list(value)
+        if isinstance(value, list):
+            if len(value) == batch_size:
+                return value
+            if len(value) == 1:
+                return value * batch_size
+        return [value for _ in range(batch_size)]
+
+    def _normalize_prompt_entries(self, prompt_entries: List[Any]) -> List[str]:
+        prompts = []
+        for entry in prompt_entries:
+            if self._is_missing_value(entry):
+                prompts.append("")
+            else:
+                prompts.append(entry if isinstance(entry, str) else str(entry))
+        return prompts
+
+    def _normalize_edit_image_entry(self, entry: Any) -> List[Any]:
+        if self._is_missing_value(entry):
+            return []
+        if not isinstance(entry, (list, tuple)):
+            return [entry]
+        images = []
+        for item in entry:
+            if self._is_missing_value(item):
+                continue
+            images.append(item)
+        return images
+
+    def _normalize_edit_latent_entry(self, entry: Any) -> List[Any]:
+        if self._is_missing_value(entry):
+            return []
+        if not isinstance(entry, (list, tuple)):
+            return [entry]
+        latents = []
+        for item in entry:
+            if self._is_nan_scalar(item):
+                continue
+            latents.append(item)
+        return latents
+
+    def _normalize_single_noise_mask(self, entry: Any, cond_num: int) -> List[int]:
+        if self._is_missing_value(entry):
+            return [0] * cond_num + [1]
+        if not isinstance(entry, (list, tuple)):
+            local = [int(entry)]
+        else:
+            local = [int(v) for v in entry if not self._is_missing_value(v)]
+        need_len = cond_num + 1
+        if len(local) == 0:
+            return [0] * cond_num + [1]
+        if len(local) < need_len:
+            local = local + [local[-1]] * (need_len - len(local))
+        return local[:need_len]
+
+    def _infer_image_hw(self, image_entries: List[Any]):
+        first_image = image_entries[0]
         if hasattr(first_image, "size"):
             width, height = first_image.size
             return int(height), int(width)
@@ -234,59 +236,52 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             return int(first_image.shape[-2]), int(first_image.shape[-1])
         raise ValueError("Cannot infer image height/width from data['image']")
 
-    def _normalize_prompt(self, prompt_value: Any, batch_size: int):
-        if isinstance(prompt_value, str):
-            return prompt_value if batch_size == 1 else [prompt_value] * batch_size
-        if not isinstance(prompt_value, list):
-            return [str(prompt_value)] * batch_size
-        if len(prompt_value) == batch_size:
-            return prompt_value
-        if len(prompt_value) == 1:
-            return prompt_value * batch_size
-        if len(prompt_value) == 0:
-            return [""] * batch_size
-        return [prompt_value[i % len(prompt_value)] for i in range(batch_size)]
-
-    def _normalize_negative_prompt(self, prompt_value: Any, neg_prompt_value: Any):
-        prompt_batch = 1 if isinstance(prompt_value, str) else len(prompt_value)
-        if neg_prompt_value is None:
-            return [""] * prompt_batch
-        if isinstance(neg_prompt_value, str):
-            return neg_prompt_value if prompt_batch == 1 else [neg_prompt_value] * prompt_batch
-        if not isinstance(neg_prompt_value, list):
-            return [str(neg_prompt_value)] * prompt_batch
-        if len(neg_prompt_value) == prompt_batch:
-            return neg_prompt_value
-        if len(neg_prompt_value) == 1:
-            return [neg_prompt_value[0]] * prompt_batch
-        if len(neg_prompt_value) == 0:
-            return [""] * prompt_batch
-        return [neg_prompt_value[i % len(neg_prompt_value)] for i in range(prompt_batch)]
+    def _validate_batched_image_shapes(self, image_entries: List[Any]):
+        if len(image_entries) <= 1:
+            return
+        reference_hw = self._infer_image_hw([image_entries[0]])
+        for idx, image in enumerate(image_entries[1:], start=1):
+            local_hw = self._infer_image_hw([image])
+            if local_hw != reference_hw:
+                raise ValueError(
+                    f"Batch size > 1 requires all target images in a batch to share the same resolution. "
+                    f"Got sample0={reference_hw}, sample{idx}={local_hw}. Enable bucket batching or use a fixed training resolution."
+                )
 
     def forward(self, data):
-        prompt_value = data["prompt"]
-        image_value = data["image"]
-        batch_size = self._infer_batch_size(prompt_value, image_value)
-        prompt_value = self._normalize_prompt(prompt_value, batch_size)
-        neg_prompt_value = self._normalize_negative_prompt(prompt_value, data.get("neg_prompt", ""))
-        height, width = self._infer_image_hw(image_value)
+        batch_size = self._infer_batch_size(data["prompt"], data["image"])
+        prompt_entries = self._split_batch_value(data["prompt"], batch_size)
+        image_entries = self._split_batch_value(data["image"], batch_size)
+        neg_prompt_entries = self._split_batch_value(data.get("neg_prompt", ""), batch_size)
+        edit_image_entries = self._split_batch_value(data.get("edit_image", None), batch_size)
+        edit_latent_entries = self._split_batch_value(data.get("edit_latent", None), batch_size)
+        noise_mask_entries = self._split_batch_value(data.get("image_noise_mask", None), batch_size)
 
-        edit_images = self._normalize_edit_images(data.get("edit_image", None), batch_size)
-        edit_latent_inputs = self._normalize_edit_latent_inputs(data.get("edit_latent", None), batch_size)
+        prompt_value = self._normalize_prompt_entries(prompt_entries)
+        neg_prompt_value = self._normalize_prompt_entries(neg_prompt_entries)
+        self._validate_batched_image_shapes(image_entries)
+        height, width = self._infer_image_hw(image_entries)
+
+        edit_images = [self._normalize_edit_image_entry(entry) for entry in edit_image_entries]
+        if all(len(group) == 0 for group in edit_images):
+            edit_images = None
+
+        edit_latent_inputs = [self._normalize_edit_latent_entry(entry) for entry in edit_latent_entries]
+        if all(len(group) == 0 for group in edit_latent_inputs):
+            edit_latent_inputs = None
 
         omni_condition_groups = edit_images if edit_images is not None else edit_latent_inputs
         omni_noise_mask = None
         if self.train_omni and omni_condition_groups is not None:
-            omni_noise_mask = self._normalize_omni_noise_mask(
-                data.get("image_noise_mask", None),
-                omni_condition_groups,
-                batch_size,
-            )
+            omni_noise_mask = [
+                self._normalize_single_noise_mask(noise_mask_entries[i], len(omni_condition_groups[i]))
+                for i in range(batch_size)
+            ]
 
         inputs_posi = {"prompt": prompt_value}
         inputs_nega = {"negative_prompt": neg_prompt_value}
         inputs_shared = {
-            "input_image": image_value,
+            "input_image": image_entries if batch_size > 1 else image_entries[0],
             "height": height,
             "width": width,
             "batch_size": batch_size,
