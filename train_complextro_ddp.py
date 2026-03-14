@@ -227,6 +227,15 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             local = local + [local[-1]] * (need_len - len(local))
         return local[:need_len]
 
+    def _infer_omni_condition_count(
+        self,
+        edit_image_group: Optional[List[Any]],
+        edit_latent_group: Optional[List[Any]],
+    ) -> int:
+        image_count = 0 if edit_image_group is None else len(edit_image_group)
+        latent_count = 0 if edit_latent_group is None else len(edit_latent_group)
+        return max(image_count, latent_count)
+
     def _infer_image_hw(self, image_entries: List[Any]):
         first_image = image_entries[0]
         if hasattr(first_image, "size"):
@@ -270,11 +279,18 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         if all(len(group) == 0 for group in edit_latent_inputs):
             edit_latent_inputs = None
 
-        omni_condition_groups = edit_images if edit_images is not None else edit_latent_inputs
+        omni_condition_counts = [
+            self._infer_omni_condition_count(
+                edit_images[i] if edit_images is not None else None,
+                edit_latent_inputs[i] if edit_latent_inputs is not None else None,
+            )
+            for i in range(batch_size)
+        ]
+        has_any_omni_condition = any(cond_num > 0 for cond_num in omni_condition_counts)
         omni_noise_mask = None
-        if self.train_omni and omni_condition_groups is not None:
+        if self.train_omni and has_any_omni_condition:
             omni_noise_mask = [
-                self._normalize_single_noise_mask(noise_mask_entries[i], len(omni_condition_groups[i]))
+                self._normalize_single_noise_mask(noise_mask_entries[i], omni_condition_counts[i])
                 for i in range(batch_size)
             ]
 
@@ -288,7 +304,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             "cfg_scale": 1,
             "edit_image": edit_images,
             "edit_latent": edit_latent_inputs,
-            "omni_mode": self.train_omni and omni_condition_groups is not None,
+            "omni_mode": self.train_omni and has_any_omni_condition,
             "image_noise_mask": omni_noise_mask,
             "use_gradient_checkpointing": True,
             "use_gradient_checkpointing_offload": True,

@@ -410,7 +410,7 @@ class ComplextroUnit_PromptEmbedder(PipelineUnit):
             merged_emb.append(torch.cat(emb_groups[owner_id], dim=0))
             merged_mask.append(torch.cat(mask_groups[owner_id], dim=0))
 
-        target_seq_len = 1024
+        target_seq_len = max(1, min(1024, max(int(emb_item.shape[0]) for emb_item in merged_emb)))
         prompt_emb = torch.zeros((len(prompts), target_seq_len, hidden_dim), dtype=pipe.torch_dtype, device=pipe.device)
         prompt_emb_mask = torch.zeros((len(prompts), target_seq_len), dtype=torch.long, device=pipe.device)
         for batch_id, (emb_item, mask_item) in enumerate(zip(merged_emb, merged_mask)):
