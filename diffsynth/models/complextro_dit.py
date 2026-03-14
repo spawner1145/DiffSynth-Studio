@@ -712,6 +712,9 @@ class ComplextroImageDiT(torch.nn.Module):
             self.siglip_refiner = None
             self.siglip_pad_token = None
 
+        self.modulation_init_std = 1e-3
+        self.output_init_std = 1e-3
+
         # Initialize all Linear layers with xavier_uniform:
         def _basic_init(module):
             if isinstance(module, nn.Linear):
@@ -750,19 +753,17 @@ class ComplextroImageDiT(torch.nn.Module):
         self.norm_out = AdaLayerNorm(self.hidden_size, single=True)
         self.proj_out = nn.Linear(self.hidden_size, in_channels)
 
-        # Zero-out adaLN modulation layers in transformer blocks and noise refiner:
         for block in list(self.transformer_blocks) + list(self.noise_refiner):
             if block.modulation:
-                nn.init.constant_(block.modulation_mlp[-1].weight, 0)
-                nn.init.constant_(block.modulation_mlp[-1].bias, 0)
+                nn.init.normal_(block.modulation_mlp[-1].weight, mean=0.0, std=self.modulation_init_std)
+                nn.init.normal_(block.modulation_mlp[-1].bias, mean=0.0, std=self.modulation_init_std)
                 for mlp in block.modulation_mlps:
-                    nn.init.constant_(mlp[-1].weight, 0)
-                    nn.init.constant_(mlp[-1].bias, 0)
+                    nn.init.normal_(mlp[-1].weight, mean=0.0, std=self.modulation_init_std)
+                    nn.init.normal_(mlp[-1].bias, mean=0.0, std=self.modulation_init_std)
 
-        # Zero-out output layers:
-        nn.init.constant_(self.norm_out.linear.weight, 0)
-        nn.init.constant_(self.norm_out.linear.bias, 0)
-        nn.init.zeros_(self.proj_out.weight)
+        nn.init.normal_(self.norm_out.linear.weight, mean=0.0, std=self.output_init_std)
+        nn.init.normal_(self.norm_out.linear.bias, mean=0.0, std=self.output_init_std)
+        nn.init.normal_(self.proj_out.weight, mean=0.0, std=self.output_init_std)
         if self.proj_out.bias is not None:
             nn.init.zeros_(self.proj_out.bias)
 

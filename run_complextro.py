@@ -4,6 +4,7 @@ from PIL import Image
 
 from transformers import AutoProcessor
 from diffsynth.core import load_model
+from diffsynth.configs.vram_management_module_maps import VRAM_MANAGEMENT_MODULE_MAPS, VERSION_CHECKER_MAPS
 from diffsynth.models.qwen_image_text_encoder import QwenImageTextEncoder
 from diffsynth.utils.state_dict_converters.qwen_image_text_encoder import QwenImageTextEncoderStateDictConverter
 from diffsynth.models.flux2_vae import Flux2VAE
@@ -23,12 +24,51 @@ def build_complextro_pipe(
     siglip_model_file="",
     use_alpha_layer_vae: bool = False,
     complextro_model_config=None,
+    enable_vram_offload: bool = False,
+    vram_config: dict | None = None,
+    vram_limit: float | None = None,
 ):
     pipe = ComplextroPipeline(device=device, torch_dtype=torch_dtype)
     if complextro_model_config is None:
         complextro_model_config = {}
     else:
         complextro_model_config = dict(complextro_model_config)
+
+    if enable_vram_offload:
+        if vram_config is None:
+            vram_config = {
+                "offload_dtype": torch_dtype,
+                "offload_device": "cpu",
+                "onload_dtype": torch_dtype,
+                "onload_device": device,
+                "preparing_dtype": torch_dtype,
+                "preparing_device": device,
+                "computation_dtype": torch_dtype,
+                "computation_device": device,
+            }
+        else:
+            vram_config = dict(vram_config)
+
+    def resolve_module_map(model_class):
+        model_class_path = f"{model_class.__module__}.{model_class.__name__}"
+        if model_class_path in VERSION_CHECKER_MAPS:
+            return VERSION_CHECKER_MAPS[model_class_path]()
+        if model_class_path not in VRAM_MANAGEMENT_MODULE_MAPS:
+            raise KeyError(f"No VRAM management module map registered for {model_class_path}.")
+        return VRAM_MANAGEMENT_MODULE_MAPS[model_class_path]
+
+    def load_model_with_optional_offload(model_class, model_file, *, config=None, state_dict_converter=None):
+        load_kwargs = {
+            "config": config,
+            "torch_dtype": torch_dtype,
+            "device": device,
+            "state_dict_converter": state_dict_converter,
+        }
+        if enable_vram_offload:
+            load_kwargs["module_map"] = resolve_module_map(model_class)
+            load_kwargs["vram_config"] = vram_config
+            load_kwargs["vram_limit"] = vram_limit
+        return load_model(model_class, model_file, **load_kwargs)
 
     siglip_model_file = "" if siglip_model_file is None else str(siglip_model_file).strip()
     siglip_enabled = bool(siglip_model_file)
@@ -44,20 +84,16 @@ def build_complextro_pipe(
                 f"siglip_feat_dim ({configured_siglip_feat_dim}) must match Siglip2ImageEncoder428M output dim ({expected_siglip_feat_dim})."
             )
 
-    pipe.text_encoder = load_model(
+    pipe.text_encoder = load_model_with_optional_offload(
         QwenImageTextEncoder,
         qwen_model_file,
         config={"model_type": "qwen3_5", "model_size": qwen_model_size},
-        torch_dtype=torch_dtype,
-        device=device,
         state_dict_converter=QwenImageTextEncoderStateDictConverter,
     )
-    pipe.vae = load_model(
+    pipe.vae = load_model_with_optional_offload(
         Flux2VAE,
         flux2_vae_file,
         config={"use_alpha_layer": use_alpha_layer_vae},
-        torch_dtype=torch_dtype,
-        device=device,
     )
     pipe.processor = AutoProcessor.from_pretrained(qwen_tokenizer_dir)
     pipe.tokenizer = pipe.processor.tokenizer
@@ -72,12 +108,10 @@ def build_complextro_pipe(
             f"complextro_model_config['text_embed_dim'] ({configured_text_dim}) must match text encoder hidden_size ({text_hidden_size})."
         )
 
-    pipe.dit = load_model(
+    pipe.dit = load_model_with_optional_offload(
         ComplextroImageDiT,
         complextro_dit_file,
         config=complextro_model_config,
-        torch_dtype=torch_dtype,
-        device=device,
     )
 
     dit_text_dim = int(pipe.dit.txt_in.in_features)
@@ -88,11 +122,9 @@ def build_complextro_pipe(
         )
 
     if siglip_enabled:
-        pipe.image_encoder = load_model(
+        pipe.image_encoder = load_model_with_optional_offload(
             Siglip2ImageEncoder428M,
             siglip_model_file,
-            torch_dtype=torch_dtype,
-            device=device,
         )
 
     pipe.vram_management_enabled = pipe.check_vram_management_state()
@@ -127,6 +159,17 @@ if __name__ == "__main__":
     """
     device = "cuda"
     dtype = torch.bfloat16
+    enable_vram_offload = False
+    vram_config = {
+        "offload_dtype": torch.bfloat16,
+        "offload_device": "cpu",
+        "onload_dtype": torch.bfloat16,
+        "onload_device": "cuda",
+        "preparing_dtype": torch.bfloat16,
+        "preparing_device": "cuda",
+        "computation_dtype": torch.bfloat16,
+        "computation_device": "cuda",
+    }
     # 需要和训练时候配置一样
     """
     complextro_model_config = {
@@ -159,6 +202,8 @@ if __name__ == "__main__":
         siglip_model_file="",
         use_alpha_layer_vae=False,
         complextro_model_config=complextro_model_config,
+        enable_vram_offload=enable_vram_offload,
+        vram_config=vram_config,
     )
 
     prompts = [

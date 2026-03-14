@@ -5,6 +5,7 @@ from typing import List, Optional, Any
 
 from transformers import AutoProcessor
 from diffsynth.core import UnifiedDataset, ImageTextPairDataset, load_model
+from diffsynth.configs.vram_management_module_maps import VRAM_MANAGEMENT_MODULE_MAPS, VERSION_CHECKER_MAPS
 from diffsynth.core.data.operators import ImageCropAndResize, LoadImage, ToAbsolutePath
 from diffsynth.diffusion import (
     DiffusionTrainingModule,
@@ -34,10 +35,14 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         train_omni: bool = False,
         use_alpha_layer_vae: bool = False,
         complextro_model_config: Optional[dict] = None,
+        enable_vram_offload: bool = False,
+        vram_config: Optional[dict] = None,
+        vram_limit: Optional[float] = None,
     ):
         super().__init__()
         self.train_omni = train_omni
         self.complextro_model_config = {} if complextro_model_config is None else dict(complextro_model_config)
+        self.enable_vram_offload = enable_vram_offload
         siglip_enabled = bool(siglip_model_file) and os.path.exists(siglip_model_file)
         if siglip_enabled:
             expected_siglip_feat_dim = 1152
@@ -51,30 +56,60 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
 
         self.pipe = ComplextroPipeline(device=device, torch_dtype=torch.bfloat16)
 
-        self.pipe.text_encoder = load_model(
+        if enable_vram_offload:
+            if vram_config is None:
+                vram_config = {
+                    "offload_dtype": torch.bfloat16,
+                    "offload_device": "cpu",
+                    "onload_dtype": torch.bfloat16,
+                    "onload_device": device,
+                    "preparing_dtype": torch.bfloat16,
+                    "preparing_device": device,
+                    "computation_dtype": torch.bfloat16,
+                    "computation_device": device,
+                }
+            else:
+                vram_config = dict(vram_config)
+
+        def resolve_module_map(model_class):
+            model_class_path = f"{model_class.__module__}.{model_class.__name__}"
+            if model_class_path in VERSION_CHECKER_MAPS:
+                return VERSION_CHECKER_MAPS[model_class_path]()
+            if model_class_path not in VRAM_MANAGEMENT_MODULE_MAPS:
+                raise KeyError(f"No VRAM management module map registered for {model_class_path}.")
+            return VRAM_MANAGEMENT_MODULE_MAPS[model_class_path]
+
+        def load_aux_model(model_class, model_file, *, config=None, state_dict_converter=None):
+            load_kwargs = {
+                "config": config,
+                "torch_dtype": torch.bfloat16,
+                "device": device,
+                "state_dict_converter": state_dict_converter,
+            }
+            if enable_vram_offload:
+                load_kwargs["module_map"] = resolve_module_map(model_class)
+                load_kwargs["vram_config"] = vram_config
+                load_kwargs["vram_limit"] = vram_limit
+            return load_model(model_class, model_file, **load_kwargs)
+
+        self.pipe.text_encoder = load_aux_model(
             QwenImageTextEncoder,
             qwen_model_file,
             config={"model_type": "qwen3_5", "model_size": qwen_model_size},
-            torch_dtype=torch.bfloat16,
-            device=device,
             state_dict_converter=QwenImageTextEncoderStateDictConverter,
         )
-        self.pipe.vae = load_model(
+        self.pipe.vae = load_aux_model(
             Flux2VAE,
             flux2_vae_file,
             config={"use_alpha_layer": use_alpha_layer_vae},
-            torch_dtype=torch.bfloat16,
-            device=device,
         )
         self.pipe.processor = AutoProcessor.from_pretrained(qwen_tokenizer_dir)
         self.pipe.tokenizer = self.pipe.processor.tokenizer
 
         if siglip_enabled:
-            self.pipe.image_encoder = load_model(
+            self.pipe.image_encoder = load_aux_model(
                 Siglip2ImageEncoder428M,
                 siglip_model_file,
-                torch_dtype=torch.bfloat16,
-                device=device,
             )
 
         self.pipe.vram_management_enabled = self.pipe.check_vram_management_state()
@@ -98,7 +133,9 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
                 device=device,
             )
         else:
-            self.pipe.dit = ComplextroImageDiT(**self.complextro_model_config).to(dtype=torch.bfloat16, device=device)
+            self.pipe.dit = ComplextroImageDiT(**self.complextro_model_config)
+            self.pipe.dit = self.pipe.dit.to(device=device)
+            self.pipe.dit = self.pipe.dit.to(dtype=torch.bfloat16)
 
         dit_text_dim = int(self.pipe.dit.txt_in.in_features)
         if text_hidden_size != dit_text_dim:
@@ -301,6 +338,8 @@ if __name__ == "__main__":
     parser.add_argument("--hidden_size", type=int, default=2304, help="DiT hidden size")
     parser.add_argument("--num_attention_heads", type=int, default=24, help="DiT attention heads")
     parser.add_argument("--attention_head_dim", type=int, default=96, help="DiT attention head dim")
+    parser.add_argument("--enable_vram_offload", action="store_true", help="Enable VRAM offload for frozen auxiliary models")
+    parser.add_argument("--offload_device", type=str, default="cpu", help="Offload device when VRAM offload is enabled")
     
     args = parser.parse_args()
 
@@ -313,6 +352,17 @@ if __name__ == "__main__":
     train_omni = args.train_omni
     use_alpha_layer_vae = args.use_alpha_layer_vae
     siglip_model_file = args.siglip_model_file
+    enable_vram_offload = args.enable_vram_offload
+    vram_config = {
+        "offload_dtype": torch.bfloat16,
+        "offload_device": args.offload_device,
+        "onload_dtype": torch.bfloat16,
+        "onload_device": accelerator.device,
+        "preparing_dtype": torch.bfloat16,
+        "preparing_device": accelerator.device,
+        "computation_dtype": torch.bfloat16,
+        "computation_device": accelerator.device,
+    }
 
     def build_optional_edit_latent_operator(base_path, max_pixels):
         resize_op = ImageCropAndResize(
@@ -470,6 +520,8 @@ if __name__ == "__main__":
         train_omni=train_omni,
         use_alpha_layer_vae=use_alpha_layer_vae,
         complextro_model_config=complextro_model_config,
+        enable_vram_offload=enable_vram_offload,
+        vram_config=vram_config,
     )
     model_logger = ModelLogger(
         args.output_dir,
