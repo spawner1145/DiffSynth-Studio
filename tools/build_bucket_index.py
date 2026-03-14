@@ -4,10 +4,11 @@ import argparse
 from concurrent.futures import ProcessPoolExecutor
 import imagesize
 from PIL import Image
+from tqdm import tqdm
+import glob
 
 from diffsynth.core.data import UnifiedDataset, ImageTextPairDataset
 from diffsynth.core.data.unified_dataset import BucketManager
-from tqdm import tqdm
 
 """分桶索引构建脚本（适用于超大数据集预处理）
 
@@ -154,13 +155,23 @@ def ensure_parent_dir(path):
         os.makedirs(parent, exist_ok=True)
 
 
+# 全局缓存 BucketManager，避免在子进程中重复初始化
+_worker_bm_cache = None
+
+def get_cached_bm(bucket_args):
+    global _worker_bm_cache
+    if _worker_bm_cache is None:
+        _worker_bm_cache = build_bucket_manager(**bucket_args)
+    return _worker_bm_cache
+
+
 def _probe_unified_bucket_task(task):
     data_id, path, bucket_args = task
     if path is None or not os.path.exists(path):
         return None
     try:
         w, h = probe_image_size(path)
-        bm = build_bucket_manager(**bucket_args)
+        bm = get_cached_bm(bucket_args)
         reso, _, _ = bm.select_bucket(w, h)
         return {"data_id": int(data_id), "bucket": [int(reso[0]), int(reso[1])]}
     except Exception:
@@ -173,7 +184,7 @@ def _probe_pairs_bucket_task(task):
         return None
     try:
         w, h = probe_image_size(image_path)
-        bm = build_bucket_manager(**bucket_args)
+        bm = get_cached_bm(bucket_args)
         reso, _, _ = bm.select_bucket(w, h)
         return {"data_id": int(data_id), "bucket": [int(reso[0]), int(reso[1])]}
     except Exception:
@@ -186,8 +197,10 @@ def _iterate_results(tasks, worker_fn, num_workers, total=None, desc=None):
             yield worker_fn(task)
         return
 
+    # 对于 700w+ 级别的数据，必须使用较大的 chunksize 减少 IPC 开销
+    chunksize = 2000 if total and total > 100000 else 100
     with ProcessPoolExecutor(max_workers=int(num_workers)) as executor:
-        for result in tqdm(executor.map(worker_fn, tasks), total=total, desc=desc):
+        for result in tqdm(executor.map(worker_fn, tasks, chunksize=chunksize), total=total, desc=desc):
             yield result
 
 
@@ -258,29 +271,52 @@ def build_bucket_index_for_image_text_pair(data_dir, output_path,
                                            bucket_reso_steps=64,
                                            bucket_base_reso=None,
                                            bucket_no_upscale=False,
-                                           num_workers=1):
+                                           num_workers=1,
+                                           recursive=False):
     """Precompute bucket assignments for an ImageTextPairDataset directory.
 
     This mirrors ImageTextPairDataset._scan_pairs + _setup_buckets, but only
     computes (data_id -> bucket_reso) and writes to jsonl.
     """
-    # Reuse the existing dataset's scanning logic for (image, text) pairs.
-    ds = ImageTextPairDataset(
-        data_dir=data_dir,
-        enable_bucket=False,  # we only need pairs, not internal bucketing
-    )
+    if recursive:
+        print(f"Recursively scanning {data_dir} for pairs...")
+        image_exts = {".jpg", ".jpeg", ".png", ".webp", ".JPG", ".JPEG", ".PNG", ".WEBP"}
+        image_paths = []
+        for root, _, files in os.walk(data_dir):
+            for file in files:
+                if os.path.splitext(file)[1] in image_exts:
+                    img_path = os.path.join(root, file)
+                    txt_path = os.path.splitext(img_path)[0] + ".txt"
+                    if os.path.exists(txt_path):
+                        image_paths.append(img_path)
+        image_paths.sort()
+        tasks = [(data_id, img_path, {
+            "max_bucket_reso": max_bucket_reso,
+            "min_bucket_reso": min_bucket_reso,
+            "bucket_reso_steps": bucket_reso_steps,
+            "bucket_base_reso": bucket_base_reso,
+            "bucket_no_upscale": bucket_no_upscale,
+        }) for data_id, img_path in enumerate(image_paths)]
+        print(f"Found {len(tasks)} pairs.")
+    else:
+        # Reuse the existing dataset's scanning logic for (image, text) pairs.
+        ds = ImageTextPairDataset(
+            data_dir=data_dir,
+            enable_bucket=False,  # we only need pairs, not internal bucketing
+        )
 
-    bucket_args = {
-        "max_bucket_reso": max_bucket_reso,
-        "min_bucket_reso": min_bucket_reso,
-        "bucket_reso_steps": bucket_reso_steps,
-        "bucket_base_reso": bucket_base_reso,
-        "bucket_no_upscale": bucket_no_upscale,
-    }
-    build_bucket_manager(**bucket_args)
+        bucket_args = {
+            "max_bucket_reso": max_bucket_reso,
+            "min_bucket_reso": min_bucket_reso,
+            "bucket_reso_steps": bucket_reso_steps,
+            "bucket_base_reso": bucket_base_reso,
+            "bucket_no_upscale": bucket_no_upscale,
+        }
+        build_bucket_manager(**bucket_args)
 
-    ensure_parent_dir(output_path)
-    tasks = [(data_id, pair["image"], bucket_args) for data_id, pair in enumerate(ds.pairs)]
+        ensure_parent_dir(output_path)
+        tasks = [(data_id, pair["image"], bucket_args) for data_id, pair in enumerate(ds.pairs)]
+
     total = 0
     skipped = 0
 
@@ -325,6 +361,7 @@ def main():
     p_pairs = subparsers.add_parser("pairs", help="Build bucket index for ImageTextPairDataset")
     p_pairs.add_argument("--data_dir", type=str, required=True, help="Directory containing image/txt pairs")
     p_pairs.add_argument("--output", type=str, required=True, help="Output jsonl index path")
+    p_pairs.add_argument("--recursive", action="store_true", help="Whether to search for image/txt pairs recursively")
     for p in (p_pairs,):
         p.add_argument("--max_bucket_reso", type=int, default=1024)
         p.add_argument("--min_bucket_reso", type=int, default=256)
@@ -360,6 +397,7 @@ def main():
             bucket_base_reso=base_reso,
             bucket_no_upscale=args.bucket_no_upscale,
             num_workers=args.num_workers,
+            recursive=args.recursive,
         )
 
 
