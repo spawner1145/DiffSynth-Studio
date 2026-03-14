@@ -1,10 +1,11 @@
-import os, argparse
+import os, argparse, importlib
 import torch, accelerate
 from accelerate import DistributedDataParallelKwargs
 from typing import List, Optional, Any
 
 from transformers import AutoProcessor
 from diffsynth.core import UnifiedDataset, ImageTextPairDataset, load_model
+from diffsynth.core.vram import AutoWrappedModule
 from diffsynth.configs.vram_management_module_maps import VRAM_MANAGEMENT_MODULE_MAPS, VERSION_CHECKER_MAPS
 from diffsynth.core.data.operators import ImageCropAndResize, LoadImage, ToAbsolutePath
 from diffsynth.diffusion import (
@@ -72,12 +73,21 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
                 vram_config = dict(vram_config)
 
         def resolve_module_map(model_class):
+            def import_class(class_path: str):
+                split = class_path.rfind(".")
+                module_name, class_name = class_path[:split], class_path[split + 1:]
+                return getattr(importlib.import_module(module_name), class_name)
+
             model_class_path = f"{model_class.__module__}.{model_class.__name__}"
+            if model_class_path == "diffsynth.models.qwen_image_text_encoder.QwenImageTextEncoder":
+                return {model_class: AutoWrappedModule}
             if model_class_path in VERSION_CHECKER_MAPS:
-                return VERSION_CHECKER_MAPS[model_class_path]()
+                raw_map = VERSION_CHECKER_MAPS[model_class_path]()
+                return {import_class(source): import_class(target) for source, target in raw_map.items()}
             if model_class_path not in VRAM_MANAGEMENT_MODULE_MAPS:
                 raise KeyError(f"No VRAM management module map registered for {model_class_path}.")
-            return VRAM_MANAGEMENT_MODULE_MAPS[model_class_path]
+            raw_map = VRAM_MANAGEMENT_MODULE_MAPS[model_class_path]
+            return {import_class(source): import_class(target) for source, target in raw_map.items()}
 
         def load_aux_model(model_class, model_file, *, config=None, state_dict_converter=None):
             load_kwargs = {

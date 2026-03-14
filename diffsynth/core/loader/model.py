@@ -20,10 +20,11 @@ def load_model(model_class, path, config=None, torch_dtype=torch.bfloat16, devic
         dtypes = [vram_config["offload_dtype"], vram_config["onload_dtype"], vram_config["preparing_dtype"], vram_config["computation_dtype"]]
         dtype = [d for d in dtypes if d != "disk"][0]
         if vram_config["offload_device"] != "disk":
-            if state_dict is None: state_dict = DiskMap(path, device, torch_dtype=dtype)
-            if state_dict_converter is not None:
+            if state_dict is None:
+                state_dict = DiskMap(path, device, torch_dtype=dtype, state_dict_converter=state_dict_converter)
+            elif state_dict_converter is not None:
                 state_dict = state_dict_converter(state_dict)
-            else:
+            if not isinstance(state_dict, dict):
                 state_dict = {i: state_dict[i] for i in state_dict}
             model.load_state_dict(state_dict, assign=True)
             model = enable_vram_management(model, module_map, vram_config=vram_config, disk_map=None, vram_limit=vram_limit)
