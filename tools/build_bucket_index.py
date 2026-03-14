@@ -1,11 +1,13 @@
 import os
 import json
 import argparse
+from concurrent.futures import ProcessPoolExecutor
 import imagesize
 from PIL import Image
 
 from diffsynth.core.data import UnifiedDataset, ImageTextPairDataset
 from diffsynth.core.data.unified_dataset import BucketManager
+from tqdm import tqdm
 
 """分桶索引构建脚本（适用于超大数据集预处理）
 
@@ -146,28 +148,76 @@ def probe_image_size(path):
         return img.size
 
 
+def ensure_parent_dir(path):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _probe_unified_bucket_task(task):
+    data_id, path, bucket_args = task
+    if path is None or not os.path.exists(path):
+        return None
+    try:
+        w, h = probe_image_size(path)
+        bm = build_bucket_manager(**bucket_args)
+        reso, _, _ = bm.select_bucket(w, h)
+        return {"data_id": int(data_id), "bucket": [int(reso[0]), int(reso[1])]}
+    except Exception:
+        return None
+
+
+def _probe_pairs_bucket_task(task):
+    data_id, image_path, bucket_args = task
+    if not image_path or not os.path.exists(image_path):
+        return None
+    try:
+        w, h = probe_image_size(image_path)
+        bm = build_bucket_manager(**bucket_args)
+        reso, _, _ = bm.select_bucket(w, h)
+        return {"data_id": int(data_id), "bucket": [int(reso[0]), int(reso[1])]}
+    except Exception:
+        return None
+
+
+def _iterate_results(tasks, worker_fn, num_workers, total=None, desc=None):
+    if int(num_workers) <= 1:
+        for task in tqdm(tasks, total=total, desc=desc):
+            yield worker_fn(task)
+        return
+
+    with ProcessPoolExecutor(max_workers=int(num_workers)) as executor:
+        for result in tqdm(executor.map(worker_fn, tasks), total=total, desc=desc):
+            yield result
+
+
 def build_bucket_index_for_unified(base_path, metadata_path, output_path,
                                    bucket_data_key="image",
                                    max_bucket_reso=1024,
                                    min_bucket_reso=256,
                                    bucket_reso_steps=64,
                                    bucket_base_reso=None,
-                                   bucket_no_upscale=False):
+                                   bucket_no_upscale=False,
+                                   num_workers=1):
     """Precompute bucket assignments for a UnifiedDataset-style metadata file.
 
     The output is a jsonl file where each line is:
         {"data_id": <int>, "bucket": [width, height]}
     """
-    bm = build_bucket_manager(max_bucket_reso, min_bucket_reso, bucket_reso_steps,
-                              bucket_base_reso=bucket_base_reso,
-                              bucket_no_upscale=bucket_no_upscale)
+    bucket_args = {
+        "max_bucket_reso": max_bucket_reso,
+        "min_bucket_reso": min_bucket_reso,
+        "bucket_reso_steps": bucket_reso_steps,
+        "bucket_base_reso": bucket_base_reso,
+        "bucket_no_upscale": bucket_no_upscale,
+    }
+    build_bucket_manager(**bucket_args)
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
-    total = 0
+    ensure_parent_dir(output_path)
+    valid_tasks = []
     skipped = 0
 
-    with open(output_path, "w", encoding="utf-8") as fout:
-        for data_id, record in iter_unified_metadata(metadata_path):
+    for data_id, record in tqdm(iter_unified_metadata(metadata_path), desc="Scanning Unified metadata"):
             if bucket_data_key not in record:
                 skipped += 1
                 continue
@@ -182,18 +232,21 @@ def build_bucket_index_for_unified(base_path, metadata_path, output_path,
                 continue
 
             path = resolve_path(base_path, path)
-            if not os.path.exists(path):
+            valid_tasks.append((data_id, path, bucket_args))
+
+    total = 0
+    with open(output_path, "w", encoding="utf-8") as fout:
+        for result in _iterate_results(
+            valid_tasks,
+            _probe_unified_bucket_task,
+            num_workers=num_workers,
+            total=len(valid_tasks),
+            desc="Computing buckets for UnifiedDataset",
+        ):
+            if result is None:
                 skipped += 1
                 continue
-
-            try:
-                w, h = probe_image_size(path)
-            except Exception:
-                skipped += 1
-                continue
-
-            reso, _, _ = bm.select_bucket(w, h)
-            fout.write(json.dumps({"data_id": data_id, "bucket": [reso[0], reso[1]]}, ensure_ascii=False) + "\n")
+            fout.write(json.dumps(result, ensure_ascii=False) + "\n")
             total += 1
 
     print(f"Unified bucket index written to {output_path}: {total} items, {skipped} skipped.")
@@ -204,7 +257,8 @@ def build_bucket_index_for_image_text_pair(data_dir, output_path,
                                            min_bucket_reso=256,
                                            bucket_reso_steps=64,
                                            bucket_base_reso=None,
-                                           bucket_no_upscale=False):
+                                           bucket_no_upscale=False,
+                                           num_workers=1):
     """Precompute bucket assignments for an ImageTextPairDataset directory.
 
     This mirrors ImageTextPairDataset._scan_pairs + _setup_buckets, but only
@@ -216,29 +270,32 @@ def build_bucket_index_for_image_text_pair(data_dir, output_path,
         enable_bucket=False,  # we only need pairs, not internal bucketing
     )
 
-    bm = build_bucket_manager(max_bucket_reso, min_bucket_reso, bucket_reso_steps,
-                              bucket_base_reso=bucket_base_reso,
-                              bucket_no_upscale=bucket_no_upscale)
+    bucket_args = {
+        "max_bucket_reso": max_bucket_reso,
+        "min_bucket_reso": min_bucket_reso,
+        "bucket_reso_steps": bucket_reso_steps,
+        "bucket_base_reso": bucket_base_reso,
+        "bucket_no_upscale": bucket_no_upscale,
+    }
+    build_bucket_manager(**bucket_args)
 
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    ensure_parent_dir(output_path)
+    tasks = [(data_id, pair["image"], bucket_args) for data_id, pair in enumerate(ds.pairs)]
     total = 0
     skipped = 0
 
-    from tqdm import tqdm
-
     with open(output_path, "w", encoding="utf-8") as fout:
-        for data_id, pair in enumerate(tqdm(ds.pairs, desc="Computing buckets for ImageTextPairDataset")):
-            image_path = pair["image"]
-            if not os.path.exists(image_path):
+        for result in _iterate_results(
+            tasks,
+            _probe_pairs_bucket_task,
+            num_workers=num_workers,
+            total=len(tasks),
+            desc="Computing buckets for ImageTextPairDataset",
+        ):
+            if result is None:
                 skipped += 1
                 continue
-            try:
-                w, h = probe_image_size(image_path)
-            except Exception:
-                skipped += 1
-                continue
-            reso, _, _ = bm.select_bucket(w, h)
-            fout.write(json.dumps({"data_id": data_id, "bucket": [reso[0], reso[1]]}, ensure_ascii=False) + "\n")
+            fout.write(json.dumps(result, ensure_ascii=False) + "\n")
             total += 1
 
     print(f"ImageTextPair bucket index written to {output_path}: {total} items, {skipped} skipped.")
@@ -262,6 +319,7 @@ def main():
         p.add_argument("--bucket_reso_steps", type=int, default=64)
         p.add_argument("--bucket_base_reso", type=int, nargs=2, default=None, help="Base resolution as two ints: H W")
         p.add_argument("--bucket_no_upscale", action="store_true")
+        p.add_argument("--num_workers", type=int, default=1, help="Number of CPU worker processes for probing image sizes")
 
     # ImageTextPair mode
     p_pairs = subparsers.add_parser("pairs", help="Build bucket index for ImageTextPairDataset")
@@ -273,6 +331,7 @@ def main():
         p.add_argument("--bucket_reso_steps", type=int, default=64)
         p.add_argument("--bucket_base_reso", type=int, nargs=2, default=None, help="Base resolution as two ints: H W")
         p.add_argument("--bucket_no_upscale", action="store_true")
+        p.add_argument("--num_workers", type=int, default=1, help="Number of CPU worker processes for probing image sizes")
 
     args = parser.parse_args()
 
@@ -288,6 +347,7 @@ def main():
             bucket_reso_steps=args.bucket_reso_steps,
             bucket_base_reso=base_reso,
             bucket_no_upscale=args.bucket_no_upscale,
+            num_workers=args.num_workers,
         )
     elif args.mode == "pairs":
         base_reso = tuple(args.bucket_base_reso) if args.bucket_base_reso is not None else None
@@ -299,6 +359,7 @@ def main():
             bucket_reso_steps=args.bucket_reso_steps,
             bucket_base_reso=base_reso,
             bucket_no_upscale=args.bucket_no_upscale,
+            num_workers=args.num_workers,
         )
 
 
