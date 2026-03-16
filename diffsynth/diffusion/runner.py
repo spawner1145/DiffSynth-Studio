@@ -853,13 +853,20 @@ def launch_training_task(
     base_collate_fn = (lambda x: x[0]) if dataloader_batch_size == 1 else (lambda x: x)
     current_epoch = Value("i", 0)
     current_step = Value("i", 0)
+    # Attach shared values so persistent workers can sync epoch/step in __getitem__.
+    dataset._shared_epoch_value = current_epoch
+    dataset._shared_step_value = current_step
     collate_fn = _DatasetStateCollator(current_epoch, current_step, dataset, base_collate_fn)
+    use_persistent_workers = num_workers > 0 and hasattr(dataset, '_sync_shared_state')
     dataloader = torch.utils.data.DataLoader(
         dataset,
         shuffle=not bucket_batching_enabled,
         batch_size=dataloader_batch_size,
         collate_fn=collate_fn,
         num_workers=num_workers,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=use_persistent_workers,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
     grad_accum_steps = max(1, int(getattr(accelerator, "gradient_accumulation_steps", 1)))
     num_processes = max(1, int(getattr(accelerator, "num_processes", 1)))

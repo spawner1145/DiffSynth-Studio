@@ -80,6 +80,13 @@ class ImageTextPairDataset(torch.utils.data.Dataset):
         self.max_skip_retries = 32
 
         self.pairs = []
+        self._crop_op_cache = {}
+        self._default_crop_op = ImageCropAndResize(
+            height=self.height, width=self.width,
+            max_pixels=self.max_pixels,
+            height_division_factor=self.height_division_factor,
+            width_division_factor=self.width_division_factor,
+        )
         self._scan_pairs()
         self._setup_buckets()
         self._rebuild_bucket_batches()
@@ -139,23 +146,27 @@ class ImageTextPairDataset(torch.utils.data.Dataset):
         )
 
     def _scan_pairs(self):
-        """Scan data_dir for image/txt pairs."""
+        """Scan data_dir for image/txt pairs, preloading text into memory."""
         if not os.path.isdir(self.data_dir):
             raise ValueError(f"data_dir does not exist: {self.data_dir}")
 
         image_stems = {}
-        for fname in os.listdir(self.data_dir):
-            ext = os.path.splitext(fname)[1].lower()
+        for entry in os.scandir(self.data_dir):
+            if not entry.is_file(follow_symlinks=False):
+                continue
+            ext = os.path.splitext(entry.name)[1].lower()
             if ext in IMAGE_EXTENSIONS:
-                stem = os.path.splitext(fname)[0]
-                image_stems[stem] = fname
+                stem = os.path.splitext(entry.name)[0]
+                image_stems[stem] = entry.name
 
         for stem in sorted(image_stems.keys()):
             txt_path = os.path.join(self.data_dir, stem + ".txt")
             if os.path.isfile(txt_path):
+                with open(txt_path, "r", encoding="utf-8") as f:
+                    prompt = f.read().strip()
                 self.pairs.append({
                     "image": os.path.join(self.data_dir, image_stems[stem]),
-                    "text": txt_path,
+                    "prompt": prompt,
                 })
 
         if len(self.pairs) == 0:
@@ -286,26 +297,38 @@ class ImageTextPairDataset(torch.utils.data.Dataset):
     def set_current_step(self, step):
         self.current_step = int(step)
 
-    def _load_text(self, txt_path):
-        with open(txt_path, "r", encoding="utf-8") as f:
-            return f.read().strip()
+    def _sync_shared_state(self):
+        """Read epoch/step from shared multiprocessing.Value (set by runner).
+
+        This allows persistent DataLoader workers to detect epoch changes
+        and re-shuffle buckets without being restarted every epoch.
+        """
+        shared_epoch = getattr(self, '_shared_epoch_value', None)
+        if shared_epoch is not None:
+            epoch = int(shared_epoch.value)
+            if self.current_epoch != epoch:
+                self.current_epoch = epoch
+                self._shuffle_buckets()
+        shared_step = getattr(self, '_shared_step_value', None)
+        if shared_step is not None:
+            self.current_step = int(shared_step.value)
+
+    def _get_crop_op(self, target_reso):
+        if target_reso not in self._crop_op_cache:
+            w, h = target_reso
+            self._crop_op_cache[target_reso] = ImageCropAndResize(
+                height=h, width=w,
+                max_pixels=None,
+                height_division_factor=1, width_division_factor=1,
+            )
+        return self._crop_op_cache[target_reso]
 
     def _load_image(self, image_path, target_reso=None):
         image = Image.open(image_path).convert("RGB")
         if target_reso is not None:
-            target_w, target_h = target_reso
-            op = ImageCropAndResize(
-                height=target_h, width=target_w,
-                max_pixels=None,
-                height_division_factor=1, width_division_factor=1,
-            )
+            op = self._get_crop_op(target_reso)
         else:
-            op = ImageCropAndResize(
-                height=self.height, width=self.width,
-                max_pixels=self.max_pixels,
-                height_division_factor=self.height_division_factor,
-                width_division_factor=self.width_division_factor,
-            )
+            op = self._default_crop_op
         return op(image)
 
     def _process_single(self, data_id, force_reso=None):
@@ -315,7 +338,7 @@ class ImageTextPairDataset(torch.utils.data.Dataset):
             reso = self.bucket_reso_by_data_id.get(data_id)
         return {
             "image": self._load_image(pair["image"], target_reso=reso),
-            "prompt": self._load_text(pair["text"]),
+            "prompt": pair["prompt"],
         }
 
     def _fallback_data_id(self, data_id, attempt, force_reso=None):
@@ -341,6 +364,7 @@ class ImageTextPairDataset(torch.utils.data.Dataset):
         ) from last_error
 
     def __getitem__(self, idx):
+        self._sync_shared_state()
         if self.bucket_enabled_batching:
             bucket_reso, batch_idx = self.bucket_batch_indices[idx % len(self.bucket_batch_indices)]
             source_ids = self.bucket_to_data_ids[bucket_reso]
