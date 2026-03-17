@@ -613,6 +613,9 @@ class ComplextroImageDiT(torch.nn.Module):
         num_attention_heads: int = 24,
         attention_head_dim: int = 128,
         rope_axes_dim: Optional[List[int]] = None,
+        use_unified_token_type_modulation: bool = False,
+        use_omni_token_type_modulation: bool = False,
+        use_token_type_embedding: bool = True,
         enable_tread_routing: bool = False,
         tread_routes: Optional[List[dict]] = None,
     ):
@@ -639,6 +642,9 @@ class ComplextroImageDiT(torch.nn.Module):
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
         self.rope_axes_dim = rope_axes_dim
+        self.use_unified_token_type_modulation = bool(use_unified_token_type_modulation)
+        self.use_omni_token_type_modulation = bool(use_omni_token_type_modulation)
+        self.use_token_type_embedding = bool(use_token_type_embedding)
         self.enable_tread_routing = bool(enable_tread_routing)
         self.tread_routes = self._normalize_tread_routes(tread_routes)
         self.tread_router = TreadRouter() if self.enable_tread_routing and len(self.tread_routes) > 0 else None
@@ -665,6 +671,7 @@ class ComplextroImageDiT(torch.nn.Module):
         self.img_in = nn.Linear(in_channels, self.hidden_size)
         self.txt_in = nn.Linear(text_embed_dim, self.hidden_size)
         self.image_pad_token = nn.Parameter(torch.empty((1, in_channels)))
+        self.token_type_embed = nn.Embedding(4, self.hidden_size) if self.use_token_type_embedding else None
 
         self.noise_refiner = nn.ModuleList(
             [
@@ -727,6 +734,8 @@ class ComplextroImageDiT(torch.nn.Module):
         nn.init.normal_(self.image_pad_token, mean=0.0, std=0.02)
         if self.siglip_pad_token is not None:
             nn.init.normal_(self.siglip_pad_token, mean=0.0, std=0.02)
+        if self.token_type_embed is not None:
+            nn.init.normal_(self.token_type_embed.weight, mean=0.0, std=0.02)
 
         for module in self.time_text_embed.modules():
             if isinstance(module, nn.Linear):
@@ -767,10 +776,22 @@ class ComplextroImageDiT(torch.nn.Module):
         if self.proj_out.bias is not None:
             nn.init.zeros_(self.proj_out.bias)
 
+    def _resolve_token_type_embed_ids(self, token_type_ids: torch.Tensor) -> torch.Tensor:
+        token_type_ids = token_type_ids.clamp(TOKEN_TYPE_TEXT, TOKEN_TYPE_COND_IMAGE)
+        # Keep text and SigLIP distinct, but let cond/target images share the same role embedding.
+        return torch.where(
+            token_type_ids == TOKEN_TYPE_COND_IMAGE,
+            torch.full_like(token_type_ids, TOKEN_TYPE_TARGET_IMAGE),
+            token_type_ids,
+        )
+
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
         if "image_pad_token" not in state_dict:
             state_dict = dict(state_dict)
             state_dict["image_pad_token"] = self.image_pad_token.detach().clone()
+        if self.token_type_embed is not None and "token_type_embed.weight" not in state_dict:
+            state_dict = dict(state_dict)
+            state_dict["token_type_embed.weight"] = self.token_type_embed.weight.detach().clone()
 
         if not isinstance(state_dict, dict):
             state_dict = dict(state_dict)
@@ -1674,6 +1695,8 @@ class ComplextroImageDiT(torch.nn.Module):
             )
             unified_temb = pad_sequence(temb_list, batch_first=True, padding_value=0.0)
             unified_token_types = pad_sequence(token_type_list, batch_first=True, padding_value=TOKEN_TYPE_TEXT)
+            if self.token_type_embed is not None:
+                unified = unified + self.token_type_embed(self._resolve_token_type_embed_ids(unified_token_types))
 
             use_tread_routing = self.training and self.tread_router is not None
             route_idx = 0
@@ -1925,6 +1948,8 @@ class ComplextroImageDiT(torch.nn.Module):
             device=image_tokens.device,
         )
         unified_token_types = pad_sequence(token_type_list, batch_first=True, padding_value=TOKEN_TYPE_TEXT)
+        if self.token_type_embed is not None:
+            unified = unified + self.token_type_embed(self._resolve_token_type_embed_ids(unified_token_types))
 
         use_tread_routing = self.training and self.tread_router is not None
         route_idx = 0
@@ -1956,7 +1981,11 @@ class ComplextroImageDiT(torch.nn.Module):
                     routed_key_mask = None
 
             active_key_mask = routed_key_mask if route_ids_keep is not None else key_mask
-            active_token_types = routed_unified_token_types if route_ids_keep is not None else unified_token_types
+            active_token_types = None
+            if self.use_unified_token_type_modulation:
+                active_token_types = None
+                if self.use_omni_token_type_modulation:
+                    active_token_types = routed_unified_token_types if route_ids_keep is not None else unified_token_types
 
             unified = gradient_checkpoint_forward(
                 block,
