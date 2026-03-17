@@ -697,4 +697,7 @@ if __name__ == "__main__":
         #save_steps=50000,
         save_epochs=1,
         num_epochs=99999999999,
+        log_with="wandb",
+        tracker_project_name="complextro-pretrain",
+        tracker_run_name="complextro-256",
     )
