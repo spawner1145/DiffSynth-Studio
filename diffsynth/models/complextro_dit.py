@@ -1983,9 +1983,7 @@ class ComplextroImageDiT(torch.nn.Module):
             active_key_mask = routed_key_mask if route_ids_keep is not None else key_mask
             active_token_types = None
             if self.use_unified_token_type_modulation:
-                active_token_types = None
-                if self.use_omni_token_type_modulation:
-                    active_token_types = routed_unified_token_types if route_ids_keep is not None else unified_token_types
+                active_token_types = routed_unified_token_types if route_ids_keep is not None else unified_token_types
 
             unified = gradient_checkpoint_forward(
                 block,
