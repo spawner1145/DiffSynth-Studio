@@ -197,6 +197,7 @@ VRAM_MANAGEMENT_MODULE_MAPS = {
     },
     "diffsynth.models.complextro_dit.ComplextroImageDiT": {
         "torch.nn.Linear": "diffsynth.core.vram.layers.AutoWrappedLinear",
+        "torch.nn.Embedding": "diffsynth.core.vram.layers.AutoWrappedModule",
         "torch.nn.LayerNorm": "diffsynth.core.vram.layers.AutoWrappedModule",
         "diffsynth.models.general_modules.RMSNorm": "diffsynth.core.vram.layers.AutoWrappedModule",
     },
