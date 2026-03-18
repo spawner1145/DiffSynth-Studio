@@ -20,7 +20,7 @@ from diffsynth.models.complextro_dit import ComplextroImageDiT
 from diffsynth.models.siglip2_image_encoder import Siglip2ImageEncoder428M
 from diffsynth.pipelines.complextro import ComplextroPipeline
 from diffsynth.pipelines.complextro_vae_utils import (
-    apply_complextro_vae_config,
+    apply_complextro_vae_shape_config,
     get_complextro_vae_spec,
     infer_complextro_vae_latent_channels,
 )
@@ -54,7 +54,11 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             vae_file=vae_file,
             use_alpha_layer_vae=use_alpha_layer_vae,
         )
-        apply_complextro_vae_config(self.complextro_model_config, self.vae_spec["latent_channels"])
+        apply_complextro_vae_shape_config(
+            self.complextro_model_config,
+            latent_channels=self.vae_spec["latent_channels"],
+            latent_downsample_factor=self.vae_spec["latent_downsample_factor"],
+        )
         siglip_enabled = bool(siglip_model_file) and os.path.exists(siglip_model_file)
         if siglip_enabled:
             expected_siglip_feat_dim = 1152

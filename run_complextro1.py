@@ -13,7 +13,7 @@ from diffsynth.models.complextro_dit import ComplextroImageDiT
 from diffsynth.models.siglip2_image_encoder import Siglip2ImageEncoder428M
 from diffsynth.pipelines.complextro import ComplextroPipeline
 from diffsynth.pipelines.complextro_vae_utils import (
-    apply_complextro_vae_config,
+    apply_complextro_vae_shape_config,
     get_complextro_vae_spec,
     infer_complextro_vae_latent_channels,
 )
@@ -45,7 +45,11 @@ def build_complextro_pipe(
         vae_file=vae_file,
         use_alpha_layer_vae=use_alpha_layer_vae,
     )
-    apply_complextro_vae_config(complextro_model_config, vae_spec["latent_channels"])
+    apply_complextro_vae_shape_config(
+        complextro_model_config,
+        latent_channels=vae_spec["latent_channels"],
+        latent_downsample_factor=vae_spec["latent_downsample_factor"],
+    )
 
     if enable_vram_offload:
         if vram_config is None:

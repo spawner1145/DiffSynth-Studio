@@ -607,6 +607,7 @@ class ComplextroImageDiT(torch.nn.Module):
         use_layer3d_rope: bool = False,
         use_additional_t_cond: bool = False,
         in_channels: int = 128,
+        latent_downsample_factor: Optional[int] = None,
         text_embed_dim: Optional[int] = None,
         siglip_feat_dim: Optional[int] = None,
         hidden_size: int = 3072,
@@ -642,6 +643,17 @@ class ComplextroImageDiT(torch.nn.Module):
         self.num_attention_heads = num_attention_heads
         self.attention_head_dim = attention_head_dim
         self.rope_axes_dim = rope_axes_dim
+        if latent_downsample_factor is None:
+            if int(in_channels) == 128:
+                latent_downsample_factor = 16
+            elif int(in_channels) == 16:
+                latent_downsample_factor = 8
+            else:
+                raise ValueError(
+                    "latent_downsample_factor must be provided when in_channels is not a known Complextro VAE latent "
+                    f"spec (got in_channels={in_channels})."
+                )
+        self.latent_downsample_factor = int(latent_downsample_factor)
         self.use_unified_token_type_modulation = bool(use_unified_token_type_modulation)
         self.use_omni_token_type_modulation = bool(use_omni_token_type_modulation)
         self.use_token_type_embedding = bool(use_token_type_embedding)
@@ -1244,9 +1256,20 @@ class ComplextroImageDiT(torch.nn.Module):
         seq_lens = [emb_mask.sum(dim=1).item() for emb_mask in entity_prompt_emb_mask] + [prompt_emb_mask.sum(dim=1).item()]
         text_seq_len = sum(seq_lens)
         total_seq_len = text_seq_len + image.shape[1]
+        if latents.ndim == 4:
+            latent_h, latent_w = latents.shape[-2:]
+        else:
+            latent_h, latent_w = height // self.latent_downsample_factor, width // self.latent_downsample_factor
         patched_masks = []
         for i in range(N):
-            patched_mask = rearrange(entity_masks[i], "B C (H P) (W Q) -> B (H W) (C P Q)", H=height//16, W=width//16, P=2, Q=2)
+            patched_mask = rearrange(
+                entity_masks[i],
+                "B C (H P) (W Q) -> B (H W) (C P Q)",
+                H=latent_h,
+                W=latent_w,
+                P=2,
+                Q=2,
+            )
             patched_masks.append(patched_mask)
         attention_mask = torch.ones((batch_size, total_seq_len, total_seq_len), dtype=torch.bool).to(device=entity_masks[0].device)
 
@@ -1780,7 +1803,7 @@ class ComplextroImageDiT(torch.nn.Module):
             image_tokens = latents
             return_latents_4d = False
             if height is not None and width is not None:
-                latent_h, latent_w = height // 16, width // 16
+                latent_h, latent_w = height // self.latent_downsample_factor, width // self.latent_downsample_factor
             else:
                 seq_len = image_tokens.shape[1]
                 side = int(math.sqrt(seq_len))

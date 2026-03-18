@@ -36,6 +36,7 @@ def get_complextro_vae_spec(
             "model_file": vae_file,
             "config": {"use_alpha_layer": use_alpha_layer_vae},
             "latent_channels": 128,
+            "latent_downsample_factor": 16,
         }
     return {
         "vae_type": "qwen_image",
@@ -43,6 +44,7 @@ def get_complextro_vae_spec(
         "model_file": vae_file,
         "config": {"image_channels": 4 if use_alpha_layer_vae else 3},
         "latent_channels": 16,
+        "latent_downsample_factor": 8,
     }
 
 
@@ -55,6 +57,24 @@ def apply_complextro_vae_config(complextro_model_config: dict[str, Any], latent_
         raise ValueError(
             f"complextro_model_config['in_channels'] ({configured_in_channels}) must match the selected VAE latent "
             f"channels ({latent_channels})."
+        )
+
+
+def apply_complextro_vae_shape_config(
+    complextro_model_config: dict[str, Any],
+    *,
+    latent_channels: int,
+    latent_downsample_factor: int,
+) -> None:
+    apply_complextro_vae_config(complextro_model_config, latent_channels)
+    configured_downsample = complextro_model_config.get("latent_downsample_factor", None)
+    if configured_downsample is None:
+        complextro_model_config["latent_downsample_factor"] = int(latent_downsample_factor)
+        return
+    if int(configured_downsample) != int(latent_downsample_factor):
+        raise ValueError(
+            f"complextro_model_config['latent_downsample_factor'] ({configured_downsample}) must match the selected "
+            f"VAE downsample factor ({latent_downsample_factor})."
         )
 
 
