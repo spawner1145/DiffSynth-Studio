@@ -253,7 +253,7 @@ if __name__ == "__main__":
             width=256,
             omni_mode=True,
         )
-        image.save(f"complextro_image_{seed}.jpg")
+        image.save(f"complextro_image_{seed}.png")
 
     # 非 Omni 但读取参考图（仅 TE 多模态）示例：
     # ref_images = [Image.open("ref1.jpg").convert("RGB"), Image.open("ref2.jpg").convert("RGB")]
@@ -268,7 +268,7 @@ if __name__ == "__main__":
     #     omni_mode=False,
     #     edit_image=ref_images,
     # )
-    # image.save("complextro_text_encoder_multimodal.jpg")
+    # image.save("complextro_text_encoder_multimodal.png")
 
     # Omni 示例
     # 使用前先加载 SigLIP 模型（build_complextro_pipe 里传 siglip_model_file），并准备条件图。
@@ -287,4 +287,4 @@ if __name__ == "__main__":
     #     edit_image=cond_images,
     #     edit_latent=cond_latents,
     # )
-    # omni_out.save("complextro_omni.jpg")
+    # omni_out.save("complextro_omni.png")
