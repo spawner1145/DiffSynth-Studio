@@ -9,21 +9,26 @@ from diffsynth.core.vram import AutoWrappedModule
 from diffsynth.configs.vram_management_module_maps import VRAM_MANAGEMENT_MODULE_MAPS, VERSION_CHECKER_MAPS
 from diffsynth.models.qwen_image_text_encoder import QwenImageTextEncoder
 from diffsynth.utils.state_dict_converters.qwen_image_text_encoder import QwenImageTextEncoderStateDictConverter
-from diffsynth.models.flux2_vae import Flux2VAE
 from diffsynth.models.complextro_dit import ComplextroImageDiT
 from diffsynth.models.siglip2_image_encoder import Siglip2ImageEncoder428M
 from diffsynth.pipelines.complextro import ComplextroPipeline
+from diffsynth.pipelines.complextro_vae_utils import (
+    apply_complextro_vae_config,
+    get_complextro_vae_spec,
+    infer_complextro_vae_latent_channels,
+)
 
 
 def build_complextro_pipe(
     device="cuda",
     torch_dtype=torch.bfloat16,
     qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw/model.safetensors",
-    flux2_vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
+    vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
     complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e3-s10059.safetensors",
     qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw",
     qwen_model_size: str = "2B",
     siglip_model_file="",
+    vae_type: str = "flux2",
     use_alpha_layer_vae: bool = False,
     complextro_model_config=None,
     enable_vram_offload: bool = False,
@@ -35,6 +40,12 @@ def build_complextro_pipe(
         complextro_model_config = {}
     else:
         complextro_model_config = dict(complextro_model_config)
+    vae_spec = get_complextro_vae_spec(
+        vae_type=vae_type,
+        vae_file=vae_file,
+        use_alpha_layer_vae=use_alpha_layer_vae,
+    )
+    apply_complextro_vae_config(complextro_model_config, vae_spec["latent_channels"])
 
     if enable_vram_offload:
         if vram_config is None:
@@ -102,9 +113,9 @@ def build_complextro_pipe(
         state_dict_converter=QwenImageTextEncoderStateDictConverter,
     )
     pipe.vae = load_model_with_optional_offload(
-        Flux2VAE,
-        flux2_vae_file,
-        config={"use_alpha_layer": use_alpha_layer_vae},
+        vae_spec["model_class"],
+        vae_spec["model_file"],
+        config=vae_spec["config"],
     )
     pipe.processor = AutoProcessor.from_pretrained(qwen_tokenizer_dir)
     pipe.tokenizer = pipe.processor.tokenizer
@@ -124,6 +135,13 @@ def build_complextro_pipe(
         complextro_dit_file,
         config=complextro_model_config,
     )
+    vae_latent_channels = infer_complextro_vae_latent_channels(pipe.vae)
+    dit_in_channels = int(pipe.dit.img_in.in_features)
+    if vae_latent_channels is not None and vae_latent_channels != dit_in_channels:
+        raise ValueError(
+            f"Selected VAE latent channels ({vae_latent_channels}) do not match ComplextroImageDiT in_channels "
+            f"({dit_in_channels})."
+        )
 
     dit_text_dim = int(pipe.dit.txt_in.in_features)
     if text_hidden_size != dit_text_dim:
@@ -206,11 +224,12 @@ if __name__ == "__main__":
         device=device,
         torch_dtype=dtype,
         qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/Qwen3_5_2b_claude_heretic/model.safetensors",
-        flux2_vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
+        vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
         complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e4-s67044.safetensors",
         qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/Qwen3_5_2b_claude_heretic",
         qwen_model_size="2B",
         siglip_model_file="",
+        vae_type="flux2",
         use_alpha_layer_vae=False,
         complextro_model_config=complextro_model_config,
         enable_vram_offload=enable_vram_offload,

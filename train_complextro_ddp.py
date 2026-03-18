@@ -16,10 +16,14 @@ from diffsynth.diffusion import (
 )
 from diffsynth.models.qwen_image_text_encoder import QwenImageTextEncoder
 from diffsynth.utils.state_dict_converters.qwen_image_text_encoder import QwenImageTextEncoderStateDictConverter
-from diffsynth.models.flux2_vae import Flux2VAE
 from diffsynth.models.complextro_dit import ComplextroImageDiT
 from diffsynth.models.siglip2_image_encoder import Siglip2ImageEncoder428M
 from diffsynth.pipelines.complextro import ComplextroPipeline
+from diffsynth.pipelines.complextro_vae_utils import (
+    apply_complextro_vae_config,
+    get_complextro_vae_spec,
+    infer_complextro_vae_latent_channels,
+)
 
 
 class ComplextroTrainingModule(DiffusionTrainingModule):
@@ -27,13 +31,14 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         self,
         device,
         qwen_model_file="/mnt/raid0/linux-train/diffusion-model-v1/qwen3.5-2b/model.safetensors",
-        flux2_vae_file="/mnt/raid0/linux-train/diffusion-model-v1/flux2-vae/diffusion_pytorch_model.safetensors",
+        vae_file="/mnt/raid0/linux-train/diffusion-model-v1/flux2-vae/diffusion_pytorch_model.safetensors",
         qwen_tokenizer_dir="/mnt/raid0/linux-train/diffusion-model-v1/qwen3.5-2b",
         qwen_model_size: str = "2B",
         siglip_model_file="",
         #complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e43-s19221.safetensors",
         complextro_dit_file="",
         train_omni: bool = False,
+        vae_type: str = "flux2",
         use_alpha_layer_vae: bool = False,
         complextro_model_config: Optional[dict] = None,
         enable_vram_offload: bool = False,
@@ -44,6 +49,12 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         self.train_omni = train_omni
         self.complextro_model_config = {} if complextro_model_config is None else dict(complextro_model_config)
         self.enable_vram_offload = enable_vram_offload
+        self.vae_spec = get_complextro_vae_spec(
+            vae_type=vae_type,
+            vae_file=vae_file,
+            use_alpha_layer_vae=use_alpha_layer_vae,
+        )
+        apply_complextro_vae_config(self.complextro_model_config, self.vae_spec["latent_channels"])
         siglip_enabled = bool(siglip_model_file) and os.path.exists(siglip_model_file)
         if siglip_enabled:
             expected_siglip_feat_dim = 1152
@@ -109,9 +120,9 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             state_dict_converter=QwenImageTextEncoderStateDictConverter,
         )
         self.pipe.vae = load_aux_model(
-            Flux2VAE,
-            flux2_vae_file,
-            config={"use_alpha_layer": use_alpha_layer_vae},
+            self.vae_spec["model_class"],
+            self.vae_spec["model_file"],
+            config=self.vae_spec["config"],
         )
         self.pipe.processor = AutoProcessor.from_pretrained(qwen_tokenizer_dir)
         self.pipe.tokenizer = self.pipe.processor.tokenizer
@@ -146,6 +157,13 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             self.pipe.dit = ComplextroImageDiT(**self.complextro_model_config)
             self.pipe.dit = self.pipe.dit.to(device=device)
             self.pipe.dit = self.pipe.dit.to(dtype=torch.bfloat16)
+        vae_latent_channels = infer_complextro_vae_latent_channels(self.pipe.vae)
+        dit_in_channels = int(self.pipe.dit.img_in.in_features)
+        if vae_latent_channels is not None and vae_latent_channels != dit_in_channels:
+            raise ValueError(
+                f"Selected VAE latent channels ({vae_latent_channels}) do not match ComplextroImageDiT in_channels "
+                f"({dit_in_channels})."
+            )
 
         dit_text_dim = int(self.pipe.dit.txt_in.in_features)
         if text_hidden_size != dit_text_dim:
@@ -331,12 +349,13 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Complextro Training Script")
+    parser.add_argument("--vae_type", type=str, default="flux2", help="Complextro VAE type: flux2 or qwen_image")
+    parser.add_argument("--vae_file", type=str, default="/mnt/raid0/linux-train/diffusion-model-v1/flux2-vae/diffusion_pytorch_model.safetensors", help="Complextro VAE model file")
     parser.add_argument("--use_image_text_pairs", action="store_true", help="True: 使用 ImageTextPairDataset（图片+txt目录），False: 使用 UnifiedDataset（metadata文件）")
     parser.add_argument("--train_omni", action="store_true", default=True, help="是否开启 Omni/编辑训练模式")
     parser.add_argument("--use_alpha_layer_vae", action="store_true", help="是否使用带 alpha 层 VAE")
     parser.add_argument("--siglip_model_file", type=str, default="", help="SigLIP 模型文件路径")
     parser.add_argument("--qwen_model_file", type=str, default="/mnt/raid0/linux-train/diffusion-model-v1/qwen3.5-2b/model.safetensors", help="Qwen 模型文件路径")
-    parser.add_argument("--flux2_vae_file", type=str, default="/mnt/raid0/linux-train/diffusion-model-v1/flux2-vae/diffusion_pytorch_model.safetensors", help="Flux2 VAE 文件路径")
     parser.add_argument("--qwen_tokenizer_dir", type=str, default="/mnt/raid0/linux-train/diffusion-model-v1/qwen3.5-2b", help="Qwen Tokenizer 目录")
     parser.add_argument("--base_path", type=str, default="/root/autodl-tmp/DiffSynth-Studio/edit/images", help="数据集根路径")
     parser.add_argument("--metadata_path", type=str, default="/root/autodl-tmp/DiffSynth-Studio/edit/metadata_merged.jsonl", help="UnifiedDataset 的 metadata 路径")
@@ -371,6 +390,7 @@ if __name__ == "__main__":
     )
     use_image_text_pairs = args.use_image_text_pairs
     train_omni = args.train_omni
+    vae_type = args.vae_type
     use_alpha_layer_vae = args.use_alpha_layer_vae
     siglip_model_file = args.siglip_model_file
     enable_vram_offload = args.enable_vram_offload
@@ -534,11 +554,12 @@ if __name__ == "__main__":
     model = ComplextroTrainingModule(
         device=accelerator.device,
         qwen_model_file=args.qwen_model_file,
-        flux2_vae_file=args.flux2_vae_file,
+        vae_file=args.vae_file,
         qwen_tokenizer_dir=args.qwen_tokenizer_dir,
         qwen_model_size="2B",
         siglip_model_file=siglip_model_file,
         train_omni=train_omni,
+        vae_type=vae_type,
         use_alpha_layer_vae=use_alpha_layer_vae,
         complextro_model_config=complextro_model_config,
         enable_vram_offload=enable_vram_offload,

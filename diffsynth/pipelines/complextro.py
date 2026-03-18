@@ -13,7 +13,9 @@ from transformers import AutoTokenizer, AutoProcessor
 from ..models.complextro_dit import ComplextroImageDiT
 from ..models.qwen_image_text_encoder import QwenImageTextEncoder
 from ..models.flux2_vae import Flux2VAE
+from ..models.qwen_image_vae import QwenImageVAE
 from ..models.siglip2_image_encoder import Siglip2ImageEncoder428M
+from .complextro_vae_utils import infer_complextro_vae_latent_channels
 
 
 class ComplextroPipeline(BasePipeline):
@@ -28,7 +30,7 @@ class ComplextroPipeline(BasePipeline):
         self.scheduler = FlowMatchScheduler("FLUX.2")
         self.text_encoder: QwenImageTextEncoder = None
         self.dit: ComplextroImageDiT = None
-        self.vae: Flux2VAE = None
+        self.vae: Flux2VAE | QwenImageVAE = None
         self.image_encoder: Siglip2ImageEncoder428M = None
         self.tokenizer: AutoTokenizer = None
         self.processor: AutoProcessor = None
@@ -130,6 +132,8 @@ class ComplextroPipeline(BasePipeline):
         pipe.text_encoder = model_pool.fetch_model("qwen_image_text_encoder")
         pipe.dit = model_pool.fetch_model("complextro_dit")
         pipe.vae = model_pool.fetch_model("flux2_vae")
+        if pipe.vae is None:
+            pipe.vae = model_pool.fetch_model("qwen_image_vae")
         pipe.image_encoder = model_pool.fetch_model("siglip_vision_model_428m")
         if tokenizer_config is not None:
             tokenizer_config.download_if_necessary()
@@ -141,6 +145,14 @@ class ComplextroPipeline(BasePipeline):
                 pipe.tokenizer = pipe.processor.tokenizer
 
         pipe._validate_text_encoder_dit_alignment(pipe.text_encoder, pipe.dit)
+        if pipe.vae is not None and pipe.dit is not None:
+            latent_channels = infer_complextro_vae_latent_channels(pipe.vae)
+            dit_in_channels = int(pipe.dit.img_in.in_features)
+            if latent_channels is not None and int(latent_channels) != dit_in_channels:
+                raise ValueError(
+                    f"Selected VAE latent channels ({latent_channels}) do not match ComplextroImageDiT in_channels "
+                    f"({dit_in_channels})."
+                )
         pipe.vram_management_enabled = pipe.check_vram_management_state()
         return pipe
 

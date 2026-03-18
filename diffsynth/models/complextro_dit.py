@@ -1793,7 +1793,7 @@ class ComplextroImageDiT(torch.nn.Module):
         if actual_channels != expected_channels:
             raise ValueError(
                 f"Latent channel mismatch for ComplextroImageDiT: got {actual_channels}, expected {expected_channels}. "
-                f"Please align DiT(in_channels) with Flux2VAE latent channels/patching config."
+                "Please align DiT(in_channels) with the selected VAE latent channels."
             )
 
         text_tokens = self.txt_in(self.txt_norm(prompt_emb))
