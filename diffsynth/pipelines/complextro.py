@@ -59,6 +59,13 @@ class ComplextroPipeline(BasePipeline):
     def _get_vae_downsample_factor(self) -> int:
         return infer_complextro_vae_downsample_factor(self.vae)
 
+    def _get_vae_token_downsample_factor(self) -> int:
+        downsample = self._get_vae_downsample_factor()
+        latent_patch_size = 1
+        if self.dit is not None and hasattr(self.dit, "latent_patch_size"):
+            latent_patch_size = int(self.dit.latent_patch_size)
+        return int(downsample) * int(latent_patch_size)
+
     def _normalize_image_mode_for_vae(self, image):
         expected_channels = self._get_vae_input_channels()
         if expected_channels not in (3, 4):
@@ -153,11 +160,11 @@ class ComplextroPipeline(BasePipeline):
         pipe._validate_text_encoder_dit_alignment(pipe.text_encoder, pipe.dit)
         if pipe.vae is not None and pipe.dit is not None:
             latent_channels = infer_complextro_vae_latent_channels(pipe.vae)
-            dit_in_channels = int(pipe.dit.img_in.in_features)
-            if latent_channels is not None and int(latent_channels) != dit_in_channels:
+            dit_latent_channels = int(pipe.dit.latent_channels)
+            if latent_channels is not None and int(latent_channels) != dit_latent_channels:
                 raise ValueError(
                     f"Selected VAE latent channels ({latent_channels}) do not match ComplextroImageDiT in_channels "
-                    f"({dit_in_channels})."
+                    f"({dit_latent_channels})."
                 )
         pipe.vram_management_enabled = pipe.check_vram_management_state()
         return pipe
@@ -187,7 +194,10 @@ class ComplextroPipeline(BasePipeline):
         self.scheduler.set_timesteps(
             num_inference_steps,
             denoising_strength=denoising_strength,
-            dynamic_shift_len=(height // self._get_vae_downsample_factor()) * (width // self._get_vae_downsample_factor()),
+            dynamic_shift_len=(
+                (height // self._get_vae_token_downsample_factor())
+                * (width // self._get_vae_token_downsample_factor())
+            ),
         )
 
         batch_size = 1
@@ -447,7 +457,7 @@ class ComplextroUnit_NoiseInitializer(PipelineUnit):
         )
 
     def process(self, pipe: ComplextroPipeline, height, width, seed, rand_device, batch_size=1):
-        latent_channels = int(pipe.dit.img_in.in_features) if pipe.dit is not None else 128
+        latent_channels = int(pipe.dit.latent_channels) if pipe.dit is not None else 128
         downsample_factor = pipe._get_vae_downsample_factor()
         noise = pipe.generate_noise(
             (int(batch_size), latent_channels, height // downsample_factor, width // downsample_factor),
@@ -496,11 +506,11 @@ class ComplextroUnit_EditImageAutoResize(PipelineUnit):
         from ..core.data.operators import ImageCropAndResize
         operator = ImageCropAndResize(max_pixels=1024 * 1024, height_division_factor=16, width_division_factor=16)
         if isinstance(edit_image, list) and len(edit_image) > 0 and isinstance(edit_image[0], list):
-            edit_image = [[operator(pipe._prepare_multimodal_image(img)) for img in image_group] for image_group in edit_image]
+            edit_image = [[operator(pipe._load_image(img)) for img in image_group] for image_group in edit_image]
         elif isinstance(edit_image, list):
-            edit_image = [operator(pipe._prepare_multimodal_image(img)) for img in edit_image]
+            edit_image = [operator(pipe._load_image(img)) for img in edit_image]
         else:
-            edit_image = operator(pipe._prepare_multimodal_image(edit_image))
+            edit_image = operator(pipe._load_image(edit_image))
         return {"edit_image": edit_image}
 
 

@@ -608,6 +608,7 @@ class ComplextroImageDiT(torch.nn.Module):
         use_additional_t_cond: bool = False,
         in_channels: int = 128,
         latent_downsample_factor: Optional[int] = None,
+        latent_patch_size: Optional[int] = None,
         text_embed_dim: Optional[int] = None,
         siglip_feat_dim: Optional[int] = None,
         hidden_size: int = 3072,
@@ -653,7 +654,11 @@ class ComplextroImageDiT(torch.nn.Module):
                     "latent_downsample_factor must be provided when in_channels is not a known Complextro VAE latent "
                     f"spec (got in_channels={in_channels})."
                 )
+        if latent_patch_size is None:
+            latent_patch_size = 2 if int(in_channels) == 16 else 1
         self.latent_downsample_factor = int(latent_downsample_factor)
+        self.latent_patch_size = int(latent_patch_size)
+        self.latent_channels = int(in_channels)
         self.use_unified_token_type_modulation = bool(use_unified_token_type_modulation)
         self.use_omni_token_type_modulation = bool(use_omni_token_type_modulation)
         self.use_token_type_embedding = bool(use_token_type_embedding)
@@ -680,9 +685,10 @@ class ComplextroImageDiT(torch.nn.Module):
         )
         self.txt_norm = RMSNorm(text_embed_dim, eps=1e-6)
 
-        self.img_in = nn.Linear(in_channels, self.hidden_size)
+        self.img_token_dim = int(in_channels) * self.latent_patch_size * self.latent_patch_size
+        self.img_in = nn.Linear(self.img_token_dim, self.hidden_size)
         self.txt_in = nn.Linear(text_embed_dim, self.hidden_size)
-        self.image_pad_token = nn.Parameter(torch.empty((1, in_channels)))
+        self.image_pad_token = nn.Parameter(torch.empty((1, self.img_token_dim)))
         self.token_type_embed = nn.Embedding(4, self.hidden_size) if self.use_token_type_embedding else None
 
         self.noise_refiner = nn.ModuleList(
@@ -769,7 +775,7 @@ class ComplextroImageDiT(torch.nn.Module):
                     f"tread route layer idx out of range: start={route['start_layer_idx']}, end={route['end_layer_idx']}, num_layers={num_layers}."
                 )
         self.norm_out = AdaLayerNorm(self.hidden_size, single=True)
-        self.proj_out = nn.Linear(self.hidden_size, in_channels)
+        self.proj_out = nn.Linear(self.hidden_size, self.img_token_dim)
 
         for block in list(self.transformer_blocks) + list(self.noise_refiner):
             if block.modulation:
@@ -904,8 +910,7 @@ class ComplextroImageDiT(torch.nn.Module):
             tokens = torch.cat([tokens, pad_values], dim=0)
         return tokens, ori_len, ori_len + pad_len
 
-    @staticmethod
-    def _flatten_latent(latent: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    def _patchify_latent(self, latent: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
         if latent.ndim == 4:
             if latent.shape[0] != 1:
                 raise ValueError("Omni mode expects per-image latent with batch=1.")
@@ -913,8 +918,38 @@ class ComplextroImageDiT(torch.nn.Module):
         if latent.ndim != 3:
             raise ValueError("Latent must be (C,H,W) or (1,C,H,W) in omni mode.")
         _, height, width = latent.shape
-        tokens = rearrange(latent, "C H W -> (H W) C")
-        return tokens, (height, width)
+        patch = self.latent_patch_size
+        if height % patch != 0 or width % patch != 0:
+            raise ValueError(
+                f"Latent spatial shape {(height, width)} must be divisible by latent_patch_size={patch}."
+            )
+        token_h, token_w = height // patch, width // patch
+        tokens = rearrange(latent, "C (H P) (W Q) -> (H W) (C P Q)", H=token_h, W=token_w, P=patch, Q=patch)
+        return tokens, (token_h, token_w)
+
+    def _patchify_latents_batched(self, latents: torch.Tensor) -> torch.Tensor:
+        if latents.ndim != 4:
+            raise ValueError("Latents must be (B,C,H,W) for batched patchify.")
+        patch = self.latent_patch_size
+        _, _, height, width = latents.shape
+        if height % patch != 0 or width % patch != 0:
+            raise ValueError(
+                f"Latent spatial shape {(height, width)} must be divisible by latent_patch_size={patch}."
+            )
+        token_h, token_w = height // patch, width // patch
+        return rearrange(latents, "B C (H P) (W Q) -> B (H W) (C P Q)", H=token_h, W=token_w, P=patch, Q=patch)
+
+    def _unpatchify_tokens(self, tokens: torch.Tensor, token_h: int, token_w: int) -> torch.Tensor:
+        patch = self.latent_patch_size
+        return rearrange(
+            tokens,
+            "B (H W) (C P Q) -> B C (H P) (W Q)",
+            H=token_h,
+            W=token_w,
+            C=self.latent_channels,
+            P=patch,
+            Q=patch,
+        )
 
     @staticmethod
     def _flatten_siglip(siglip: torch.Tensor) -> Tuple[torch.Tensor, Tuple[int, int]]:
@@ -953,10 +988,18 @@ class ComplextroImageDiT(torch.nn.Module):
                 if size is None:
                     offset += total_len
                     continue
-                height, width = size
-                ori_len = height * width
+                token_h, token_w = size
+                ori_len = token_h * token_w
                 local = unified_x[offset : offset + ori_len]
-                out = rearrange(local, "(H W) C -> C H W", H=height, W=width)
+                out = rearrange(
+                    local,
+                    "(H W) (C P Q) -> C (H P) (W Q)",
+                    H=token_h,
+                    W=token_w,
+                    C=self.latent_channels,
+                    P=self.latent_patch_size,
+                    Q=self.latent_patch_size,
+                )
                 offset += total_len
             result.append(out)
         return result
@@ -1431,7 +1474,7 @@ class ComplextroImageDiT(torch.nn.Module):
                         image_token_noise_mask.extend([local_noise_flag] * pad_len)
                         image_token_valid_mask.extend([0] * pad_len)
                         continue
-                    tokens, (h, w) = self._flatten_latent(img)
+                    tokens, (h, w) = self._patchify_latent(img)
                     tokens, original_len, total_len = self._pad_tokens(tokens, pad_token=self.image_pad_token)
                     if local_keep_flag:
                         image_tokens_list.append(tokens)
@@ -1796,14 +1839,22 @@ class ComplextroImageDiT(torch.nn.Module):
             return torch.cat(outputs, dim=0)
 
         if latents.ndim == 4:
-            latent_h, latent_w = latents.shape[-2:]
-            image_tokens = rearrange(latents, "B C H W -> B (H W) C")
+            latent_h_full, latent_w_full = latents.shape[-2:]
+            image_tokens = self._patchify_latents_batched(latents)
+            latent_h, latent_w = latent_h_full // self.latent_patch_size, latent_w_full // self.latent_patch_size
             return_latents_4d = True
         else:
             image_tokens = latents
             return_latents_4d = False
             if height is not None and width is not None:
-                latent_h, latent_w = height // self.latent_downsample_factor, width // self.latent_downsample_factor
+                latent_h_full = height // self.latent_downsample_factor
+                latent_w_full = width // self.latent_downsample_factor
+                if latent_h_full % self.latent_patch_size != 0 or latent_w_full % self.latent_patch_size != 0:
+                    raise ValueError(
+                        f"Latent spatial shape {(latent_h_full, latent_w_full)} inferred from height/width must be divisible "
+                        f"by latent_patch_size={self.latent_patch_size}."
+                    )
+                latent_h, latent_w = latent_h_full // self.latent_patch_size, latent_w_full // self.latent_patch_size
             else:
                 seq_len = image_tokens.shape[1]
                 side = int(math.sqrt(seq_len))
@@ -1815,8 +1866,8 @@ class ComplextroImageDiT(torch.nn.Module):
         actual_channels = int(image_tokens.shape[-1])
         if actual_channels != expected_channels:
             raise ValueError(
-                f"Latent channel mismatch for ComplextroImageDiT: got {actual_channels}, expected {expected_channels}. "
-                "Please align DiT(in_channels) with the selected VAE latent channels."
+                f"Latent token dim mismatch for ComplextroImageDiT: got {actual_channels}, expected {expected_channels}. "
+                "Please align the incoming latent representation with DiT latent_channels/latent_patch_size."
             )
 
         text_tokens = self.txt_in(self.txt_norm(prompt_emb))
@@ -2042,7 +2093,7 @@ class ComplextroImageDiT(torch.nn.Module):
         image_tokens = self.proj_out(image_tokens)
 
         if return_latents_4d:
-            latents = rearrange(image_tokens, "B (H W) C -> B C H W", H=latent_h, W=latent_w)
+            latents = self._unpatchify_tokens(image_tokens, latent_h, latent_w)
             return latents
 
         return image_tokens

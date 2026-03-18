@@ -58,6 +58,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             self.complextro_model_config,
             latent_channels=self.vae_spec["latent_channels"],
             latent_downsample_factor=self.vae_spec["latent_downsample_factor"],
+            latent_patch_size=self.vae_spec["latent_patch_size"],
         )
         siglip_enabled = bool(siglip_model_file) and os.path.exists(siglip_model_file)
         if siglip_enabled:
@@ -162,11 +163,11 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             self.pipe.dit = self.pipe.dit.to(device=device)
             self.pipe.dit = self.pipe.dit.to(dtype=torch.bfloat16)
         vae_latent_channels = infer_complextro_vae_latent_channels(self.pipe.vae)
-        dit_in_channels = int(self.pipe.dit.img_in.in_features)
-        if vae_latent_channels is not None and vae_latent_channels != dit_in_channels:
+        dit_latent_channels = int(self.pipe.dit.latent_channels)
+        if vae_latent_channels is not None and vae_latent_channels != dit_latent_channels:
             raise ValueError(
                 f"Selected VAE latent channels ({vae_latent_channels}) do not match ComplextroImageDiT in_channels "
-                f"({dit_in_channels})."
+                f"({dit_latent_channels})."
             )
 
         dit_text_dim = int(self.pipe.dit.txt_in.in_features)

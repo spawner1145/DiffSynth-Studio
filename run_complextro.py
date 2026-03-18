@@ -49,6 +49,7 @@ def build_complextro_pipe(
         complextro_model_config,
         latent_channels=vae_spec["latent_channels"],
         latent_downsample_factor=vae_spec["latent_downsample_factor"],
+        latent_patch_size=vae_spec["latent_patch_size"],
     )
 
     if enable_vram_offload:
@@ -140,11 +141,11 @@ def build_complextro_pipe(
         config=complextro_model_config,
     )
     vae_latent_channels = infer_complextro_vae_latent_channels(pipe.vae)
-    dit_in_channels = int(pipe.dit.img_in.in_features)
-    if vae_latent_channels is not None and vae_latent_channels != dit_in_channels:
+    dit_latent_channels = int(pipe.dit.latent_channels)
+    if vae_latent_channels is not None and vae_latent_channels != dit_latent_channels:
         raise ValueError(
             f"Selected VAE latent channels ({vae_latent_channels}) do not match ComplextroImageDiT in_channels "
-            f"({dit_in_channels})."
+            f"({dit_latent_channels})."
         )
 
     dit_text_dim = int(pipe.dit.txt_in.in_features)
