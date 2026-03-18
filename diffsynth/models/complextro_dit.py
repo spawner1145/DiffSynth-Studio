@@ -569,8 +569,6 @@ class ComplextroSingleTransformerBlock(nn.Module):
                     mod = mod.unsqueeze(1)
 
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=-1)
-            gate_msa = torch.tanh(gate_msa)
-            gate_mlp = torch.tanh(gate_mlp)
 
             normed = self.norm1(hidden_states)
             normed = normed * (1 + scale_msa) + shift_msa
