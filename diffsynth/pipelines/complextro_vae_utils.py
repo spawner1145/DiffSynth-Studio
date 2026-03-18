@@ -73,3 +73,13 @@ def infer_complextro_vae_latent_channels(vae) -> int | None:
     if hasattr(vae, "z_dim"):
         return int(getattr(vae, "z_dim"))
     return None
+
+
+def infer_complextro_vae_downsample_factor(vae) -> int:
+    if isinstance(vae, QwenImageVAE):
+        return 8
+    if isinstance(vae, Flux2VAE):
+        return 16
+    if hasattr(vae, "z_dim"):
+        return 8
+    return 16

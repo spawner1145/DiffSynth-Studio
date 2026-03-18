@@ -15,7 +15,10 @@ from ..models.qwen_image_text_encoder import QwenImageTextEncoder
 from ..models.flux2_vae import Flux2VAE
 from ..models.qwen_image_vae import QwenImageVAE
 from ..models.siglip2_image_encoder import Siglip2ImageEncoder428M
-from .complextro_vae_utils import infer_complextro_vae_latent_channels
+from .complextro_vae_utils import (
+    infer_complextro_vae_downsample_factor,
+    infer_complextro_vae_latent_channels,
+)
 
 
 class ComplextroPipeline(BasePipeline):
@@ -52,6 +55,9 @@ class ComplextroPipeline(BasePipeline):
         if hasattr(self.vae, "encoder") and hasattr(self.vae.encoder, "conv_in"):
             return int(self.vae.encoder.conv_in.in_channels)
         return None
+
+    def _get_vae_downsample_factor(self) -> int:
+        return infer_complextro_vae_downsample_factor(self.vae)
 
     def _normalize_image_mode_for_vae(self, image):
         expected_channels = self._get_vae_input_channels()
@@ -181,7 +187,7 @@ class ComplextroPipeline(BasePipeline):
         self.scheduler.set_timesteps(
             num_inference_steps,
             denoising_strength=denoising_strength,
-            dynamic_shift_len=(height // 16) * (width // 16),
+            dynamic_shift_len=(height // self._get_vae_downsample_factor()) * (width // self._get_vae_downsample_factor()),
         )
 
         batch_size = 1
@@ -442,8 +448,9 @@ class ComplextroUnit_NoiseInitializer(PipelineUnit):
 
     def process(self, pipe: ComplextroPipeline, height, width, seed, rand_device, batch_size=1):
         latent_channels = int(pipe.dit.img_in.in_features) if pipe.dit is not None else 128
+        downsample_factor = pipe._get_vae_downsample_factor()
         noise = pipe.generate_noise(
-            (int(batch_size), latent_channels, height // 16, width // 16),
+            (int(batch_size), latent_channels, height // downsample_factor, width // downsample_factor),
             seed=seed,
             rand_device=rand_device,
             rand_torch_dtype=pipe.torch_dtype,
