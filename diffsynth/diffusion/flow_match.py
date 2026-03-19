@@ -224,6 +224,7 @@ class FlowMatchScheduler():
         if timestep.ndim >= 1 and timestep.shape[0] > 1:
             timestep_id = torch.argmin((self.timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
             sigma = self.sigmas[timestep_id]
+            sigma = sigma.to(device=original_samples.device, dtype=original_samples.dtype)
             while sigma.ndim < original_samples.ndim:
                 sigma = sigma.unsqueeze(-1)
         else:
