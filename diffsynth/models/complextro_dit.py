@@ -1400,7 +1400,7 @@ class ComplextroImageDiT(torch.nn.Module):
                 )
             text_tokens = self.txt_in(self.txt_norm(prompt_emb))
             conditioning_noisy = self.time_text_embed(timestep, text_tokens.dtype)
-            conditioning_clean = self.time_text_embed(torch.ones_like(timestep), text_tokens.dtype)
+            conditioning_clean = self.time_text_embed(torch.zeros_like(timestep), text_tokens.dtype)
             if conditioning_noisy.shape[0] == 1 and batch_size > 1:
                 conditioning_noisy = conditioning_noisy.expand(batch_size, -1)
             elif conditioning_noisy.shape[0] != batch_size:
