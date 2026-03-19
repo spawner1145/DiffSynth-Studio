@@ -597,7 +597,7 @@ if __name__ == "__main__":
         ],
     }
     """
-    # 2.25B
+    # 2.25B, 加 "num_refiner_layers": 1 时为 2.54B
     complextro_model_config = {
         "num_layers": 10,
         "num_refiner_layers": 0,
