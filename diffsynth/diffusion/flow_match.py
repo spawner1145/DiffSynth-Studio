@@ -221,15 +221,14 @@ class FlowMatchScheduler():
     def add_noise(self, original_samples, noise, timestep):
         if isinstance(timestep, torch.Tensor):
             timestep = timestep.cpu()
-        if timestep.ndim == 0 or (timestep.ndim == 1 and timestep.shape[0] == 1):
-            timestep_id = torch.argmin((self.timesteps - timestep).abs())
+        if timestep.ndim >= 1 and timestep.shape[0] > 1:
+            timestep_id = torch.argmin((self.timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
             sigma = self.sigmas[timestep_id]
-        else:
-            timestep_ids = torch.stack([torch.argmin((self.timesteps - t).abs()) for t in timestep])
-            sigma = self.sigmas[timestep_ids]
-            sigma = sigma.to(device=original_samples.device, dtype=original_samples.dtype)
             while sigma.ndim < original_samples.ndim:
                 sigma = sigma.unsqueeze(-1)
+        else:
+            timestep_id = torch.argmin((self.timesteps - timestep).abs())
+            sigma = self.sigmas[timestep_id]
         sample = (1 - sigma) * original_samples + sigma * noise
         return sample
     
@@ -239,11 +238,9 @@ class FlowMatchScheduler():
     
     def training_weight(self, timestep):
         timestep = timestep.to(self.timesteps.device)
-        if timestep.ndim == 0 or (timestep.ndim == 1 and timestep.shape[0] == 1):
-            timestep_id = torch.argmin((self.timesteps - timestep).abs())
-            weights = self.linear_timesteps_weights[timestep_id]
+        if timestep.ndim >= 1 and timestep.shape[0] > 1:
+            timestep_id = torch.argmin((self.timesteps.unsqueeze(0) - timestep.unsqueeze(1)).abs(), dim=1)
         else:
-            timestep_ids = torch.stack([torch.argmin((self.timesteps - t).abs()) for t in timestep])
-            weights = self.linear_timesteps_weights[timestep_ids]
-            weights = weights.mean()
+            timestep_id = torch.argmin((self.timesteps - timestep).abs())
+        weights = self.linear_timesteps_weights[timestep_id]
         return weights

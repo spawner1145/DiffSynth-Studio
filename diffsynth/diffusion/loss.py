@@ -8,32 +8,25 @@ def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
 
     batch_size = inputs["input_latents"].shape[0]
     timestep_ids = torch.randint(min_timestep_boundary, max_timestep_boundary, (batch_size,))
-    timestep = pipe.scheduler.timesteps[timestep_ids].to(dtype=pipe.torch_dtype, device=pipe.device)
-    
+    timesteps = pipe.scheduler.timesteps[timestep_ids].to(dtype=pipe.torch_dtype, device=pipe.device)
+
     noise = torch.randn_like(inputs["input_latents"])
-    inputs["latents"] = pipe.scheduler.add_noise(inputs["input_latents"], noise, timestep)
-    training_target = pipe.scheduler.training_target(inputs["input_latents"], noise, timestep)
-    
+    inputs["latents"] = pipe.scheduler.add_noise(inputs["input_latents"], noise, timesteps)
+    training_target = pipe.scheduler.training_target(inputs["input_latents"], noise, timesteps)
+
     if "first_frame_latents" in inputs:
         inputs["latents"][:, :, 0:1] = inputs["first_frame_latents"]
-    
+
     models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
-    noise_pred = pipe.model_fn(**models, **inputs, timestep=timestep)
-    
+    noise_pred = pipe.model_fn(**models, **inputs, timestep=timesteps)
+
     if "first_frame_latents" in inputs:
         noise_pred = noise_pred[:, :, 1:]
         training_target = training_target[:, :, 1:]
-    
-    if batch_size > 1 and timestep.ndim >= 1 and timestep.shape[0] == batch_size:
-        # Per-sample weighted loss: each sample has its own timestep and weight
-        per_sample_mse = ((noise_pred.float() - training_target.float()) ** 2).flatten(1).mean(1)
-        timestep_on_sched_device = timestep.to(pipe.scheduler.timesteps.device)
-        weight_ids = torch.stack([torch.argmin((pipe.scheduler.timesteps - t).abs()) for t in timestep_on_sched_device])
-        per_sample_weight = pipe.scheduler.linear_timesteps_weights[weight_ids].to(dtype=per_sample_mse.dtype, device=per_sample_mse.device)
-        loss = (per_sample_mse * per_sample_weight).mean()
-    else:
-        loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
-        loss = loss * pipe.scheduler.training_weight(timestep)
+
+    per_sample_mse = (noise_pred.float() - training_target.float()).pow(2).flatten(1).mean(1)
+    weights = pipe.scheduler.training_weight(timesteps).to(device=per_sample_mse.device, dtype=per_sample_mse.dtype)
+    loss = (per_sample_mse * weights).mean()
     return loss
 
 
