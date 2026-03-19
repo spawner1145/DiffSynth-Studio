@@ -1029,7 +1029,7 @@ def launch_training_task(
                             metrics["train/grad_norm"] = float(grad_norm_item)
                         if layer_grad_norms is not None:
                             for layer_name, layer_grad_norm in layer_grad_norms.items():
-                                metrics[f"train/grad_norm_layers/{layer_name.replace('.', '/')}"] = float(layer_grad_norm)
+                                metrics[f"grad_norm_layers/{layer_name.replace('.', '/')}"] = float(layer_grad_norm)
                         if tb_writer is not None:
                             for key, value in metrics.items():
                                 tb_writer.add_scalar(key, value, global_step)
