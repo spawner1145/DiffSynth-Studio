@@ -221,8 +221,14 @@ class FlowMatchScheduler():
     def add_noise(self, original_samples, noise, timestep):
         if isinstance(timestep, torch.Tensor):
             timestep = timestep.cpu()
-        timestep_id = torch.argmin((self.timesteps - timestep).abs())
-        sigma = self.sigmas[timestep_id]
+        if timestep.ndim == 0 or (timestep.ndim == 1 and timestep.shape[0] == 1):
+            timestep_id = torch.argmin((self.timesteps - timestep).abs())
+            sigma = self.sigmas[timestep_id]
+        else:
+            timestep_ids = torch.stack([torch.argmin((self.timesteps - t).abs()) for t in timestep])
+            sigma = self.sigmas[timestep_ids]
+            while sigma.ndim < original_samples.ndim:
+                sigma = sigma.unsqueeze(-1)
         sample = (1 - sigma) * original_samples + sigma * noise
         return sample
     
@@ -231,6 +237,12 @@ class FlowMatchScheduler():
         return target
     
     def training_weight(self, timestep):
-        timestep_id = torch.argmin((self.timesteps - timestep.to(self.timesteps.device)).abs())
-        weights = self.linear_timesteps_weights[timestep_id]
+        timestep = timestep.to(self.timesteps.device)
+        if timestep.ndim == 0 or (timestep.ndim == 1 and timestep.shape[0] == 1):
+            timestep_id = torch.argmin((self.timesteps - timestep).abs())
+            weights = self.linear_timesteps_weights[timestep_id]
+        else:
+            timestep_ids = torch.stack([torch.argmin((self.timesteps - t).abs()) for t in timestep])
+            weights = self.linear_timesteps_weights[timestep_ids]
+            weights = weights.mean()
         return weights
