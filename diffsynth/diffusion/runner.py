@@ -698,6 +698,17 @@ def _compute_grad_norm(parameters):
     return total ** 0.5
 
 
+def _compute_layer_grad_norms(named_parameters):
+    layer_totals = {}
+    for name, param in named_parameters:
+        if param.grad is None:
+            continue
+        layer_name = name.rsplit(".", 1)[0] if "." in name else name
+        grad_norm_sq = param.grad.detach().norm(2).item() ** 2
+        layer_totals[layer_name] = layer_totals.get(layer_name, 0.0) + grad_norm_sq
+    return {layer_name: total ** 0.5 for layer_name, total in layer_totals.items()}
+
+
 def _normalize_log_with(log_with):
     if log_with is None:
         return []
@@ -765,6 +776,7 @@ def launch_training_task(
     lr_warmup_steps: int = 0,
     max_grad_norm: float = None,
     show_grad_norm: bool = True,
+    log_layer_grad_norms: bool = False,
     mup_scale: bool = False,
     mup_base_dim: float = 1.0,
     mup_dim: Optional[float] = None,
@@ -789,6 +801,7 @@ def launch_training_task(
     lr_warmup_steps = _get_arg(args, "lr_warmup_steps", lr_warmup_steps)
     max_grad_norm = _get_arg(args, "max_grad_norm", max_grad_norm)
     show_grad_norm = _get_arg(args, "show_grad_norm", show_grad_norm)
+    log_layer_grad_norms = _get_arg(args, "log_layer_grad_norms", log_layer_grad_norms)
     mup_scale = _get_arg(args, "mup_scale", mup_scale)
     mup_base_dim = _get_arg(args, "mup_base_dim", mup_base_dim)
     mup_dim = _get_arg(args, "mup_dim", mup_dim)
@@ -946,6 +959,7 @@ def launch_training_task(
                 loss = _compute_loss(model, dataset, data)
                 accelerator.backward(loss)
                 grad_norm = None
+                layer_grad_norms = None
                 if max_grad_norm is not None:
                     current_trainable_params = [param for param in model.parameters() if param.requires_grad]
                     if accelerator.sync_gradients:
@@ -953,6 +967,12 @@ def launch_training_task(
                 elif show_grad_norm and accelerator.sync_gradients:
                     current_trainable_params = [param for param in model.parameters() if param.requires_grad]
                     grad_norm = _compute_grad_norm(current_trainable_params)
+                if log_layer_grad_norms and accelerator.sync_gradients:
+                    unwrapped_model = accelerator.unwrap_model(model)
+                    current_trainable_named_params = [
+                        (name, param) for name, param in unwrapped_model.named_parameters() if param.requires_grad
+                    ]
+                    layer_grad_norms = _compute_layer_grad_norms(current_trainable_named_params)
                 optimizer.step()
                 if accelerator.sync_gradients:
                     optimizer.zero_grad()
@@ -1007,6 +1027,9 @@ def launch_training_task(
                             metrics["train/lr"] = float(lr)
                         if grad_norm is not None:
                             metrics["train/grad_norm"] = float(grad_norm_item)
+                        if layer_grad_norms is not None:
+                            for layer_name, layer_grad_norm in layer_grad_norms.items():
+                                metrics[f"train/grad_norm_layers/{layer_name.replace('.', '/')}"] = float(layer_grad_norm)
                         if tb_writer is not None:
                             for key, value in metrics.items():
                                 tb_writer.add_scalar(key, value, global_step)

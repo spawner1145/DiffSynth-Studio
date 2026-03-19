@@ -589,6 +589,7 @@ if __name__ == "__main__":
         mup_base_dim=1.0,
         mup_dim=complextro_model_config.get("hidden_size", None),
         max_grad_norm=1.0,
+        log_layer_grad_norms=True,
         num_workers=args.num_workers,
         save_epochs=args.save_epochs,
         num_epochs=args.num_epochs,
