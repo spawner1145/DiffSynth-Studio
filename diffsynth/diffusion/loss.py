@@ -24,8 +24,16 @@ def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
         noise_pred = noise_pred[:, :, 1:]
         training_target = training_target[:, :, 1:]
     
-    loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
-    loss = loss * pipe.scheduler.training_weight(timestep)
+    if batch_size > 1 and timestep.ndim >= 1 and timestep.shape[0] == batch_size:
+        # Per-sample weighted loss: each sample has its own timestep and weight
+        per_sample_mse = ((noise_pred.float() - training_target.float()) ** 2).flatten(1).mean(1)
+        timestep_on_sched_device = timestep.to(pipe.scheduler.timesteps.device)
+        weight_ids = torch.stack([torch.argmin((pipe.scheduler.timesteps - t).abs()) for t in timestep_on_sched_device])
+        per_sample_weight = pipe.scheduler.linear_timesteps_weights[weight_ids].to(dtype=per_sample_mse.dtype, device=per_sample_mse.device)
+        loss = (per_sample_mse * per_sample_weight).mean()
+    else:
+        loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
+        loss = loss * pipe.scheduler.training_weight(timestep)
     return loss
 
 

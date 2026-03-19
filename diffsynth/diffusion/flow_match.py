@@ -227,6 +227,7 @@ class FlowMatchScheduler():
         else:
             timestep_ids = torch.stack([torch.argmin((self.timesteps - t).abs()) for t in timestep])
             sigma = self.sigmas[timestep_ids]
+            sigma = sigma.to(device=original_samples.device, dtype=original_samples.dtype)
             while sigma.ndim < original_samples.ndim:
                 sigma = sigma.unsqueeze(-1)
         sample = (1 - sigma) * original_samples + sigma * noise
