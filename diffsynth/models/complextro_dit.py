@@ -618,6 +618,7 @@ class ComplextroImageDiT(torch.nn.Module):
         use_token_type_embedding: bool = True,
         enable_tread_routing: bool = False,
         tread_routes: Optional[List[dict]] = None,
+        use_text_modulation: bool = False,
     ):
         super().__init__()
 
@@ -661,6 +662,7 @@ class ComplextroImageDiT(torch.nn.Module):
         self.use_omni_token_type_modulation = bool(use_omni_token_type_modulation)
         self.use_token_type_embedding = bool(use_token_type_embedding)
         self.enable_tread_routing = bool(enable_tread_routing)
+        self.use_text_modulation = bool(use_text_modulation)
         self.tread_routes = self._normalize_tread_routes(tread_routes)
         self.tread_router = TreadRouter() if self.enable_tread_routing and len(self.tread_routes) > 0 else None
         self._freq_cache = OrderedDict()
@@ -686,6 +688,7 @@ class ComplextroImageDiT(torch.nn.Module):
         self.img_token_dim = int(in_channels) * self.latent_patch_size * self.latent_patch_size
         self.img_in = nn.Linear(self.img_token_dim, self.hidden_size)
         self.txt_in = nn.Linear(text_embed_dim, self.hidden_size)
+        self.text_pool_proj = nn.Linear(text_embed_dim, self.hidden_size) if self.use_text_modulation else None
         self.image_pad_token = nn.Parameter(torch.empty((1, self.img_token_dim)))
         self.token_type_embed = nn.Embedding(4, self.hidden_size) if self.use_token_type_embedding else None
 
@@ -790,6 +793,14 @@ class ComplextroImageDiT(torch.nn.Module):
         if self.proj_out.bias is not None:
             nn.init.zeros_(self.proj_out.bias)
 
+    def _compute_text_pool_conditioning(self, prompt_emb: torch.Tensor, prompt_emb_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        if prompt_emb_mask is not None:
+            mask = prompt_emb_mask.unsqueeze(-1).to(dtype=prompt_emb.dtype)
+            pooled = (prompt_emb * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1)
+        else:
+            pooled = prompt_emb.mean(dim=1)
+        return self.text_pool_proj(pooled)
+
     def _resolve_token_type_embed_ids(self, token_type_ids: torch.Tensor) -> torch.Tensor:
         token_type_ids = token_type_ids.clamp(TOKEN_TYPE_TEXT, TOKEN_TYPE_COND_IMAGE)
         # Keep text and SigLIP distinct, but let cond/target images share the same role embedding.
@@ -806,6 +817,12 @@ class ComplextroImageDiT(torch.nn.Module):
         if self.token_type_embed is not None and "token_type_embed.weight" not in state_dict:
             state_dict = dict(state_dict)
             state_dict["token_type_embed.weight"] = self.token_type_embed.weight.detach().clone()
+        if self.text_pool_proj is not None and "text_pool_proj.weight" not in state_dict:
+            if not isinstance(state_dict, dict):
+                state_dict = dict(state_dict)
+            state_dict["text_pool_proj.weight"] = self.text_pool_proj.weight.detach().clone()
+            if self.text_pool_proj.bias is not None:
+                state_dict["text_pool_proj.bias"] = self.text_pool_proj.bias.detach().clone()
 
         if not isinstance(state_dict, dict):
             state_dict = dict(state_dict)
@@ -1401,6 +1418,10 @@ class ComplextroImageDiT(torch.nn.Module):
             text_tokens = self.txt_in(self.txt_norm(prompt_emb))
             conditioning_noisy = self.time_text_embed(timestep, text_tokens.dtype)
             conditioning_clean = self.time_text_embed(torch.zeros_like(timestep), text_tokens.dtype)
+            if self.text_pool_proj is not None:
+                text_pool_cond = self._compute_text_pool_conditioning(prompt_emb, prompt_emb_mask)
+                conditioning_noisy = conditioning_noisy + text_pool_cond
+                conditioning_clean = conditioning_clean + text_pool_cond
             if conditioning_noisy.shape[0] == 1 and batch_size > 1:
                 conditioning_noisy = conditioning_noisy.expand(batch_size, -1)
             elif conditioning_noisy.shape[0] != batch_size:
@@ -1907,6 +1928,8 @@ class ComplextroImageDiT(torch.nn.Module):
         image_freqs_for_refiner = image_freqs_single[:x_seqlen].unsqueeze(0).repeat(image_tokens.shape[0], 1, 1)
 
         conditioning = self.time_text_embed(timestep, image_tokens.dtype)
+        if self.text_pool_proj is not None:
+            conditioning = conditioning + self._compute_text_pool_conditioning(prompt_emb, prompt_emb_mask)
         image_token_types = torch.full(
             (image_tokens.shape[0], image_tokens.shape[1]),
             TOKEN_TYPE_TARGET_IMAGE,
