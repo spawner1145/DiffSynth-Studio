@@ -735,6 +735,25 @@ class ComplextroImageDiT(torch.nn.Module):
             self.siglip_refiner = None
             self.siglip_pad_token = None
 
+        self.transformer_blocks = nn.ModuleList(
+            [
+                ComplextroSingleTransformerBlock(
+                    dim=self.hidden_size,
+                    num_attention_heads=self.num_attention_heads,
+                    attention_head_dim=self.attention_head_dim,
+                    modulation=True,
+                )
+                for _ in range(num_layers)
+            ]
+        )
+        for route in self.tread_routes:
+            if route["start_layer_idx"] >= num_layers or route["end_layer_idx"] >= num_layers:
+                raise ValueError(
+                    f"tread route layer idx out of range: start={route['start_layer_idx']}, end={route['end_layer_idx']}, num_layers={num_layers}."
+                )
+        self.norm_out = AdaLayerNorm(self.hidden_size, single=True)
+        self.proj_out = nn.Linear(self.hidden_size, self.img_token_dim)
+
         # Initialize all Linear layers with xavier_uniform:
         def _basic_init(module):
             if isinstance(module, nn.Linear):
@@ -755,25 +774,6 @@ class ComplextroImageDiT(torch.nn.Module):
                 nn.init.normal_(module.weight, mean=0.0, std=0.02)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-
-        self.transformer_blocks = nn.ModuleList(
-            [
-                ComplextroSingleTransformerBlock(
-                    dim=self.hidden_size,
-                    num_attention_heads=self.num_attention_heads,
-                    attention_head_dim=self.attention_head_dim,
-                    modulation=True,
-                )
-                for _ in range(num_layers)
-            ]
-        )
-        for route in self.tread_routes:
-            if route["start_layer_idx"] >= num_layers or route["end_layer_idx"] >= num_layers:
-                raise ValueError(
-                    f"tread route layer idx out of range: start={route['start_layer_idx']}, end={route['end_layer_idx']}, num_layers={num_layers}."
-                )
-        self.norm_out = AdaLayerNorm(self.hidden_size, single=True)
-        self.proj_out = nn.Linear(self.hidden_size, self.img_token_dim)
 
         for block in list(self.transformer_blocks) + list(self.noise_refiner):
             if block.modulation:
