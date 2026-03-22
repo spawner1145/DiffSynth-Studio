@@ -661,7 +661,7 @@ if __name__ == "__main__":
                 "end_layer_idx": 4,
             }
         ],
-        "use_text_modulation": True,
+        "use_text_modulation": False,
     }
 
     train_resolution = (256, 256)

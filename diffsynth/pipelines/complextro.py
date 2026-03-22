@@ -113,16 +113,22 @@ class ComplextroPipeline(BasePipeline):
         cfg_scale: float,
     ) -> torch.Tensor:
         timestep = t.flatten() * 1000.0
-        x_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, latents=latents, timestep=timestep)
-        denom = (1.0 - t).clamp_min(float(self.jit_t_eps))
+        model_inputs = dict(inputs_shared)
+        model_latents = latents.to(device=self.device, dtype=self.torch_dtype)
+        model_inputs["latents"] = model_latents
+        x_pred_posi = self.model_fn(**models, **model_inputs, **inputs_posi, timestep=timestep)
+        x_pred_posi = x_pred_posi.to(device=latents.device, dtype=torch.float32)
+        latents_fp32 = latents.to(device=latents.device, dtype=torch.float32)
+        denom = (1.0 - t).clamp_min(float(self.jit_t_eps)).to(device=latents.device, dtype=torch.float32)
         while denom.ndim < latents.ndim:
             denom = denom.unsqueeze(-1)
-        v_pred_posi = (x_pred_posi - latents) / denom
+        v_pred_posi = (x_pred_posi - latents_fp32) / denom
         if cfg_scale == 1.0:
             return v_pred_posi
 
-        x_pred_nega = self.model_fn(**models, **inputs_shared, **inputs_nega, latents=latents, timestep=timestep)
-        v_pred_nega = (x_pred_nega - latents) / denom
+        x_pred_nega = self.model_fn(**models, **model_inputs, **inputs_nega, timestep=timestep)
+        x_pred_nega = x_pred_nega.to(device=latents.device, dtype=torch.float32)
+        v_pred_nega = (x_pred_nega - latents_fp32) / denom
         low = float(self.jit_cfg_interval_min)
         high = float(self.jit_cfg_interval_max)
         apply_cfg = bool(float(t.flatten()[0]) < high and (low == 0.0 or float(t.flatten()[0]) > low))
@@ -132,15 +138,19 @@ class ComplextroPipeline(BasePipeline):
 
     def _jit_euler_step(self, models, inputs_shared, inputs_posi, inputs_nega, latents, t, t_next, cfg_scale):
         v_pred = self._jit_cfg_guided_velocity(models, inputs_shared, inputs_posi, inputs_nega, latents, t, cfg_scale)
-        return latents + (t_next - t) * v_pred
+        latents_fp32 = latents.to(device=latents.device, dtype=torch.float32)
+        delta = (t_next - t).to(device=latents.device, dtype=torch.float32)
+        return latents_fp32 + delta * v_pred
 
     def _jit_heun_step(self, models, inputs_shared, inputs_posi, inputs_nega, latents, t, t_next, cfg_scale):
         v_pred_t = self._jit_cfg_guided_velocity(models, inputs_shared, inputs_posi, inputs_nega, latents, t, cfg_scale)
-        latents_euler = latents + (t_next - t) * v_pred_t
+        latents_fp32 = latents.to(device=latents.device, dtype=torch.float32)
+        delta = (t_next - t).to(device=latents.device, dtype=torch.float32)
+        latents_euler = latents_fp32 + delta * v_pred_t
         v_pred_t_next = self._jit_cfg_guided_velocity(
             models, inputs_shared, inputs_posi, inputs_nega, latents_euler, t_next, cfg_scale
         )
-        return latents + (t_next - t) * 0.5 * (v_pred_t + v_pred_t_next)
+        return latents_fp32 + delta * 0.5 * (v_pred_t + v_pred_t_next)
 
     @staticmethod
     def _is_nested_list(value) -> bool:
@@ -325,7 +335,9 @@ class ComplextroPipeline(BasePipeline):
             old_cfg_max = self.jit_cfg_interval_max
             try:
                 if input_image is None:
-                    inputs_shared["latents"] = inputs_shared["latents"] * float(self.jit_noise_scale)
+                    inputs_shared["latents"] = (inputs_shared["latents"] * float(self.jit_noise_scale)).to(torch.float32)
+                else:
+                    inputs_shared["latents"] = inputs_shared["latents"].to(torch.float32)
                 timesteps = torch.linspace(
                     float(self._jit_t_start), 1.0, int(num_inference_steps) + 1, device=self.device, dtype=torch.float32
                 )
@@ -369,7 +381,7 @@ class ComplextroPipeline(BasePipeline):
                 )
 
         self.load_models_to_device(["vae"])
-        image = self.vae.decode(inputs_shared["latents"])
+        image = self.vae.decode(inputs_shared["latents"].to(dtype=self.torch_dtype))
         if image.shape[0] == 1:
             image = self.vae_output_to_image(image)
         else:

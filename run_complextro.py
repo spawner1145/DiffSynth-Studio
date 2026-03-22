@@ -31,12 +31,28 @@ def build_complextro_pipe(
     siglip_model_file="",
     vae_type: str = "flux2",
     use_alpha_layer_vae: bool = False,
+    prediction_type: str = "flow",
+    jit_p_mean: float = -0.8,
+    jit_p_std: float = 0.8,
+    jit_noise_scale: float = 1.0,
+    jit_t_eps: float = 5e-2,
+    jit_sampling_method: str = "heun",
+    jit_cfg_interval_min: float = 0.0,
+    jit_cfg_interval_max: float = 1.0,
     complextro_model_config=None,
     enable_vram_offload: bool = False,
     vram_config: dict | None = None,
     vram_limit: float | None = None,
 ):
     pipe = ComplextroPipeline(device=device, torch_dtype=torch_dtype)
+    pipe.prediction_type = str(prediction_type)
+    pipe.jit_p_mean = float(jit_p_mean)
+    pipe.jit_p_std = float(jit_p_std)
+    pipe.jit_noise_scale = float(jit_noise_scale)
+    pipe.jit_t_eps = float(jit_t_eps)
+    pipe.jit_sampling_method = str(jit_sampling_method)
+    pipe.jit_cfg_interval_min = float(jit_cfg_interval_min)
+    pipe.jit_cfg_interval_max = float(jit_cfg_interval_max)
     if complextro_model_config is None:
         complextro_model_config = {}
     else:
@@ -240,6 +256,10 @@ if __name__ == "__main__":
         siglip_model_file="",
         vae_type="flux2",
         use_alpha_layer_vae=False,
+        prediction_type="flow",
+        jit_sampling_method="heun",
+        jit_cfg_interval_min=0.0,
+        jit_cfg_interval_max=1.0,
         complextro_model_config=complextro_model_config,
         enable_vram_offload=enable_vram_offload,
         vram_config=vram_config,
