@@ -423,7 +423,8 @@ if __name__ == "__main__":
     parser.add_argument("--lr_decay_steps", type=float, default=0, help="decay 步数；传小数时按总步数比例计算")
     parser.add_argument("--lr_scheduler_min_lr_ratio", type=float, default=None, help="最小学习率相对初始学习率的比例")
     parser.add_argument("--num_workers", type=int, default=4, help="数据读取线程数")
-    parser.add_argument("--save_epochs", type=int, default=1, help="每多少个 epoch 保存一次模型")
+    parser.add_argument("--save_epochs", type=int, default=None, help="每多少个 epoch 保存一次模型")
+    parser.add_argument("--save_steps", type=int, default=2000, help="每多少个 steps 保存一次模型")
     parser.add_argument("--num_epochs", type=int, default=999999999, help="总训练 epoch 数")
     parser.add_argument("--train_resolution", type=int, nargs=2, default=[256, 256], help="训练基础分辨率")
     parser.add_argument("--max_bucket_reso", type=int, default=1024, help="分桶最大分辨率")
@@ -722,5 +723,6 @@ if __name__ == "__main__":
         log_layer_grad_norms=True,
         num_workers=args.num_workers,
         save_epochs=args.save_epochs,
+        save_steps=args.save_steps,
         num_epochs=args.num_epochs,
     )
