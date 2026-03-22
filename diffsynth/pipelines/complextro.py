@@ -261,6 +261,7 @@ class ComplextroPipeline(BasePipeline):
         progress_bar_cmd=tqdm,
     ):
         if self.prediction_type == "jit_xpred":
+            self.scheduler.training = False
             if self._get_vae_downsample_factor() != 1:
                 raise NotImplementedError("JiT-style x-pred inference is only implemented for pixel-space Complextro.")
             t_start = 1.0 - float(denoising_strength)

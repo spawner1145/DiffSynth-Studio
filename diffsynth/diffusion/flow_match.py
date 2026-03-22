@@ -15,6 +15,7 @@ class FlowMatchScheduler():
             "Qwen-Image-Lightning": FlowMatchScheduler.set_timesteps_qwen_image_lightning,
         }.get(template, FlowMatchScheduler.set_timesteps_flux)
         self.num_train_timesteps = 1000
+        self.training = False
 
     @staticmethod
     def set_timesteps_flux(num_inference_steps=100, denoising_strength=1.0, shift=None):
