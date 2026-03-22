@@ -13,6 +13,7 @@ from transformers import AutoTokenizer, AutoProcessor
 from ..models.complextro_dit import ComplextroImageDiT
 from ..models.qwen_image_text_encoder import QwenImageTextEncoder
 from ..models.flux2_vae import Flux2VAE
+from ..models.pixel_identity_vae import PixelIdentityVAE
 from ..models.qwen_image_vae import QwenImageVAE
 from ..models.siglip2_image_encoder import Siglip2ImageEncoder428M
 from .complextro_vae_utils import (
@@ -33,10 +34,18 @@ class ComplextroPipeline(BasePipeline):
         self.scheduler = FlowMatchScheduler("FLUX.2")
         self.text_encoder: QwenImageTextEncoder = None
         self.dit: ComplextroImageDiT = None
-        self.vae: Flux2VAE | QwenImageVAE = None
+        self.vae: Flux2VAE | QwenImageVAE | PixelIdentityVAE = None
         self.image_encoder: Siglip2ImageEncoder428M = None
         self.tokenizer: AutoTokenizer = None
         self.processor: AutoProcessor = None
+        self.prediction_type = "flow"
+        self.jit_p_mean = -0.8
+        self.jit_p_std = 0.8
+        self.jit_noise_scale = 1.0
+        self.jit_t_eps = 5e-2
+        self.jit_sampling_method = "heun"
+        self.jit_cfg_interval_min = 0.0
+        self.jit_cfg_interval_max = 1.0
         self.in_iteration_models = ("dit",)
         self.units = [
             ComplextroUnit_ShapeChecker(),
@@ -52,6 +61,8 @@ class ComplextroPipeline(BasePipeline):
     def _get_vae_input_channels(self) -> Optional[int]:
         if self.vae is None:
             return None
+        if hasattr(self.vae, "image_channels"):
+            return int(self.vae.image_channels)
         if hasattr(self.vae, "encoder") and hasattr(self.vae.encoder, "conv_in"):
             return int(self.vae.encoder.conv_in.in_channels)
         return None
@@ -90,6 +101,46 @@ class ComplextroPipeline(BasePipeline):
     def _prepare_vae_image(self, image):
         image = self._load_image(image)
         return self._normalize_image_mode_for_vae(image)
+
+    def _jit_cfg_guided_velocity(
+        self,
+        models,
+        inputs_shared,
+        inputs_posi,
+        inputs_nega,
+        latents: torch.Tensor,
+        t: torch.Tensor,
+        cfg_scale: float,
+    ) -> torch.Tensor:
+        timestep = t.flatten() * 1000.0
+        x_pred_posi = self.model_fn(**models, **inputs_shared, **inputs_posi, latents=latents, timestep=timestep)
+        denom = (1.0 - t).clamp_min(float(self.jit_t_eps))
+        while denom.ndim < latents.ndim:
+            denom = denom.unsqueeze(-1)
+        v_pred_posi = (x_pred_posi - latents) / denom
+        if cfg_scale == 1.0:
+            return v_pred_posi
+
+        x_pred_nega = self.model_fn(**models, **inputs_shared, **inputs_nega, latents=latents, timestep=timestep)
+        v_pred_nega = (x_pred_nega - latents) / denom
+        low = float(self.jit_cfg_interval_min)
+        high = float(self.jit_cfg_interval_max)
+        apply_cfg = bool(float(t.flatten()[0]) < high and (low == 0.0 or float(t.flatten()[0]) > low))
+        if not apply_cfg:
+            return v_pred_posi
+        return v_pred_nega + cfg_scale * (v_pred_posi - v_pred_nega)
+
+    def _jit_euler_step(self, models, inputs_shared, inputs_posi, inputs_nega, latents, t, t_next, cfg_scale):
+        v_pred = self._jit_cfg_guided_velocity(models, inputs_shared, inputs_posi, inputs_nega, latents, t, cfg_scale)
+        return latents + (t_next - t) * v_pred
+
+    def _jit_heun_step(self, models, inputs_shared, inputs_posi, inputs_nega, latents, t, t_next, cfg_scale):
+        v_pred_t = self._jit_cfg_guided_velocity(models, inputs_shared, inputs_posi, inputs_nega, latents, t, cfg_scale)
+        latents_euler = latents + (t_next - t) * v_pred_t
+        v_pred_t_next = self._jit_cfg_guided_velocity(
+            models, inputs_shared, inputs_posi, inputs_nega, latents_euler, t_next, cfg_scale
+        )
+        return latents + (t_next - t) * 0.5 * (v_pred_t + v_pred_t_next)
 
     @staticmethod
     def _is_nested_list(value) -> bool:
@@ -147,6 +198,11 @@ class ComplextroPipeline(BasePipeline):
         pipe.vae = model_pool.fetch_model("flux2_vae")
         if pipe.vae is None:
             pipe.vae = model_pool.fetch_model("qwen_image_vae")
+        if pipe.vae is None and pipe.dit is not None:
+            dit_latent_channels = int(pipe.dit.latent_channels)
+            dit_downsample = int(getattr(pipe.dit, "latent_downsample_factor", 16))
+            if dit_latent_channels in (3, 4) and dit_downsample == 1:
+                pipe.vae = PixelIdentityVAE(image_channels=dit_latent_channels).to(device=device, dtype=torch_dtype)
         pipe.image_encoder = model_pool.fetch_model("siglip_vision_model_428m")
         if tokenizer_config is not None:
             tokenizer_config.download_if_necessary()
@@ -187,18 +243,31 @@ class ComplextroPipeline(BasePipeline):
         seed: int = None,
         rand_device: str = "cpu",
         num_inference_steps: int = 30,
+        jit_sampling_method: Optional[str] = None,
+        jit_cfg_interval_min: Optional[float] = None,
+        jit_cfg_interval_max: Optional[float] = None,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
         progress_bar_cmd=tqdm,
     ):
-        self.scheduler.set_timesteps(
-            num_inference_steps,
-            denoising_strength=denoising_strength,
-            dynamic_shift_len=(
-                (height // self._get_vae_token_downsample_factor())
-                * (width // self._get_vae_token_downsample_factor())
-            ),
-        )
+        if self.prediction_type == "jit_xpred":
+            if self._get_vae_downsample_factor() != 1:
+                raise NotImplementedError("JiT-style x-pred inference is only implemented for pixel-space Complextro.")
+            t_start = 1.0 - float(denoising_strength)
+            t_start = max(0.0, min(1.0, t_start))
+            self._jit_t_start = t_start
+            effective_sampling_method = self.jit_sampling_method if jit_sampling_method is None else str(jit_sampling_method)
+            effective_cfg_interval_min = self.jit_cfg_interval_min if jit_cfg_interval_min is None else float(jit_cfg_interval_min)
+            effective_cfg_interval_max = self.jit_cfg_interval_max if jit_cfg_interval_max is None else float(jit_cfg_interval_max)
+        else:
+            self.scheduler.set_timesteps(
+                num_inference_steps,
+                denoising_strength=denoising_strength,
+                dynamic_shift_len=(
+                    (height // self._get_vae_token_downsample_factor())
+                    * (width // self._get_vae_token_downsample_factor())
+                ),
+            )
 
         batch_size = 1
         if isinstance(prompt, list):
@@ -251,24 +320,53 @@ class ComplextroPipeline(BasePipeline):
 
         self.load_models_to_device(self.in_iteration_models)
         models = {name: getattr(self, name) for name in self.in_iteration_models}
-        for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
-            timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
-            noise_pred = self.cfg_guided_model_fn(
-                self.model_fn,
-                cfg_scale,
-                inputs_shared,
-                inputs_posi,
-                inputs_nega,
-                **models,
-                timestep=timestep,
-                progress_id=progress_id,
-            )
-            inputs_shared["latents"] = self.step(
-                self.scheduler,
-                progress_id=progress_id,
-                noise_pred=noise_pred,
-                **inputs_shared,
-            )
+        if self.prediction_type == "jit_xpred":
+            old_cfg_min = self.jit_cfg_interval_min
+            old_cfg_max = self.jit_cfg_interval_max
+            try:
+                if input_image is None:
+                    inputs_shared["latents"] = inputs_shared["latents"] * float(self.jit_noise_scale)
+                timesteps = torch.linspace(
+                    float(self._jit_t_start), 1.0, int(num_inference_steps) + 1, device=self.device, dtype=torch.float32
+                )
+                step_method = str(effective_sampling_method).lower()
+                self.jit_cfg_interval_min = float(effective_cfg_interval_min)
+                self.jit_cfg_interval_max = float(effective_cfg_interval_max)
+                for progress_id, _ in enumerate(progress_bar_cmd(timesteps[:-1])):
+                    t = timesteps[progress_id].view(1)
+                    t_next = timesteps[progress_id + 1].view(1)
+                    if step_method == "euler" or progress_id + 1 >= int(num_inference_steps):
+                        inputs_shared["latents"] = self._jit_euler_step(
+                            models, inputs_shared, inputs_posi, inputs_nega, inputs_shared["latents"], t, t_next, cfg_scale
+                        )
+                    elif step_method == "heun":
+                        inputs_shared["latents"] = self._jit_heun_step(
+                            models, inputs_shared, inputs_posi, inputs_nega, inputs_shared["latents"], t, t_next, cfg_scale
+                        )
+                    else:
+                        raise ValueError(f"Unsupported JiT sampling method: {effective_sampling_method!r}. Expected 'euler' or 'heun'.")
+            finally:
+                self.jit_cfg_interval_min = old_cfg_min
+                self.jit_cfg_interval_max = old_cfg_max
+        else:
+            for progress_id, timestep in enumerate(progress_bar_cmd(self.scheduler.timesteps)):
+                timestep = timestep.unsqueeze(0).to(dtype=self.torch_dtype, device=self.device)
+                noise_pred = self.cfg_guided_model_fn(
+                    self.model_fn,
+                    cfg_scale,
+                    inputs_shared,
+                    inputs_posi,
+                    inputs_nega,
+                    **models,
+                    timestep=timestep,
+                    progress_id=progress_id,
+                )
+                inputs_shared["latents"] = self.step(
+                    self.scheduler,
+                    progress_id=progress_id,
+                    noise_pred=noise_pred,
+                    **inputs_shared,
+                )
 
         self.load_models_to_device(["vae"])
         image = self.vae.decode(inputs_shared["latents"])
@@ -277,6 +375,8 @@ class ComplextroPipeline(BasePipeline):
         else:
             image = [self.vae_output_to_image(i, pattern="C H W") for i in image]
         self.load_models_to_device([])
+        if hasattr(self, "_jit_t_start"):
+            delattr(self, "_jit_t_start")
         return image
 
 
@@ -285,7 +385,16 @@ class ComplextroUnit_ShapeChecker(PipelineUnit):
         super().__init__(input_params=("height", "width"), output_params=("height", "width"))
 
     def process(self, pipe: ComplextroPipeline, height, width):
-        height, width = pipe.check_resize_height_width(height, width)
+        token_factor = max(1, int(pipe._get_vae_token_downsample_factor()))
+        old_h_div = pipe.height_division_factor
+        old_w_div = pipe.width_division_factor
+        try:
+            pipe.height_division_factor = max(int(old_h_div), token_factor)
+            pipe.width_division_factor = max(int(old_w_div), token_factor)
+            height, width = pipe.check_resize_height_width(height, width)
+        finally:
+            pipe.height_division_factor = old_h_div
+            pipe.width_division_factor = old_w_div
         return {"height": height, "width": width}
 
 
@@ -487,6 +596,10 @@ class ComplextroUnit_InputImageEmbedder(PipelineUnit):
             image = pipe.preprocess_image(input_image)
         image = image.to(device=pipe.device, dtype=pipe.torch_dtype)
         input_latents = pipe.vae.encode(image)
+        if pipe.prediction_type == "jit_xpred" and not pipe.scheduler.training:
+            t_start = float(getattr(pipe, "_jit_t_start", 0.0))
+            latents = t_start * input_latents + (1.0 - t_start) * noise * float(pipe.jit_noise_scale)
+            return {"latents": latents, "input_latents": input_latents}
         if pipe.scheduler.training:
             return {"latents": noise, "input_latents": input_latents}
         latents = pipe.scheduler.add_noise(input_latents, noise, timestep=pipe.scheduler.timesteps[0])
@@ -504,7 +617,8 @@ class ComplextroUnit_EditImageAutoResize(PipelineUnit):
         if edit_image is None or not edit_image_auto_resize:
             return {}
         from ..core.data.operators import ImageCropAndResize
-        operator = ImageCropAndResize(max_pixels=1024 * 1024, height_division_factor=16, width_division_factor=16)
+        token_factor = max(1, int(pipe._get_vae_token_downsample_factor()))
+        operator = ImageCropAndResize(max_pixels=1024 * 1024, height_division_factor=token_factor, width_division_factor=token_factor)
         if isinstance(edit_image, list) and len(edit_image) > 0 and isinstance(edit_image[0], list):
             edit_image = [[operator(pipe._load_image(img)) for img in image_group] for image_group in edit_image]
         elif isinstance(edit_image, list):
@@ -616,7 +730,8 @@ class ComplextroUnit_EditImageEmbedder(PipelineUnit):
             return {}
         pipe.load_models_to_device(self.onload_model_names)
         from ..core.data.operators import ImageCropAndResize
-        resize_operator = ImageCropAndResize(max_pixels=1024 * 1024, height_division_factor=16, width_division_factor=16)
+        token_factor = max(1, int(pipe._get_vae_token_downsample_factor()))
+        resize_operator = ImageCropAndResize(max_pixels=1024 * 1024, height_division_factor=token_factor, width_division_factor=token_factor)
 
         group_count = self._infer_group_count(edit_image, edit_latent)
         image_groups = self._normalize_image_groups(edit_image, group_count)
@@ -699,7 +814,7 @@ def model_fn_complextro(
     use_gradient_checkpointing_offload: bool = False,
     **kwargs,
 ):
-    timestep = timestep / 1000
+    timestep_model = timestep / 1000
 
     if omni_mode and edit_latents is not None and len(edit_latents) > 0:
         batch_size = latents.shape[0]
@@ -754,7 +869,7 @@ def model_fn_complextro(
 
         model_output = dit(
             latents=latents_omni,
-            timestep=timestep,
+            timestep=timestep_model,
             prompt_emb=prompt_emb,
             prompt_emb_mask=prompt_emb_mask,
             image_noise_mask=mask,
@@ -767,7 +882,7 @@ def model_fn_complextro(
 
     model_output = dit(
         latents=latents,
-        timestep=timestep,
+        timestep=timestep_model,
         prompt_emb=prompt_emb,
         prompt_emb_mask=prompt_emb_mask,
         siglip_feats=None,

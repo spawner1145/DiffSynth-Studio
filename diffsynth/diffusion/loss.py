@@ -30,6 +30,34 @@ def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
     return loss
 
 
+def JiTXPredLoss(pipe: BasePipeline, **inputs):
+    if hasattr(pipe, "_get_vae_downsample_factor") and int(pipe._get_vae_downsample_factor()) != 1:
+        raise NotImplementedError("JiT-style x-pred training is only valid for pixel-space inputs (VAE downsample factor must be 1).")
+    x = inputs["input_latents"]
+    batch_size = x.shape[0]
+    p_mean = float(inputs.get("jit_p_mean", getattr(pipe, "jit_p_mean", -0.8)))
+    p_std = float(inputs.get("jit_p_std", getattr(pipe, "jit_p_std", 0.8)))
+    noise_scale = float(inputs.get("jit_noise_scale", getattr(pipe, "jit_noise_scale", 1.0)))
+    t_eps = float(inputs.get("jit_t_eps", getattr(pipe, "jit_t_eps", 5e-2)))
+
+    t = torch.randn(batch_size, device=x.device, dtype=torch.float32) * p_std + p_mean
+    t = torch.sigmoid(t).view(batch_size, *([1] * (x.ndim - 1))).to(dtype=x.dtype)
+    noise = torch.randn_like(x) * noise_scale
+    latents = t * x + (1 - t) * noise
+
+    inputs["latents"] = latents
+    timestep = t.flatten() * 1000.0
+    models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
+    x_pred = pipe.model_fn(**models, **inputs, timestep=timestep)
+
+    denom = (1 - t).clamp_min(t_eps)
+    v_target = (x - latents) / denom
+    v_pred = (x_pred - latents) / denom
+
+    loss = (v_target.float() - v_pred.float()).pow(2).flatten(1).mean(1).mean()
+    return loss
+
+
 def FlowMatchSFTAudioVideoLoss(pipe: BasePipeline, **inputs):
     max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * len(pipe.scheduler.timesteps))
     min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * len(pipe.scheduler.timesteps))

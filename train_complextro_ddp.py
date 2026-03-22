@@ -11,12 +11,14 @@ from diffsynth.core.data.operators import ImageCropAndResize, LoadImage, ToAbsol
 from diffsynth.diffusion import (
     DiffusionTrainingModule,
     FlowMatchSFTLoss,
+    JiTXPredLoss,
     ModelLogger,
     launch_training_task,
 )
 from diffsynth.models.qwen_image_text_encoder import QwenImageTextEncoder
 from diffsynth.utils.state_dict_converters.qwen_image_text_encoder import QwenImageTextEncoderStateDictConverter
 from diffsynth.models.complextro_dit import ComplextroImageDiT
+from diffsynth.models.pixel_identity_vae import PixelIdentityVAE
 from diffsynth.models.siglip2_image_encoder import Siglip2ImageEncoder428M
 from diffsynth.pipelines.complextro import ComplextroPipeline
 from diffsynth.pipelines.complextro_vae_utils import (
@@ -41,12 +43,24 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         vae_type: str = "flux2",
         use_alpha_layer_vae: bool = False,
         complextro_model_config: Optional[dict] = None,
+        prediction_type: str = "flow",
+        condition_drop_prob: float = 0.0,
+        jit_p_mean: float = -0.8,
+        jit_p_std: float = 0.8,
+        jit_noise_scale: float = 1.0,
+        jit_t_eps: float = 5e-2,
+        jit_sampling_method: str = "heun",
+        jit_cfg_interval_min: float = 0.0,
+        jit_cfg_interval_max: float = 1.0,
         enable_vram_offload: bool = False,
         vram_config: Optional[dict] = None,
         vram_limit: Optional[float] = None,
     ):
         super().__init__()
         self.train_omni = train_omni
+        if str(prediction_type) == "jit_xpred" and float(condition_drop_prob) == 0.0:
+            condition_drop_prob = 0.1
+        self.condition_drop_prob = float(condition_drop_prob)
         self.complextro_model_config = {} if complextro_model_config is None else dict(complextro_model_config)
         self.enable_vram_offload = enable_vram_offload
         self.vae_spec = get_complextro_vae_spec(
@@ -72,6 +86,16 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
                 )
 
         self.pipe = ComplextroPipeline(device=device, torch_dtype=torch.bfloat16)
+        self.pipe.prediction_type = str(prediction_type)
+        self.pipe.jit_p_mean = float(jit_p_mean)
+        self.pipe.jit_p_std = float(jit_p_std)
+        self.pipe.jit_noise_scale = float(jit_noise_scale)
+        self.pipe.jit_t_eps = float(jit_t_eps)
+        self.pipe.jit_sampling_method = str(jit_sampling_method)
+        self.pipe.jit_cfg_interval_min = float(jit_cfg_interval_min)
+        self.pipe.jit_cfg_interval_max = float(jit_cfg_interval_max)
+        if self.pipe.prediction_type == "jit_xpred" and int(self.vae_spec["latent_downsample_factor"]) != 1:
+            raise NotImplementedError("JiT-style x-pred training requires pixel-space Complextro (use vae_type='pixel' or 'pixel:<patch_size>').")
 
         if enable_vram_offload:
             if vram_config is None:
@@ -124,11 +148,14 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             config={"model_type": "qwen3_5", "model_size": qwen_model_size},
             state_dict_converter=QwenImageTextEncoderStateDictConverter,
         )
-        self.pipe.vae = load_aux_model(
-            self.vae_spec["model_class"],
-            self.vae_spec["model_file"],
-            config=self.vae_spec["config"],
-        )
+        if self.vae_spec["model_file"] is None and self.vae_spec["model_class"] is PixelIdentityVAE:
+            self.pipe.vae = PixelIdentityVAE(**self.vae_spec["config"]).to(device=device, dtype=torch.bfloat16)
+        else:
+            self.pipe.vae = load_aux_model(
+                self.vae_spec["model_class"],
+                self.vae_spec["model_file"],
+                config=self.vae_spec["config"],
+            )
         self.pipe.processor = AutoProcessor.from_pretrained(qwen_tokenizer_dir)
         self.pipe.tokenizer = self.pipe.processor.tokenizer
 
@@ -222,6 +249,14 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
                 prompts.append(entry if isinstance(entry, str) else str(entry))
         return prompts
 
+    def _apply_condition_dropout(self, prompts: List[str]) -> List[str]:
+        if self.condition_drop_prob <= 0:
+            return prompts
+        if len(prompts) == 0:
+            return prompts
+        keep = torch.rand(len(prompts)) >= self.condition_drop_prob
+        return [prompt if bool(keep[idx]) else "" for idx, prompt in enumerate(prompts)]
+
     def _normalize_edit_image_entry(self, entry: Any) -> List[Any]:
         if self._is_missing_value(entry):
             return []
@@ -300,6 +335,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         noise_mask_entries = self._split_batch_value(data.get("image_noise_mask", None), batch_size)
 
         prompt_value = self._normalize_prompt_entries(prompt_entries)
+        prompt_value = self._apply_condition_dropout(prompt_value)
         neg_prompt_value = self._normalize_prompt_entries(neg_prompt_entries)
         self._validate_batched_image_shapes(image_entries)
         height, width = self._infer_image_hw(image_entries)
@@ -348,14 +384,17 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
                 unit, self.pipe, inputs_shared, inputs_posi, inputs_nega
             )
 
-        loss = FlowMatchSFTLoss(self.pipe, **inputs_shared, **inputs_posi)
+        if self.pipe.prediction_type == "jit_xpred":
+            loss = JiTXPredLoss(self.pipe, **inputs_shared, **inputs_posi)
+        else:
+            loss = FlowMatchSFTLoss(self.pipe, **inputs_shared, **inputs_posi)
         return loss
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Complextro Training Script")
-    parser.add_argument("--vae_type", type=str, default="flux2", help="Complextro VAE type: flux2 or qwen_image")
-    parser.add_argument("--vae_file", type=str, default="/mnt/raid0/linux-train/diffusion-model-v1/flux2-vae/diffusion_pytorch_model.safetensors", help="Complextro VAE model file")
+    parser.add_argument("--vae_type", type=str, default="flux2", help="Complextro VAE type: flux2 / qwen_image / pixel / pixel:<patch_size> (pixel defaults to patch_size=32)")
+    parser.add_argument("--vae_file", type=str, default="/mnt/raid0/linux-train/diffusion-model-v1/flux2-vae/diffusion_pytorch_model.safetensors", help="Complextro VAE model file; ignored when --vae_type pixel")
     parser.add_argument("--use_image_text_pairs", action="store_true", help="True: 使用 ImageTextPairDataset（图片+txt目录），False: 使用 UnifiedDataset（metadata文件）")
     parser.add_argument("--train_omni", action="store_true", default=True, help="是否开启 Omni/编辑训练模式")
     parser.add_argument("--use_alpha_layer_vae", action="store_true", help="是否使用带 alpha 层 VAE")
@@ -370,6 +409,15 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=2, help="训练 batch size")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="学习率")
+    parser.add_argument("--prediction_type", type=str, default="flow", help="Training target type: flow / jit_xpred")
+    parser.add_argument("--condition_drop_prob", type=float, default=0.0, help="Classifier-free condition dropout probability used during training")
+    parser.add_argument("--jit_p_mean", type=float, default=-0.8, help="JiT x-pred logit-normal P_mean")
+    parser.add_argument("--jit_p_std", type=float, default=0.8, help="JiT x-pred logit-normal P_std")
+    parser.add_argument("--jit_noise_scale", type=float, default=1.0, help="JiT x-pred noise scale")
+    parser.add_argument("--jit_t_eps", type=float, default=5e-2, help="JiT x-pred denominator clamp epsilon")
+    parser.add_argument("--jit_sampling_method", type=str, default="heun", help="JiT x-pred sampling method: euler / heun")
+    parser.add_argument("--jit_cfg_interval_min", type=float, default=0.0, help="JiT x-pred CFG interval minimum t")
+    parser.add_argument("--jit_cfg_interval_max", type=float, default=1.0, help="JiT x-pred CFG interval maximum t")
     parser.add_argument("--lr_scheduler", type=str, default="constant", help="学习率调度器名称，例如 constant / warmup_stable_decay")
     parser.add_argument("--lr_warmup_steps", type=float, default=0, help="warmup 步数；传小数时按总步数比例计算")
     parser.add_argument("--lr_decay_steps", type=float, default=0, help="decay 步数；传小数时按总步数比例计算")
@@ -404,6 +452,13 @@ if __name__ == "__main__":
     #   max_train_steps - lr_warmup_steps - lr_decay_steps
     # - Unknown CLI args are forwarded into `args` as attributes, so you can also pass
     #   launch_training_task / runner fields directly with `--xxx value`.
+    # - JiT-style pixel x-pred example:
+    #   accelerate launch train_complextro_ddp.py \
+    #     --vae_type pixel:32 \
+    #     --prediction_type jit_xpred \
+    #     --jit_sampling_method heun \
+    #     --jit_cfg_interval_min 0.1 \
+    #     --jit_cfg_interval_max 1.0
 
     def _parse_cli_value(value):
         if isinstance(value, str):
@@ -458,6 +513,12 @@ if __name__ == "__main__":
     vae_type = args.vae_type
     use_alpha_layer_vae = args.use_alpha_layer_vae
     siglip_model_file = args.siglip_model_file
+    data_vae_spec = get_complextro_vae_spec(
+        vae_type=vae_type,
+        vae_file=args.vae_file,
+        use_alpha_layer_vae=use_alpha_layer_vae,
+    )
+    image_division_factor = int(data_vae_spec["latent_downsample_factor"]) * int(data_vae_spec["latent_patch_size"])
     enable_vram_offload = args.enable_vram_offload
     vram_config = {
         "offload_dtype": torch.bfloat16,
@@ -475,8 +536,8 @@ if __name__ == "__main__":
             height=None,
             width=None,
             max_pixels=max_pixels,
-            height_division_factor=16,
-            width_division_factor=16,
+            height_division_factor=image_division_factor,
+            width_division_factor=image_division_factor,
         )
         to_abs = ToAbsolutePath(base_path)
         load_image = LoadImage()
@@ -563,16 +624,16 @@ if __name__ == "__main__":
                     height=None,
                     width=None,
                     max_pixels=max_bucket_reso * max_bucket_reso,
-                    height_division_factor=16,
-                    width_division_factor=16,
+                    height_division_factor=image_division_factor,
+                    width_division_factor=image_division_factor,
                 ),
             )
         else:
             dataset = ImageTextPairDataset(
                 data_dir=args.data_dir,
                 max_pixels=max_bucket_reso * max_bucket_reso,
-                height_division_factor=16,
-                width_division_factor=16,
+                height_division_factor=image_division_factor,
+                width_division_factor=image_division_factor,
                 enable_bucket=True,
                 bucket_no_upscale=False,
                 min_bucket_reso=256,
@@ -612,8 +673,8 @@ if __name__ == "__main__":
                 height=None,
                 width=None,
                 max_pixels=max_bucket_reso * max_bucket_reso,
-                height_division_factor=16,
-                width_division_factor=16,
+                height_division_factor=image_division_factor,
+                width_division_factor=image_division_factor,
             ),
         )
 
@@ -628,6 +689,15 @@ if __name__ == "__main__":
         vae_type=vae_type,
         use_alpha_layer_vae=use_alpha_layer_vae,
         complextro_model_config=complextro_model_config,
+        prediction_type=args.prediction_type,
+        condition_drop_prob=args.condition_drop_prob,
+        jit_p_mean=args.jit_p_mean,
+        jit_p_std=args.jit_p_std,
+        jit_noise_scale=args.jit_noise_scale,
+        jit_t_eps=args.jit_t_eps,
+        jit_sampling_method=args.jit_sampling_method,
+        jit_cfg_interval_min=args.jit_cfg_interval_min,
+        jit_cfg_interval_max=args.jit_cfg_interval_max,
         enable_vram_offload=enable_vram_offload,
         vram_config=vram_config,
     )
