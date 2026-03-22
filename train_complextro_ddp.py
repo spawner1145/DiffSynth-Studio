@@ -1,4 +1,4 @@
-import os, argparse, importlib
+import os, ast, argparse, importlib
 import torch, accelerate
 from accelerate import DistributedDataParallelKwargs
 from typing import List, Optional, Any
@@ -370,6 +370,10 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=2, help="训练 batch size")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="学习率")
+    parser.add_argument("--lr_scheduler", type=str, default="constant", help="学习率调度器名称，例如 constant / warmup_stable_decay")
+    parser.add_argument("--lr_warmup_steps", type=float, default=0, help="warmup 步数；传小数时按总步数比例计算")
+    parser.add_argument("--lr_decay_steps", type=float, default=0, help="decay 步数；传小数时按总步数比例计算")
+    parser.add_argument("--lr_scheduler_min_lr_ratio", type=float, default=None, help="最小学习率相对初始学习率的比例")
     parser.add_argument("--num_workers", type=int, default=4, help="数据读取线程数")
     parser.add_argument("--save_epochs", type=int, default=1, help="每多少个 epoch 保存一次模型")
     parser.add_argument("--num_epochs", type=int, default=999999999, help="总训练 epoch 数")
@@ -385,8 +389,64 @@ if __name__ == "__main__":
     parser.add_argument("--attention_head_dim", type=int, default=96, help="DiT attention head dim")
     parser.add_argument("--enable_vram_offload", action="store_true", help="Enable VRAM offload for frozen auxiliary models")
     parser.add_argument("--offload_device", type=str, default="cpu", help="Offload device when VRAM offload is enabled")
-    
-    args = parser.parse_args()
+
+    # 使用 WSD 调度器示例:
+    # accelerate launch train_complextro_ddp.py \
+    #   --lr_scheduler warmup_stable_decay \
+    #   --lr_warmup_steps 1000 \
+    #   --lr_decay_steps 10000 \
+    #   --lr_scheduler_min_lr_ratio 0.1
+    #
+    # ps:
+    # - lr_warmup_steps / lr_decay_steps 可以是整数或比例.
+    # - 如果传入浮点数，它将被解释为总训练步数的比例.
+    # - 稳定步数会被自动计算为总训练步数减去 warmup 和 decay 步数. 例如:
+    #   max_train_steps - lr_warmup_steps - lr_decay_steps
+    # - Unknown CLI args are forwarded into `args` as attributes, so you can also pass
+    #   launch_training_task / runner fields directly with `--xxx value`.
+
+    def _parse_cli_value(value):
+        if isinstance(value, str):
+            lowered = value.lower()
+            if lowered == "true":
+                return True
+            if lowered == "false":
+                return False
+            if lowered == "none":
+                return None
+        try:
+            return ast.literal_eval(value)
+        except (ValueError, SyntaxError):
+            return value
+
+    def _apply_unknown_args(namespace, unknown_args):
+        i = 0
+        while i < len(unknown_args):
+            token = unknown_args[i]
+            if not token.startswith("--"):
+                raise ValueError(f"Unexpected positional argument: {token}")
+
+            key = token[2:]
+            if "=" in key:
+                key, raw_value = key.split("=", 1)
+                setattr(namespace, key.replace("-", "_"), _parse_cli_value(raw_value))
+                i += 1
+                continue
+
+            if i + 1 < len(unknown_args) and not unknown_args[i + 1].startswith("--"):
+                raw_value = unknown_args[i + 1]
+                setattr(namespace, key.replace("-", "_"), _parse_cli_value(raw_value))
+                i += 2
+                continue
+
+            if key.startswith("no-"):
+                setattr(namespace, key[3:].replace("-", "_"), False)
+            else:
+                setattr(namespace, key.replace("-", "_"), True)
+            i += 1
+
+    args, unknown_args = parser.parse_known_args()
+    _apply_unknown_args(args, unknown_args)
 
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = accelerate.Accelerator(
@@ -581,11 +641,10 @@ if __name__ == "__main__":
         dataset,
         model,
         model_logger,
+        args=args,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         optimizer_type="adamw",
-        lr_scheduler_type="constant",
-        lr_warmup_steps=0,
         mup_scale=False,
         mup_base_dim=1.0,
         mup_dim=complextro_model_config.get("hidden_size", None),

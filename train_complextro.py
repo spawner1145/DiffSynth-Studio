@@ -1,3 +1,4 @@
+import argparse
 import os
 import importlib
 import torch, accelerate
@@ -707,16 +708,22 @@ if __name__ == "__main__":
         remove_prefix_in_ckpt="pipe.dit.",
     )
 
+    args = argparse.Namespace(
+        lr_scheduler="warmup_stable_decay",
+        lr_warmup_steps=0.01,
+        lr_decay_steps=0.1,
+        lr_scheduler_min_lr_ratio=0.1,
+    )
+
     launch_training_task(
         accelerator,
         dataset,
         model,
         model_logger,
+        args=args,
         batch_size=2,
         learning_rate=1e-4,
         optimizer_type="adamw",
-        lr_scheduler_type="constant",
-        lr_warmup_steps=0,
         mup_scale=False,
         mup_base_dim=1.0,
         mup_dim=complextro_model_config.get("hidden_size", None),
