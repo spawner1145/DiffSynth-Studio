@@ -581,11 +581,12 @@ class ComplextroUnit_NoiseInitializer(PipelineUnit):
     def process(self, pipe: ComplextroPipeline, height, width, seed, rand_device, batch_size=1):
         latent_channels = int(pipe.dit.latent_channels) if pipe.dit is not None else 128
         downsample_factor = pipe._get_vae_downsample_factor()
+        noise_dtype = torch.float32 if isinstance(pipe.vae, PixelIdentityVAE) else pipe.torch_dtype
         noise = pipe.generate_noise(
             (int(batch_size), latent_channels, height // downsample_factor, width // downsample_factor),
             seed=seed,
             rand_device=rand_device,
-            rand_torch_dtype=pipe.torch_dtype,
+            rand_torch_dtype=noise_dtype,
         )
         return {"noise": noise}
 
