@@ -351,7 +351,7 @@ if __name__ == "__main__":
     inference_omni_mode = False
     inference_output_root = "complextro_xpred_sweep"
     inference_test_input_image = True
-    inference_input_image_path = "/root/autodl-tmp/DiffSynth-Studio/data/images/replace_with_train_image.jpg"
+    inference_input_image_path = "/root/autodl-tmp/DiffSynth-Studio/data/images/001Bulbasaur.png"
     inference_input_image_strengths = [0.2, 0.4, 0.6]
     inference_input_output_root = "complextro_xpred_i2i_sweep"
 
@@ -376,8 +376,8 @@ if __name__ == "__main__":
     )
 
     enable_debug_xpred = True
-    debug_image_path = "/root/autodl-tmp/DiffSynth-Studio/data/images/replace_with_train_image.jpg"
-    debug_prompt = "replace with the exact training prompt"
+    debug_image_path = "/root/autodl-tmp/DiffSynth-Studio/data/images/001Bulbasaur.png"
+    debug_prompt = "green, lizard, plant, Grass, Poison, seed on back, red eyes, smiling expression, short stout limbs, sharp claws"
     debug_out_dir = "debug_xpred"
     debug_t_value = 0.5
     debug_seed = 0
