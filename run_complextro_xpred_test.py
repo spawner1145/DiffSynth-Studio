@@ -249,17 +249,6 @@ def debug_xpred_once(
     models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
     x_pred = pipe.model_fn(**models, **inputs_shared, **inputs_posi, timestep=t.flatten()).float()
 
-    final_image = pipe(
-        prompt=prompt,
-        negative_prompt="",
-        num_inference_steps=30,
-        cfg_scale=1.0,
-        seed=seed,
-        height=image_pil.height,
-        width=image_pil.width,
-        omni_mode=False,
-    )
-
     def save_tensor_image(tensor, path):
         tensor = tensor.detach().cpu().clamp(-1, 1)
         tensor = (tensor + 1.0) / 2.0
@@ -269,7 +258,6 @@ def debug_xpred_once(
     save_tensor_image(noise.clamp(-1, 1), os.path.join(out_dir, "noise_vis.png"))
     save_tensor_image(z, os.path.join(out_dir, f"z_t{t_value:.2f}.png"))
     save_tensor_image(x_pred, os.path.join(out_dir, f"xpred_t{t_value:.2f}.png"))
-    final_image.save(os.path.join(out_dir, "final_sample.png"))
 
     pipe.load_models_to_device([])
 
@@ -376,7 +364,7 @@ if __name__ == "__main__":
         qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/Qwen3_5_2b_claude_heretic",
         qwen_model_size="2B",
         siglip_model_file="",
-        vae_type="pixel:32",
+        vae_type="pixel:16",
         use_alpha_layer_vae=False,
         prediction_type="jit_xpred",
         jit_sampling_method="heun",
