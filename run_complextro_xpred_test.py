@@ -195,8 +195,8 @@ def debug_xpred_once(
     t_value: float = 0.5,
     seed: int = 0,
 ):
-    if pipe.prediction_type != "jit_xpred":
-        raise ValueError("debug_xpred_once requires prediction_type='jit_xpred'.")
+    if pipe.prediction_type not in ("jit_xpred", "bridge_xpred"):
+        raise ValueError("debug_xpred_once requires prediction_type='jit_xpred' or 'bridge_xpred'.")
     if not isinstance(pipe.vae, PixelIdentityVAE):
         raise ValueError("debug_xpred_once requires pixel-space Complextro (PixelIdentityVAE).")
 
@@ -247,7 +247,11 @@ def debug_xpred_once(
         inputs_shared, inputs_posi, inputs_nega = pipe.unit_runner(unit, pipe, inputs_shared, inputs_posi, inputs_nega)
 
     models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
-    x_pred = pipe.model_fn(**models, **inputs_shared, **inputs_posi, timestep=t.flatten()).float()
+    model_pred = pipe.model_fn(**models, **inputs_shared, **inputs_posi, timestep=t.flatten()).float()
+    if pipe.prediction_type == "bridge_xpred":
+        x_pred = z + (1.0 - t) * model_pred
+    else:
+        x_pred = model_pred
 
     def save_tensor_image(tensor, path):
         tensor = tensor.detach().cpu().clamp(-1, 1)

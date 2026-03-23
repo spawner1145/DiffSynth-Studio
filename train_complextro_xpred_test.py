@@ -13,6 +13,7 @@ from diffsynth.diffusion import (
     DiffusionTrainingModule,
     FlowMatchSFTLoss,
     JiTXPredLoss,
+    BridgeXPredLoss,
     ModelLogger,
     launch_training_task,
 )
@@ -93,8 +94,8 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         self.pipe.jit_sampling_method = str(jit_sampling_method)
         self.pipe.jit_cfg_interval_min = float(jit_cfg_interval_min)
         self.pipe.jit_cfg_interval_max = float(jit_cfg_interval_max)
-        if self.pipe.prediction_type == "jit_xpred" and int(self.vae_spec["latent_downsample_factor"]) != 1:
-            raise NotImplementedError("JiT-style x-pred training requires pixel-space Complextro (use vae_type='pixel' or 'pixel:<patch_size>').")
+        if self.pipe.prediction_type in ("jit_xpred", "bridge_xpred") and int(self.vae_spec["latent_downsample_factor"]) != 1:
+            raise NotImplementedError("JiT-style pixel-space training requires pixel-space Complextro (use vae_type='pixel' or 'pixel:<patch_size>').")
 
         if enable_vram_offload:
             if vram_config is None:
@@ -385,6 +386,8 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
 
         if self.pipe.prediction_type == "jit_xpred":
             loss = JiTXPredLoss(self.pipe, **inputs_shared, **inputs_posi)
+        elif self.pipe.prediction_type == "bridge_xpred":
+            loss = BridgeXPredLoss(self.pipe, **inputs_shared, **inputs_posi)
         else:
             loss = FlowMatchSFTLoss(self.pipe, **inputs_shared, **inputs_posi)
         return loss

@@ -47,9 +47,7 @@ def JiTXPredLoss(pipe: BasePipeline, **inputs):
     latents = t * x_fp32 + (1 - t) * noise
 
     inputs["latents"] = latents.to(dtype=pipe.torch_dtype)
-    # JiT feeds t in [0, 1] directly into the model. model_fn_complextro divides
-    # by 1000 and ComplextroImageDiT multiplies by 1000 inside time_text_embed,
-    # so passing raw t here preserves JiT's effective timestep scale.
+    # JiT 直接归一到[0,1]的
     timestep = t.flatten()
     models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
     x_pred = pipe.model_fn(**models, **inputs, timestep=timestep)
@@ -59,6 +57,31 @@ def JiTXPredLoss(pipe: BasePipeline, **inputs):
     v_pred = (x_pred.float() - latents) / denom
 
     loss = (v_target - v_pred).pow(2).flatten(1).mean(1).mean()
+    return loss
+
+
+def BridgeXPredLoss(pipe: BasePipeline, **inputs):
+    if hasattr(pipe, "_get_vae_downsample_factor") and int(pipe._get_vae_downsample_factor()) != 1:
+        raise NotImplementedError("Bridge x-pred training is only valid for pixel-space inputs (VAE downsample factor must be 1).")
+    x = inputs["input_latents"]
+    batch_size = x.shape[0]
+    p_mean = float(inputs.get("jit_p_mean", getattr(pipe, "jit_p_mean", -0.8)))
+    p_std = float(inputs.get("jit_p_std", getattr(pipe, "jit_p_std", 0.8)))
+    noise_scale = float(inputs.get("jit_noise_scale", getattr(pipe, "jit_noise_scale", 1.0)))
+
+    t = torch.randn(batch_size, device=x.device, dtype=torch.float32) * p_std + p_mean
+    t = torch.sigmoid(t).view(batch_size, *([1] * (x.ndim - 1)))
+    x_fp32 = x.float()
+    noise = torch.randn_like(x_fp32) * noise_scale
+    latents = t * x_fp32 + (1 - t) * noise
+
+    inputs["latents"] = latents.to(dtype=pipe.torch_dtype)
+    timestep = t.flatten()
+    models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
+    bridge_pred = pipe.model_fn(**models, **inputs, timestep=timestep)
+
+    bridge_target = x_fp32 - noise
+    loss = (bridge_pred.float() - bridge_target).pow(2).flatten(1).mean(1).mean()
     return loss
 
 

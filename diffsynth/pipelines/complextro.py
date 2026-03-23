@@ -136,6 +136,33 @@ class ComplextroPipeline(BasePipeline):
             return v_pred_posi
         return v_pred_nega + cfg_scale * (v_pred_posi - v_pred_nega)
 
+    def _bridge_cfg_guided_velocity(
+        self,
+        models,
+        inputs_shared,
+        inputs_posi,
+        inputs_nega,
+        latents: torch.Tensor,
+        t: torch.Tensor,
+        cfg_scale: float,
+    ) -> torch.Tensor:
+        timestep = t.flatten()
+        model_inputs = dict(inputs_shared)
+        model_inputs["latents"] = latents.to(device=self.device, dtype=self.torch_dtype)
+        v_pred_posi = self.model_fn(**models, **model_inputs, **inputs_posi, timestep=timestep)
+        v_pred_posi = v_pred_posi.to(device=latents.device, dtype=torch.float32)
+        if cfg_scale == 1.0:
+            return v_pred_posi
+
+        v_pred_nega = self.model_fn(**models, **model_inputs, **inputs_nega, timestep=timestep)
+        v_pred_nega = v_pred_nega.to(device=latents.device, dtype=torch.float32)
+        low = float(self.jit_cfg_interval_min)
+        high = float(self.jit_cfg_interval_max)
+        apply_cfg = bool(float(t.flatten()[0]) < high and (low == 0.0 or float(t.flatten()[0]) > low))
+        if not apply_cfg:
+            return v_pred_posi
+        return v_pred_nega + cfg_scale * (v_pred_posi - v_pred_nega)
+
     def _jit_euler_step(self, models, inputs_shared, inputs_posi, inputs_nega, latents, t, t_next, cfg_scale):
         v_pred = self._jit_cfg_guided_velocity(models, inputs_shared, inputs_posi, inputs_nega, latents, t, cfg_scale)
         latents_fp32 = latents.to(device=latents.device, dtype=torch.float32)
@@ -148,6 +175,22 @@ class ComplextroPipeline(BasePipeline):
         delta = (t_next - t).to(device=latents.device, dtype=torch.float32)
         latents_euler = latents_fp32 + delta * v_pred_t
         v_pred_t_next = self._jit_cfg_guided_velocity(
+            models, inputs_shared, inputs_posi, inputs_nega, latents_euler, t_next, cfg_scale
+        )
+        return latents_fp32 + delta * 0.5 * (v_pred_t + v_pred_t_next)
+
+    def _bridge_euler_step(self, models, inputs_shared, inputs_posi, inputs_nega, latents, t, t_next, cfg_scale):
+        v_pred = self._bridge_cfg_guided_velocity(models, inputs_shared, inputs_posi, inputs_nega, latents, t, cfg_scale)
+        latents_fp32 = latents.to(device=latents.device, dtype=torch.float32)
+        delta = (t_next - t).to(device=latents.device, dtype=torch.float32)
+        return latents_fp32 + delta * v_pred
+
+    def _bridge_heun_step(self, models, inputs_shared, inputs_posi, inputs_nega, latents, t, t_next, cfg_scale):
+        v_pred_t = self._bridge_cfg_guided_velocity(models, inputs_shared, inputs_posi, inputs_nega, latents, t, cfg_scale)
+        latents_fp32 = latents.to(device=latents.device, dtype=torch.float32)
+        delta = (t_next - t).to(device=latents.device, dtype=torch.float32)
+        latents_euler = latents_fp32 + delta * v_pred_t
+        v_pred_t_next = self._bridge_cfg_guided_velocity(
             models, inputs_shared, inputs_posi, inputs_nega, latents_euler, t_next, cfg_scale
         )
         return latents_fp32 + delta * 0.5 * (v_pred_t + v_pred_t_next)
@@ -260,10 +303,10 @@ class ComplextroPipeline(BasePipeline):
         use_gradient_checkpointing_offload: bool = False,
         progress_bar_cmd=tqdm,
     ):
-        if self.prediction_type == "jit_xpred":
+        if self.prediction_type in ("jit_xpred", "bridge_xpred"):
             self.scheduler.training = False
             if self._get_vae_downsample_factor() != 1:
-                raise NotImplementedError("JiT-style x-pred inference is only implemented for pixel-space Complextro.")
+                raise NotImplementedError("JiT-style pixel-space inference is only implemented for pixel-space Complextro.")
             t_start = 1.0 - float(denoising_strength)
             t_start = max(0.0, min(1.0, t_start))
             self._jit_t_start = t_start
@@ -331,7 +374,7 @@ class ComplextroPipeline(BasePipeline):
 
         self.load_models_to_device(self.in_iteration_models)
         models = {name: getattr(self, name) for name in self.in_iteration_models}
-        if self.prediction_type == "jit_xpred":
+        if self.prediction_type in ("jit_xpred", "bridge_xpred"):
             old_cfg_min = self.jit_cfg_interval_min
             old_cfg_max = self.jit_cfg_interval_max
             try:
@@ -348,12 +391,18 @@ class ComplextroPipeline(BasePipeline):
                 for progress_id, _ in enumerate(progress_bar_cmd(timesteps[:-1])):
                     t = timesteps[progress_id].view(1)
                     t_next = timesteps[progress_id + 1].view(1)
+                    if self.prediction_type == "jit_xpred":
+                        euler_step = self._jit_euler_step
+                        heun_step = self._jit_heun_step
+                    else:
+                        euler_step = self._bridge_euler_step
+                        heun_step = self._bridge_heun_step
                     if step_method == "euler" or progress_id + 1 >= int(num_inference_steps):
-                        inputs_shared["latents"] = self._jit_euler_step(
+                        inputs_shared["latents"] = euler_step(
                             models, inputs_shared, inputs_posi, inputs_nega, inputs_shared["latents"], t, t_next, cfg_scale
                         )
                     elif step_method == "heun":
-                        inputs_shared["latents"] = self._jit_heun_step(
+                        inputs_shared["latents"] = heun_step(
                             models, inputs_shared, inputs_posi, inputs_nega, inputs_shared["latents"], t, t_next, cfg_scale
                         )
                     else:
@@ -611,7 +660,7 @@ class ComplextroUnit_InputImageEmbedder(PipelineUnit):
         image_dtype = torch.float32 if isinstance(pipe.vae, PixelIdentityVAE) else pipe.torch_dtype
         image = image.to(device=pipe.device, dtype=image_dtype)
         input_latents = pipe.vae.encode(image)
-        if pipe.prediction_type == "jit_xpred" and not pipe.scheduler.training:
+        if pipe.prediction_type in ("jit_xpred", "bridge_xpred") and not pipe.scheduler.training:
             t_start = float(getattr(pipe, "_jit_t_start", 0.0))
             latents = t_start * input_latents.float() + (1.0 - t_start) * noise.float() * float(pipe.jit_noise_scale)
             return {"latents": latents, "input_latents": input_latents}

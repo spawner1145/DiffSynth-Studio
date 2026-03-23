@@ -12,6 +12,7 @@ from diffsynth.diffusion import (
     DiffusionTrainingModule,
     FlowMatchSFTLoss,
     JiTXPredLoss,
+    BridgeXPredLoss,
     ModelLogger,
     launch_training_task,
 )
@@ -92,7 +93,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         self.pipe.jit_sampling_method = str(jit_sampling_method)
         self.pipe.jit_cfg_interval_min = float(jit_cfg_interval_min)
         self.pipe.jit_cfg_interval_max = float(jit_cfg_interval_max)
-        if self.pipe.prediction_type == "jit_xpred" and int(self.vae_spec["latent_downsample_factor"]) != 1:
+        if self.pipe.prediction_type in ("jit_xpred", "bridge_xpred") and int(self.vae_spec["latent_downsample_factor"]) != 1:
             raise NotImplementedError("JiT-style x-pred training requires pixel-space Complextro (use vae_type='pixel' or 'pixel:<patch_size>').")
 
         if enable_vram_offload:
@@ -384,6 +385,8 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
 
         if self.pipe.prediction_type == "jit_xpred":
             loss = JiTXPredLoss(self.pipe, **inputs_shared, **inputs_posi)
+        elif self.pipe.prediction_type == "bridge_xpred":
+            loss = BridgeXPredLoss(self.pipe, **inputs_shared, **inputs_posi)
         else:
             loss = FlowMatchSFTLoss(self.pipe, **inputs_shared, **inputs_posi)
         return loss
@@ -407,7 +410,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=2, help="训练 batch size")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="学习率")
-    parser.add_argument("--prediction_type", type=str, default="flow", help="Training target type: flow / jit_xpred")
+    parser.add_argument("--prediction_type", type=str, default="flow", help="Training target type: flow / jit_xpred / bridge_xpred")
     parser.add_argument("--condition_drop_prob", type=float, default=0.0, help="Classifier-free condition dropout probability used during training")
     parser.add_argument("--jit_p_mean", type=float, default=-0.8, help="JiT x-pred logit-normal P_mean")
     parser.add_argument("--jit_p_std", type=float, default=0.8, help="JiT x-pred logit-normal P_std")
