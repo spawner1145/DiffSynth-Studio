@@ -249,7 +249,10 @@ def debug_xpred_once(
     models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
     model_pred = pipe.model_fn(**models, **inputs_shared, **inputs_posi, timestep=t.flatten()).float()
     if pipe.prediction_type == "bridge_xpred":
-        x_pred = z + (1.0 - t) * model_pred
+        lambda2 = t.pow(2) + (1.0 - t).pow(2)
+        mean_t = (t / lambda2.clamp_min(float(pipe.jit_t_eps))) * z
+        scale = ((1.0 - t) / lambda2.clamp_min(float(pipe.jit_t_eps)).sqrt()).clamp_min(float(pipe.jit_t_eps))
+        x_pred = mean_t + scale * model_pred
     else:
         x_pred = model_pred
 

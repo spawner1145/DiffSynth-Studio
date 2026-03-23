@@ -149,13 +149,30 @@ class ComplextroPipeline(BasePipeline):
         timestep = t.flatten()
         model_inputs = dict(inputs_shared)
         model_inputs["latents"] = latents.to(device=self.device, dtype=self.torch_dtype)
-        v_pred_posi = self.model_fn(**models, **model_inputs, **inputs_posi, timestep=timestep)
-        v_pred_posi = v_pred_posi.to(device=latents.device, dtype=torch.float32)
+        r_pred_posi = self.model_fn(**models, **model_inputs, **inputs_posi, timestep=timestep)
+        r_pred_posi = r_pred_posi.to(device=latents.device, dtype=torch.float32)
+        t_fp32 = t.to(device=latents.device, dtype=torch.float32)
+        lambda2 = t_fp32.pow(2) + (1.0 - t_fp32).pow(2)
+        mean_t = (t_fp32 / lambda2.clamp_min(float(self.jit_t_eps))).to(dtype=torch.float32)
+        scale = ((1.0 - t_fp32) / lambda2.clamp_min(float(self.jit_t_eps)).sqrt()).to(dtype=torch.float32)
+        scale = scale.clamp_min(float(self.jit_t_eps))
+        while mean_t.ndim < latents.ndim:
+            mean_t = mean_t.unsqueeze(-1)
+        while scale.ndim < latents.ndim:
+            scale = scale.unsqueeze(-1)
+        latents_fp32 = latents.to(device=latents.device, dtype=torch.float32)
+        x_pred_posi = mean_t * latents_fp32 + scale * r_pred_posi
+        denom = (1.0 - t).clamp_min(float(self.jit_t_eps)).to(device=latents.device, dtype=torch.float32)
+        while denom.ndim < latents.ndim:
+            denom = denom.unsqueeze(-1)
+        v_pred_posi = (x_pred_posi - latents_fp32) / denom
         if cfg_scale == 1.0:
             return v_pred_posi
 
-        v_pred_nega = self.model_fn(**models, **model_inputs, **inputs_nega, timestep=timestep)
-        v_pred_nega = v_pred_nega.to(device=latents.device, dtype=torch.float32)
+        r_pred_nega = self.model_fn(**models, **model_inputs, **inputs_nega, timestep=timestep)
+        r_pred_nega = r_pred_nega.to(device=latents.device, dtype=torch.float32)
+        x_pred_nega = mean_t * latents_fp32 + scale * r_pred_nega
+        v_pred_nega = (x_pred_nega - latents_fp32) / denom
         low = float(self.jit_cfg_interval_min)
         high = float(self.jit_cfg_interval_max)
         apply_cfg = bool(float(t.flatten()[0]) < high and (low == 0.0 or float(t.flatten()[0]) > low))

@@ -68,6 +68,7 @@ def BridgeXPredLoss(pipe: BasePipeline, **inputs):
     p_mean = float(inputs.get("jit_p_mean", getattr(pipe, "jit_p_mean", -0.8)))
     p_std = float(inputs.get("jit_p_std", getattr(pipe, "jit_p_std", 0.8)))
     noise_scale = float(inputs.get("jit_noise_scale", getattr(pipe, "jit_noise_scale", 1.0)))
+    t_eps = float(inputs.get("jit_t_eps", getattr(pipe, "jit_t_eps", 5e-2)))
 
     t = torch.randn(batch_size, device=x.device, dtype=torch.float32) * p_std + p_mean
     t = torch.sigmoid(t).view(batch_size, *([1] * (x.ndim - 1)))
@@ -78,10 +79,18 @@ def BridgeXPredLoss(pipe: BasePipeline, **inputs):
     inputs["latents"] = latents.to(dtype=pipe.torch_dtype)
     timestep = t.flatten()
     models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
-    bridge_pred = pipe.model_fn(**models, **inputs, timestep=timestep)
+    bridge_pred = pipe.model_fn(**models, **inputs, timestep=timestep).float()
 
-    bridge_target = x_fp32 - noise
-    loss = (bridge_pred.float() - bridge_target).pow(2).flatten(1).mean(1).mean()
+    # 灵感可以参考这两篇：
+    # Albergo et al., "Stochastic Interpolants: A Unifying Framework for Flows and Diffusions" (JMLR 2025)
+    # Shaul et al., "Flow Map Matching with Stochastic Interpolants" (TMLR 2025)
+    
+    lambda2 = t.pow(2) + (1 - t).pow(2)
+    mean_t = (t / lambda2.clamp_min(t_eps)) * latents
+    scale = (1 - t) / lambda2.clamp_min(t_eps).sqrt()
+    scale = scale.clamp_min(t_eps)
+    bridge_target = (x_fp32 - mean_t) / scale
+    loss = (bridge_pred - bridge_target).pow(2).flatten(1).mean(1).mean()
     return loss
 
 
