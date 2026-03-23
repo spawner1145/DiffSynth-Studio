@@ -59,8 +59,6 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
     ):
         super().__init__()
         self.train_omni = train_omni
-        if str(prediction_type) == "jit_xpred" and float(condition_drop_prob) == 0.0:
-            condition_drop_prob = 0.1
         self.condition_drop_prob = float(condition_drop_prob)
         self.complextro_model_config = {} if complextro_model_config is None else dict(complextro_model_config)
         self.enable_vram_offload = enable_vram_offload
