@@ -343,6 +343,7 @@ if __name__ == "__main__":
         "num_attention_heads": 24,
         "attention_head_dim": 96,
         "rope_axes_dim": [32, 32, 32],
+        "use_text_modulation": True,
     }
 
     inference_num_inference_steps = 50
@@ -352,7 +353,7 @@ if __name__ == "__main__":
     inference_output_root = "complextro_xpred_sweep"
     inference_test_input_image = True
     inference_input_image_path = "/root/autodl-tmp/DiffSynth-Studio/data/images/001Bulbasaur.png"
-    inference_input_image_strengths = [0.2, 0.4, 0.6]
+    inference_input_image_strengths = [0.2, 0.4, 0.6, 0.7, 0.8, 0.9, 1.0]
     inference_input_output_root = "complextro_xpred_i2i_sweep"
 
     pipe = build_complextro_pipe(

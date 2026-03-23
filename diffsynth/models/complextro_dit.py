@@ -658,8 +658,8 @@ class ComplextroImageDiT(torch.nn.Module):
         self.latent_downsample_factor = int(latent_downsample_factor)
         self.latent_patch_size = int(latent_patch_size)
         self.latent_channels = int(in_channels)
-        self.use_unified_token_type_modulation = bool(use_unified_token_type_modulation)
-        self.use_omni_token_type_modulation = bool(use_omni_token_type_modulation)
+        self.use_unified_token_type_modulation = bool(use_unified_token_type_modulation or use_text_modulation)
+        self.use_omni_token_type_modulation = bool(use_omni_token_type_modulation or use_text_modulation)
         self.use_token_type_embedding = bool(use_token_type_embedding)
         self.enable_tread_routing = bool(enable_tread_routing)
         self.use_text_modulation = bool(use_text_modulation)
@@ -689,6 +689,7 @@ class ComplextroImageDiT(torch.nn.Module):
         self.img_in = nn.Linear(self.img_token_dim, self.hidden_size)
         self.txt_in = nn.Linear(text_embed_dim, self.hidden_size)
         self.text_pool_proj = nn.Linear(text_embed_dim, self.hidden_size) if self.use_text_modulation else None
+        self.edit_pool_proj = nn.Linear(self.hidden_size, self.hidden_size) if self.use_text_modulation else None
         self.image_pad_token = nn.Parameter(torch.empty((1, self.img_token_dim)))
         self.token_type_embed = nn.Embedding(4, self.hidden_size) if self.use_token_type_embedding else None
 
@@ -709,7 +710,7 @@ class ComplextroImageDiT(torch.nn.Module):
                     dim=self.hidden_size,
                     num_attention_heads=self.num_attention_heads,
                     attention_head_dim=self.attention_head_dim,
-                    modulation=False,
+                    modulation=self.use_text_modulation,
                 )
                 for _ in range(num_refiner_layers)
             ]
@@ -778,7 +779,7 @@ class ComplextroImageDiT(torch.nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
 
-        for block in list(self.transformer_blocks) + list(self.noise_refiner):
+        for block in list(self.transformer_blocks) + list(self.noise_refiner) + list(self.context_refiner):
             if block.modulation:
                 # DiT-style adaLN-Zero: start each modulated block close to identity.
                 nn.init.zeros_(block.modulation_mlp[-1].weight)
@@ -800,6 +801,20 @@ class ComplextroImageDiT(torch.nn.Module):
         else:
             pooled = prompt_emb.mean(dim=1)
         return self.text_pool_proj(pooled)
+
+    def _compute_edit_pool_conditioning(
+        self,
+        image_tokens: torch.Tensor,
+        cond_token_mask: torch.Tensor,
+    ) -> Optional[torch.Tensor]:
+        if self.edit_pool_proj is None:
+            return None
+        cond_token_mask = cond_token_mask.to(device=image_tokens.device, dtype=image_tokens.dtype)
+        if float(cond_token_mask.sum().item()) <= 0.0:
+            return None
+        pooled = (image_tokens * cond_token_mask.unsqueeze(-1)).sum(dim=0, keepdim=True)
+        pooled = pooled / cond_token_mask.sum().clamp(min=1.0)
+        return self.edit_pool_proj(pooled)
 
     def _resolve_token_type_embed_ids(self, token_type_ids: torch.Tensor) -> torch.Tensor:
         token_type_ids = token_type_ids.clamp(TOKEN_TYPE_TEXT, TOKEN_TYPE_COND_IMAGE)
@@ -823,6 +838,12 @@ class ComplextroImageDiT(torch.nn.Module):
             state_dict["text_pool_proj.weight"] = self.text_pool_proj.weight.detach().clone()
             if self.text_pool_proj.bias is not None:
                 state_dict["text_pool_proj.bias"] = self.text_pool_proj.bias.detach().clone()
+        if self.edit_pool_proj is not None and "edit_pool_proj.weight" not in state_dict:
+            if not isinstance(state_dict, dict):
+                state_dict = dict(state_dict)
+            state_dict["edit_pool_proj.weight"] = self.edit_pool_proj.weight.detach().clone()
+            if self.edit_pool_proj.bias is not None:
+                state_dict["edit_pool_proj.bias"] = self.edit_pool_proj.bias.detach().clone()
 
         if not isinstance(state_dict, dict):
             state_dict = dict(state_dict)
@@ -1509,10 +1530,23 @@ class ComplextroImageDiT(torch.nn.Module):
 
                 image_tokens = torch.cat(image_tokens_list, dim=0)
                 image_tokens = self.img_in(image_tokens)
+                cond_token_mask = []
+                for image_idx, image_len in enumerate(length_list):
+                    is_cond_image = image_idx != len(length_list) - 1
+                    cond_token_mask.extend([1 if is_cond_image else 0] * image_len)
+                cond_token_mask = torch.tensor(cond_token_mask, dtype=image_tokens.dtype, device=image_tokens.device)
+                edit_pool_cond = self._compute_edit_pool_conditioning(image_tokens, cond_token_mask)
+                local_conditioning_noisy = conditioning_noisy[b : b + 1]
+                local_conditioning_clean = conditioning_clean[b : b + 1]
+                if edit_pool_cond is not None:
+                    local_conditioning_noisy = local_conditioning_noisy + edit_pool_cond
+                    local_conditioning_clean = local_conditioning_clean + edit_pool_cond
+                    conditioning_noisy[b : b + 1] = local_conditioning_noisy
+                    conditioning_clean[b : b + 1] = local_conditioning_clean
                 image_temb = self._build_per_token_temb(
                     image_token_noise_mask,
-                    conditioning_noisy[b : b + 1],
-                    conditioning_clean[b : b + 1],
+                    local_conditioning_noisy,
+                    local_conditioning_clean,
                 )
                 image_freqs_for_refiner, _ = self._build_omni_image_freqs(
                     image_sizes=size_list,
@@ -1707,6 +1741,13 @@ class ComplextroImageDiT(torch.nn.Module):
                     use_gradient_checkpointing=use_gradient_checkpointing,
                     use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
                     hidden_states=batched_text_tokens,
+                    temb=conditioning_noisy,
+                    token_type_ids=torch.full(
+                        (batched_text_tokens.shape[0], batched_text_tokens.shape[1]),
+                        TOKEN_TYPE_TEXT,
+                        dtype=torch.long,
+                        device=prompt_emb.device,
+                    ) if block.modulation else None,
                     image_rotary_emb=batched_text_freqs_for_refiner,
                     attention_mask=text_refiner_key_mask,
                 )
@@ -1816,7 +1857,9 @@ class ComplextroImageDiT(torch.nn.Module):
 
                 active_key_mask = routed_key_mask if route_ids_keep is not None else key_mask
                 active_temb = routed_unified_temb if route_ids_keep is not None else unified_temb
-                active_token_types = routed_unified_token_types if route_ids_keep is not None else unified_token_types
+                active_token_types = None
+                if self.use_omni_token_type_modulation:
+                    active_token_types = routed_unified_token_types if route_ids_keep is not None else unified_token_types
 
                 unified = gradient_checkpoint_forward(
                     block,
@@ -1955,6 +1998,13 @@ class ComplextroImageDiT(torch.nn.Module):
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
                 hidden_states=text_tokens,
+                temb=conditioning,
+                token_type_ids=torch.full(
+                    (text_tokens.shape[0], text_tokens.shape[1]),
+                    TOKEN_TYPE_TEXT,
+                    dtype=torch.long,
+                    device=text_tokens.device,
+                ) if block.modulation else None,
                 image_rotary_emb=text_freqs_for_refiner,
                 attention_mask=text_key_mask,
             )

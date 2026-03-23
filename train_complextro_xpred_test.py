@@ -584,10 +584,10 @@ if __name__ == "__main__":
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=1)
     use_image_text_pairs = False  # True: 使用 ImageTextPairDataset（图片+txt目录），False: 使用 UnifiedDataset（metadata文件）
     train_omni = True
-    vae_type = "pixel:32"
+    vae_type = "pixel:16"
     prediction_type = "jit_xpred"
     condition_drop_prob = 0.0
-    jit_p_mean = -1.2
+    jit_p_mean = -1.5
     jit_p_std = 0.8
     jit_noise_scale = 1.0
     jit_t_eps = 5e-2
@@ -663,7 +663,7 @@ if __name__ == "__main__":
                 "end_layer_idx": 4,
             }
         ],
-        "use_text_modulation": False,
+        "use_text_modulation": True,
     }
 
     train_resolution = (256, 256)
