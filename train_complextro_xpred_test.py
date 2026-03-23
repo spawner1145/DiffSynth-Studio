@@ -584,9 +584,13 @@ if __name__ == "__main__":
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=1)
     use_image_text_pairs = False  # True: 使用 ImageTextPairDataset（图片+txt目录），False: 使用 UnifiedDataset（metadata文件）
     train_omni = True
-    vae_type = "flux2"
-    prediction_type = "flow"
+    vae_type = "pixel:16"
+    prediction_type = "jit_xpred"
     condition_drop_prob = 0.0
+    jit_p_mean = -1.2
+    jit_p_std = 0.8
+    jit_noise_scale = 1.0
+    jit_t_eps = 5e-2
     use_alpha_layer_vae = False
     vae_file = "/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors"
     siglip_model_file = ""
@@ -688,7 +692,7 @@ if __name__ == "__main__":
 
     if use_image_text_pairs:
         dataset = ImageTextPairDataset(
-            data_dir="/root/autodl-tmp/DiffSynth-Studio/edit/images",
+            data_dir="/root/autodl-tmp/DiffSynth-Studio/data/images",
             max_pixels=max_bucket_reso * max_bucket_reso,
             height_division_factor=image_division_factor,
             width_division_factor=image_division_factor,
@@ -707,13 +711,13 @@ if __name__ == "__main__":
             else ("image", "edit_image")
         )
         dataset = UnifiedDataset(
-            base_path="/root/autodl-tmp/DiffSynth-Studio/edit/images",
-            metadata_path="/root/autodl-tmp/DiffSynth-Studio/edit/metadata_merged.jsonl",
+            base_path="/root/autodl-tmp/DiffSynth-Studio/data/images",
+            metadata_path="/root/autodl-tmp/DiffSynth-Studio/data/metadata_merged.csv",
             max_data_items=10000000,
             data_file_keys=data_file_keys,
             special_operator_map={
                 "edit_latent": build_optional_edit_latent_operator(
-                    base_path="/root/autodl-tmp/DiffSynth-Studio/edit/images",
+                    base_path="/root/autodl-tmp/DiffSynth-Studio/data/images",
                     max_pixels=max_bucket_reso * max_bucket_reso,
                 ),
             },
@@ -727,7 +731,7 @@ if __name__ == "__main__":
             bucket_index_path=prebucket_index_path,
             jsonl_index_path=jsonl_index_path,
             main_data_operator=UnifiedDataset.default_image_operator(
-                base_path="/root/autodl-tmp/DiffSynth-Studio/edit/images",
+                base_path="/root/autodl-tmp/DiffSynth-Studio/data/images",
                 height=None,
                 width=None,
                 max_pixels=max_bucket_reso * max_bucket_reso,
@@ -747,6 +751,10 @@ if __name__ == "__main__":
         complextro_model_config=complextro_model_config,
         prediction_type=prediction_type,
         condition_drop_prob=condition_drop_prob,
+        jit_p_mean=jit_p_mean,
+        jit_p_std=jit_p_std,
+        jit_noise_scale=jit_noise_scale,
+        jit_t_eps=jit_t_eps,
         jit_sampling_method="heun",
         jit_cfg_interval_min=0.0,
         jit_cfg_interval_max=1.0,
@@ -759,8 +767,8 @@ if __name__ == "__main__":
     )
 
     args = argparse.Namespace(
-        lr_scheduler="constant",
         #lr_scheduler="warmup_stable_decay",
+        lr_scheduler="constant",
         #lr_warmup_steps=0.01,
         #lr_decay_steps=0.1,
         #lr_scheduler_min_lr_ratio=0.1,
