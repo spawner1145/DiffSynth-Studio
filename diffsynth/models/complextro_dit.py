@@ -22,7 +22,7 @@ except ModuleNotFoundError:
 
 class TreadRouter:
     def __init__(self):
-        super().__init__()
+        pass
 
     def get_mask(self, x, selection_rate=0.0):
         batch_size, num_patches, _ = x.shape
@@ -330,9 +330,6 @@ class ComplextroEmbedLayer3DRope(nn.Module):
             self.pos_freqs = self.pos_freqs.to(device)
             self.neg_freqs = self.neg_freqs.to(device)
 
-        video_fhw = [video_fhw]
-        if isinstance(video_fhw, list):
-            video_fhw = video_fhw[0]
         if not isinstance(video_fhw, list):
             video_fhw = [video_fhw]
 
@@ -1892,11 +1889,22 @@ class ComplextroImageDiT(torch.nn.Module):
                     route_idx += 1
                     current_route = self.tread_routes[route_idx] if route_idx < len(self.tread_routes) else None
 
-            image_tokens = unified
-            image_tokens = self.norm_out(image_tokens, conditioning_noisy)
-            image_tokens = self.proj_out(image_tokens)
+            # Extract only image tokens before norm_out/proj_out to avoid
+            # wasting computation on text/siglip tokens that will be discarded.
+            image_token_list = []
+            for i, (start, end) in enumerate(x_pos_offsets):
+                img_tok = unified[i, start:end, :].unsqueeze(0)
+                img_tok = self.norm_out(img_tok, conditioning_noisy[i:i+1])
+                img_tok = self.proj_out(img_tok)
+                image_token_list.append(img_tok.squeeze(0))
 
-            outputs = self._unpatchify_omni(image_tokens, x_sizes, x_lengths, x_pos_offsets)
+            # _unpatchify_omni expects per-sample tokens; since we already
+            # sliced to [start:end], use zero-based offsets.
+            zero_offsets = [(0, end - start) for start, end in x_pos_offsets]
+            outputs = self._unpatchify_omni(
+                image_token_list,
+                x_sizes, x_lengths, zero_offsets,
+            )
             outputs = [out.unsqueeze(0) for out in outputs]
             return torch.cat(outputs, dim=0)
 

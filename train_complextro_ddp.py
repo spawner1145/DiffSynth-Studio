@@ -53,6 +53,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         jit_sampling_method: str = "heun",
         jit_cfg_interval_min: float = 0.0,
         jit_cfg_interval_max: float = 1.0,
+        jit_loss_weighting: str = "balanced",
         enable_vram_offload: bool = False,
         vram_config: Optional[dict] = None,
         vram_limit: Optional[float] = None,
@@ -93,6 +94,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         self.pipe.jit_sampling_method = str(jit_sampling_method)
         self.pipe.jit_cfg_interval_min = float(jit_cfg_interval_min)
         self.pipe.jit_cfg_interval_max = float(jit_cfg_interval_max)
+        self.pipe.jit_loss_weighting = str(jit_loss_weighting)
         if self.pipe.prediction_type in ("jit_xpred", "bridge_xpred") and int(self.vae_spec["latent_downsample_factor"]) != 1:
             raise NotImplementedError("JiT-style x-pred training requires pixel-space Complextro (use vae_type='pixel' or 'pixel:<patch_size>').")
 
@@ -419,6 +421,7 @@ if __name__ == "__main__":
     parser.add_argument("--jit_sampling_method", type=str, default="heun", help="JiT x-pred sampling method: euler / heun")
     parser.add_argument("--jit_cfg_interval_min", type=float, default=0.0, help="JiT x-pred CFG interval minimum t")
     parser.add_argument("--jit_cfg_interval_max", type=float, default=1.0, help="JiT x-pred CFG interval maximum t")
+    parser.add_argument("--jit_loss_weighting", type=str, default="balanced", help="JiT x-pred loss weighting: velocity / balanced / x_pred")
     parser.add_argument("--lr_scheduler", type=str, default="constant", help="学习率调度器名称，例如 constant / warmup_stable_decay")
     parser.add_argument("--lr_warmup_steps", type=float, default=0, help="warmup 步数；传小数时按总步数比例计算")
     parser.add_argument("--lr_decay_steps", type=float, default=0, help="decay 步数；传小数时按总步数比例计算")
@@ -700,6 +703,7 @@ if __name__ == "__main__":
         jit_sampling_method=args.jit_sampling_method,
         jit_cfg_interval_min=args.jit_cfg_interval_min,
         jit_cfg_interval_max=args.jit_cfg_interval_max,
+        jit_loss_weighting=args.jit_loss_weighting,
         enable_vram_offload=enable_vram_offload,
         vram_config=vram_config,
     )

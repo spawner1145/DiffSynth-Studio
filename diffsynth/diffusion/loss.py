@@ -31,6 +31,18 @@ def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
 
 
 def JiTXPredLoss(pipe: BasePipeline, **inputs):
+    """JiT x-prediction loss (velocity parameterization).
+
+    The raw velocity loss = ||x - x_pred||² / (1-t)² implicitly up-weights
+    low-noise (high t) samples by a factor of 1/(1-t)², starving the high-noise
+    (low t) region of gradient signal.  This is why a model can show extremely
+    low loss yet fail completely at text-to-image (which starts from t=0).
+
+    We support an optional ``jit_loss_weighting`` mode (configurable on pipe):
+      - "velocity"  : original JiT velocity loss, no correction (default)
+      - "x_pred"    : multiply by (1-t)² to fully cancel → equivalent to MSE on x_pred
+      - "balanced"  : multiply by (1-t)  → partial correction (recommended)
+    """
     if hasattr(pipe, "_get_vae_downsample_factor") and int(pipe._get_vae_downsample_factor()) != 1:
         raise NotImplementedError("JiT-style x-pred training is only valid for pixel-space inputs (VAE downsample factor must be 1).")
     x = inputs["input_latents"]
@@ -56,7 +68,24 @@ def JiTXPredLoss(pipe: BasePipeline, **inputs):
     v_target = (x_fp32 - latents) / denom
     v_pred = (x_pred.float() - latents) / denom
 
-    loss = (v_target - v_pred).pow(2).flatten(1).mean(1).mean()
+    per_sample_mse = (v_target - v_pred).pow(2).flatten(1).mean(1)
+
+    # Apply loss weighting to counteract the implicit 1/(1-t)² in velocity loss.
+    # Without correction, high-t (low-noise) samples dominate gradients and the
+    # model never learns to denoise from pure noise (low-t).
+    loss_weighting = str(inputs.get("jit_loss_weighting", getattr(pipe, "jit_loss_weighting", "balanced")))
+    t_flat = t.flatten()
+    if loss_weighting == "x_pred":
+        # Full correction: effective loss = ||x - x_pred||² (uniform across t)
+        weight = (1.0 - t_flat).clamp_min(t_eps).pow(2)
+    elif loss_weighting == "balanced":
+        # Partial correction: effective loss = ||x - x_pred||² / (1-t) (recommended)
+        weight = (1.0 - t_flat).clamp_min(t_eps)
+    else:
+        # "velocity": original JiT, no correction
+        weight = torch.ones_like(t_flat)
+
+    loss = (per_sample_mse * weight).mean()
     return loss
 
 
@@ -86,6 +115,11 @@ def BridgeXPredLoss(pipe: BasePipeline, **inputs):
     # Shaul et al., "Flow Map Matching with Stochastic Interpolants" (TMLR 2025)
     
     lambda2 = t.pow(2) + (1 - t).pow(2)
+    # NOTE: here mean_t includes the latents multiplication, i.e.
+    # mean_t = (t / λ²) * z.  In the inference counterpart
+    # (_bridge_cfg_guided_velocity), mean_t is defined as just the
+    # scalar coefficient (t / λ²), and then multiplied by latents
+    # separately.  The two are mathematically equivalent.
     mean_t = (t / lambda2.clamp_min(t_eps)) * latents
     scale = (1 - t) / lambda2.clamp_min(t_eps).sqrt()
     scale = scale.clamp_min(t_eps)

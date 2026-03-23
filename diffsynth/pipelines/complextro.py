@@ -46,6 +46,7 @@ class ComplextroPipeline(BasePipeline):
         self.jit_sampling_method = "heun"
         self.jit_cfg_interval_min = 0.0
         self.jit_cfg_interval_max = 1.0
+        self.jit_loss_weighting = "balanced"  # "velocity" | "balanced" | "x_pred"
         self.in_iteration_models = ("dit",)
         self.units = [
             ComplextroUnit_ShapeChecker(),
@@ -153,6 +154,9 @@ class ComplextroPipeline(BasePipeline):
         r_pred_posi = r_pred_posi.to(device=latents.device, dtype=torch.float32)
         t_fp32 = t.to(device=latents.device, dtype=torch.float32)
         lambda2 = t_fp32.pow(2) + (1.0 - t_fp32).pow(2)
+        # NOTE: unlike BridgeXPredLoss where mean_t = (t/λ²) * latents (includes
+        # latents), here mean_t is just the scalar coefficient (t/λ²).  The actual
+        # conditional mean is reconstructed as mean_t * latents_fp32 below.
         mean_t = (t_fp32 / lambda2.clamp_min(float(self.jit_t_eps))).to(dtype=torch.float32)
         scale = ((1.0 - t_fp32) / lambda2.clamp_min(float(self.jit_t_eps)).sqrt()).to(dtype=torch.float32)
         scale = scale.clamp_min(float(self.jit_t_eps))
@@ -895,6 +899,12 @@ def model_fn_complextro(
     use_gradient_checkpointing_offload: bool = False,
     **kwargs,
 ):
+    # Timestep convention: both training (JiTXPredLoss / FlowMatchSFTLoss) and
+    # inference (_jit_cfg_guided_velocity / scheduler) pass timestep in the
+    # *original* scale (e.g. [0, 1] for x-pred, [0, 1000] for flow-match).
+    # Dividing by 1000 here is intentional — it is compensated inside
+    # ComplextroImageDiT.time_text_embed which uses TimestepEmbeddings(scale=1000),
+    # so the sinusoidal embedding ultimately sees the correct value.
     timestep_model = timestep / 1000
 
     if omni_mode and edit_latents is not None and len(edit_latents) > 0:

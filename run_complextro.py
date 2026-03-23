@@ -243,6 +243,7 @@ if __name__ == "__main__":
         "num_attention_heads": 24,
         "attention_head_dim": 96,
         "rope_axes_dim": [32, 32, 32],
+        "use_text_modulation": True,
     }
 
     pipe = build_complextro_pipe(

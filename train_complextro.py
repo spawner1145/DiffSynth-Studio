@@ -54,6 +54,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         jit_sampling_method: str = "heun",
         jit_cfg_interval_min: float = 0.0,
         jit_cfg_interval_max: float = 1.0,
+        jit_loss_weighting: str = "balanced",
         enable_vram_offload: bool = False,
         vram_config: Optional[dict] = None,
         vram_limit: Optional[float] = None,
@@ -94,6 +95,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         self.pipe.jit_sampling_method = str(jit_sampling_method)
         self.pipe.jit_cfg_interval_min = float(jit_cfg_interval_min)
         self.pipe.jit_cfg_interval_max = float(jit_cfg_interval_max)
+        self.pipe.jit_loss_weighting = str(jit_loss_weighting)
         if self.pipe.prediction_type in ("jit_xpred", "bridge_xpred") and int(self.vae_spec["latent_downsample_factor"]) != 1:
             raise NotImplementedError("JiT-style pixel-space training requires pixel-space Complextro (use vae_type='pixel' or 'pixel:<patch_size>').")
 
@@ -662,7 +664,7 @@ if __name__ == "__main__":
                 "end_layer_idx": 4,
             }
         ],
-        "use_text_modulation": False,
+        "use_text_modulation": True,
     }
 
     train_resolution = (256, 256)
