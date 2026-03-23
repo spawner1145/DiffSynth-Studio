@@ -607,11 +607,12 @@ class ComplextroUnit_InputImageEmbedder(PipelineUnit):
             image = torch.cat([pipe.preprocess_image(img) for img in input_image], dim=0)
         else:
             image = pipe.preprocess_image(input_image)
-        image = image.to(device=pipe.device, dtype=pipe.torch_dtype)
+        image_dtype = torch.float32 if isinstance(pipe.vae, PixelIdentityVAE) else pipe.torch_dtype
+        image = image.to(device=pipe.device, dtype=image_dtype)
         input_latents = pipe.vae.encode(image)
         if pipe.prediction_type == "jit_xpred" and not pipe.scheduler.training:
             t_start = float(getattr(pipe, "_jit_t_start", 0.0))
-            latents = t_start * input_latents + (1.0 - t_start) * noise * float(pipe.jit_noise_scale)
+            latents = t_start * input_latents.float() + (1.0 - t_start) * noise.float() * float(pipe.jit_noise_scale)
             return {"latents": latents, "input_latents": input_latents}
         if pipe.scheduler.training:
             return {"latents": noise, "input_latents": input_latents}
