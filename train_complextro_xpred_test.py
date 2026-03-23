@@ -592,7 +592,7 @@ if __name__ == "__main__":
     vae_type = "pixel:16"
     prediction_type = "jit_xpred"
     condition_drop_prob = 0.0
-    jit_p_mean = -1.5
+    jit_p_mean = -0.8
     jit_p_std = 0.8
     jit_noise_scale = 1.0
     jit_t_eps = 5e-2
