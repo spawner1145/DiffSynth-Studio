@@ -112,7 +112,7 @@ class ComplextroPipeline(BasePipeline):
         t: torch.Tensor,
         cfg_scale: float,
     ) -> torch.Tensor:
-        timestep = t.flatten() * 1000.0
+        timestep = t.flatten()
         model_inputs = dict(inputs_shared)
         model_latents = latents.to(device=self.device, dtype=self.torch_dtype)
         model_inputs["latents"] = model_latents

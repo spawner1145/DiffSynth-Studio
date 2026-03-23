@@ -41,20 +41,24 @@ def JiTXPredLoss(pipe: BasePipeline, **inputs):
     t_eps = float(inputs.get("jit_t_eps", getattr(pipe, "jit_t_eps", 5e-2)))
 
     t = torch.randn(batch_size, device=x.device, dtype=torch.float32) * p_std + p_mean
-    t = torch.sigmoid(t).view(batch_size, *([1] * (x.ndim - 1))).to(dtype=x.dtype)
-    noise = torch.randn_like(x) * noise_scale
-    latents = t * x + (1 - t) * noise
+    t = torch.sigmoid(t).view(batch_size, *([1] * (x.ndim - 1)))
+    x_fp32 = x.float()
+    noise = torch.randn_like(x_fp32) * noise_scale
+    latents = t * x_fp32 + (1 - t) * noise
 
-    inputs["latents"] = latents
-    timestep = t.flatten() * 1000.0
+    inputs["latents"] = latents.to(dtype=pipe.torch_dtype)
+    # JiT feeds t in [0, 1] directly into the model. model_fn_complextro divides
+    # by 1000 and ComplextroImageDiT multiplies by 1000 inside time_text_embed,
+    # so passing raw t here preserves JiT's effective timestep scale.
+    timestep = t.flatten()
     models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
     x_pred = pipe.model_fn(**models, **inputs, timestep=timestep)
 
     denom = (1 - t).clamp_min(t_eps)
-    v_target = (x - latents) / denom
-    v_pred = (x_pred - latents) / denom
+    v_target = (x_fp32 - latents) / denom
+    v_pred = (x_pred.float() - latents) / denom
 
-    loss = (v_target.float() - v_pred.float()).pow(2).flatten(1).mean(1).mean()
+    loss = (v_target - v_pred).pow(2).flatten(1).mean(1).mean()
     return loss
 
 
