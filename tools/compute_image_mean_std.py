@@ -126,6 +126,7 @@ def compute_image_mean_std(
     mode: str = "RGB",
     recursive: bool = True,
     exts=DEFAULT_IMAGE_EXTS,
+    max_images: int | None = None,
     num_workers: int = 1,
 ):
     if not os.path.isdir(input_dir):
@@ -136,6 +137,11 @@ def compute_image_mean_std(
         raise ValueError("mode must be one of: RGB / RGBA / L")
 
     paths = sorted(iter_image_paths(input_dir, recursive=recursive, exts=normalize_exts(exts)))
+    if max_images is not None:
+        max_images = int(max_images)
+        if max_images <= 0:
+            raise ValueError("max_images must be positive when provided.")
+        paths = paths[:max_images]
     if len(paths) == 0:
         raise ValueError(f"No images found under {input_dir}")
 
@@ -178,6 +184,7 @@ def compute_image_mean_std(
         "mode": mode,
         "recursive": bool(recursive),
         "extensions": list(normalize_exts(exts)),
+        "max_images": None if max_images is None else int(max_images),
         "num_workers": int(num_workers),
         "num_images_found": len(paths),
         "num_images_processed": int(num_success),
@@ -197,6 +204,7 @@ def main():
     parser.add_argument("--output", type=str, default=None, help="Optional output json path.")
     parser.add_argument("--mode", type=str, default="RGB", help="Image convert mode: RGB / RGBA / L")
     parser.add_argument("--num_workers", type=int, default=1, help="Number of worker processes.")
+    parser.add_argument("--max_images", type=int, default=None, help="Process at most the first N scanned images.")
     parser.add_argument("--no_recursive", action="store_true", help="Disable recursive scanning.")
     parser.add_argument(
         "--ext",
@@ -217,6 +225,7 @@ def main():
         mode=args.mode,
         recursive=not args.no_recursive,
         exts=args.ext,
+        max_images=args.max_images,
         num_workers=args.num_workers,
     )
 
@@ -229,6 +238,7 @@ def main():
         {
             "input_dir": result["input_dir"],
             "mode": result["mode"],
+            "max_images": result["max_images"],
             "num_images_found": result["num_images_found"],
             "num_images_processed": result["num_images_processed"],
             "num_images_failed": result["num_images_failed"],
