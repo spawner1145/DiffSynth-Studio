@@ -209,14 +209,32 @@ def _frequency_residual_loss(
 
     weight = base_weight.to(device=residual.device, dtype=coeff.dtype)
     if weight.ndim == 2:
-        while weight.ndim < coeff.ndim:
-            weight = weight.unsqueeze(1)
+        weight = weight.view(1, 1, 1, 1, block_size, block_size)
     elif weight.ndim == 3:
-        weight = weight.unsqueeze(2).unsqueeze(2)
-        if coeff.shape[1] > weight.shape[1]:
-            pad_channels = coeff.shape[1] - weight.shape[1]
-            tail = weight[:, -1:].expand(weight.shape[0], pad_channels, weight.shape[2], weight.shape[3], weight.shape[4], weight.shape[5])
-            weight = torch.cat([weight, tail], dim=1)
+        weight = weight.view(1, weight.shape[0], 1, 1, block_size, block_size)
+    elif weight.ndim == 4:
+        # [B, bs, bs] or [1/ B, C, bs, bs] are both allowed.
+        if weight.shape[-2:] != (block_size, block_size):
+            raise ValueError("Frequency weight spatial shape must match the configured DCT block size.")
+        if weight.shape[1] == block_size and weight.shape[2] == block_size:
+            weight = weight.view(weight.shape[0], 1, 1, 1, block_size, block_size)
+        else:
+            weight = weight.view(weight.shape[0], weight.shape[1], 1, 1, block_size, block_size)
+    elif weight.ndim == 5:
+        weight = weight.unsqueeze(2)
+    elif weight.ndim != 6:
+        raise ValueError(f"Unsupported frequency weight rank: {weight.ndim}.")
+
+    if weight.shape[0] == 1 and coeff.shape[0] > 1:
+        expand_shape = (coeff.shape[0],) + tuple(weight.shape[1:])
+        weight = weight.expand(*expand_shape)
+    if weight.shape[1] == 1 and coeff.shape[1] > 1:
+        expand_shape = (weight.shape[0], coeff.shape[1]) + tuple(weight.shape[2:])
+        weight = weight.expand(*expand_shape)
+    elif coeff.shape[1] > weight.shape[1]:
+        pad_channels = coeff.shape[1] - weight.shape[1]
+        tail = weight[:, -1:].expand(weight.shape[0], pad_channels, weight.shape[2], weight.shape[3], weight.shape[4], weight.shape[5])
+        weight = torch.cat([weight, tail], dim=1)
     return (coeff.pow(2) * weight).mean()
 
 
