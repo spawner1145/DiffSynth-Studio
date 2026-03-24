@@ -31,17 +31,21 @@ def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
 
 
 def JiTXPredLoss(pipe: BasePipeline, **inputs):
-    """JiT x-prediction loss (velocity parameterization).
+    """JiT x-prediction loss.
 
-    The raw velocity loss = ||x - x_pred||² / (1-t)² implicitly up-weights
-    low-noise (high t) samples by a factor of 1/(1-t)², starving the high-noise
-    (low t) region of gradient signal.  This is why a model can show extremely
-    low loss yet fail completely at text-to-image (which starts from t=0).
+    The model outputs x_pred (prediction of the clean image x).  At inference
+    the velocity v = (x_pred - z) / (1-t) is used for ODE integration, so the
+    training loss can be formulated either in velocity space or directly on
+    x_pred.  The ``jit_loss_weighting`` switch selects among:
 
-    We support an optional ``jit_loss_weighting`` mode (configurable on pipe):
-      - "velocity"  : original JiT velocity loss, no correction (default)
-      - "x_pred"    : multiply by (1-t)² to fully cancel → equivalent to MSE on x_pred
-      - "balanced"  : multiply by (1-t)  → partial correction (recommended)
+      - "velocity"  : ||x - x_pred||² / (1-t)²  — original JiT paper
+      - "balanced"  : ||x - x_pred||² / (1-t)    — partial correction
+      - "x_pred"    : ||x - x_pred||²            — direct x-prediction MSE (recommended
+                       for text-conditioned pixel-space models where high-noise region
+                       is hard to learn)
+
+    All three modes are compatible with the same Euler/Heun ODE sampler;
+    only the training gradient distribution differs.
     """
     if hasattr(pipe, "_get_vae_downsample_factor") and int(pipe._get_vae_downsample_factor()) != 1:
         raise NotImplementedError("JiT-style x-pred training is only valid for pixel-space inputs (VAE downsample factor must be 1).")
@@ -59,33 +63,36 @@ def JiTXPredLoss(pipe: BasePipeline, **inputs):
     latents = t * x_fp32 + (1 - t) * noise
 
     inputs["latents"] = latents.to(dtype=pipe.torch_dtype)
-    # JiT 直接归一到[0,1]的
     timestep = t.flatten()
     models = {name: getattr(pipe, name) for name in pipe.in_iteration_models}
     x_pred = pipe.model_fn(**models, **inputs, timestep=timestep)
 
-    denom = (1 - t).clamp_min(t_eps)
-    v_target = (x_fp32 - latents) / denom
-    v_pred = (x_pred.float() - latents) / denom
-
-    per_sample_mse = (v_target - v_pred).pow(2).flatten(1).mean(1)
-
-    # Apply loss weighting to counteract the implicit 1/(1-t)² in velocity loss.
-    # Without correction, high-t (low-noise) samples dominate gradients and the
-    # model never learns to denoise from pure noise (low-t).
-    loss_weighting = str(inputs.get("jit_loss_weighting", getattr(pipe, "jit_loss_weighting", "balanced")))
+    loss_weighting = str(inputs.get("jit_loss_weighting", getattr(pipe, "jit_loss_weighting", "x_pred")))
     t_flat = t.flatten()
-    if loss_weighting == "x_pred":
-        # Full correction: effective loss = ||x - x_pred||² (uniform across t)
-        weight = (1.0 - t_flat).clamp_min(t_eps).pow(2)
-    elif loss_weighting == "balanced":
-        # Partial correction: effective loss = ||x - x_pred||² / (1-t) (recommended)
-        weight = (1.0 - t_flat).clamp_min(t_eps)
-    else:
-        # "velocity": original JiT, no correction
-        weight = torch.ones_like(t_flat)
+    one_minus_t = (1.0 - t).clamp_min(t_eps)
 
-    loss = (per_sample_mse * weight).mean()
+    if loss_weighting == "x_pred":
+        # Direct x-prediction MSE: ||x - x_pred||²
+        # No implicit weighting — all t values contribute equally.
+        # This is the most effective mode for text-conditioned generation
+        # because the high-noise (low-t) region gets fair gradient signal.
+        per_sample_loss = (x_fp32 - x_pred.float()).pow(2).flatten(1).mean(1)
+        loss = per_sample_loss.mean()
+    elif loss_weighting == "balanced":
+        # Velocity loss with partial correction: effective = ||x - x_pred||² / (1-t)
+        # High-t still gets ~10× more weight than low-t (vs 100× in raw velocity).
+        v_target = (x_fp32 - latents) / one_minus_t
+        v_pred = (x_pred.float() - latents) / one_minus_t
+        per_sample_loss = (v_target - v_pred).pow(2).flatten(1).mean(1)
+        weight = one_minus_t.flatten()
+        loss = (per_sample_loss * weight).mean()
+    else:
+        # "velocity": original JiT paper loss = ||x - x_pred||² / (1-t)²
+        # WARNING: high-t dominates gradients; not recommended for weak conditions.
+        v_target = (x_fp32 - latents) / one_minus_t
+        v_pred = (x_pred.float() - latents) / one_minus_t
+        per_sample_loss = (v_target - v_pred).pow(2).flatten(1).mean(1)
+        loss = per_sample_loss.mean()
     return loss
 
 
