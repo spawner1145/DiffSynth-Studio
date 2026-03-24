@@ -629,7 +629,7 @@ if __name__ == "__main__":
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=1)
     use_image_text_pairs = False  # True: 使用 ImageTextPairDataset（图片+txt目录），False: 使用 UnifiedDataset（metadata文件）
     train_omni = True
-    vae_type = "pixel:16"
+    vae_type = "pixel_norm:16"
     prediction_type = "flow"
     condition_drop_prob = 0.0
     # Frequency-aware loss knobs.
