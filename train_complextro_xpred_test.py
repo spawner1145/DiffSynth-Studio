@@ -20,7 +20,7 @@ from diffsynth.diffusion import (
 from diffsynth.models.qwen_image_text_encoder import QwenImageTextEncoder
 from diffsynth.utils.state_dict_converters.qwen_image_text_encoder import QwenImageTextEncoderStateDictConverter
 from diffsynth.models.complextro_dit import ComplextroImageDiT
-from diffsynth.models.pixel_identity_vae import PixelIdentityVAE, PixelLogitVAE
+from diffsynth.models.pixel_identity_vae import PixelIdentityVAE, PixelLogitVAE, PixelNormalizedVAE
 from diffsynth.models.siglip2_image_encoder import Siglip2ImageEncoder428M
 from diffsynth.pipelines.complextro import ComplextroPipeline
 from diffsynth.pipelines.complextro_vae_utils import (
@@ -97,7 +97,10 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         self.pipe.jit_cfg_interval_max = float(jit_cfg_interval_max)
         self.pipe.jit_loss_weighting = str(jit_loss_weighting)
         if self.pipe.prediction_type in ("jit_xpred", "bridge_xpred") and int(self.vae_spec["latent_downsample_factor"]) != 1:
-            raise NotImplementedError("JiT-style pixel-space training requires pixel-space Complextro (use vae_type='pixel' or 'pixel:<patch_size>').")
+            raise NotImplementedError(
+                "JiT-style pixel-space training requires pixel-space Complextro "
+                "(use vae_type='pixel', 'pixel_logit', 'pixel_norm', or their ':<patch_size>' variants)."
+            )
 
         if enable_vram_offload:
             if vram_config is None:
@@ -150,8 +153,12 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             config={"model_type": "qwen3_5", "model_size": qwen_model_size},
             state_dict_converter=QwenImageTextEncoderStateDictConverter,
         )
-        if self.vae_spec["model_file"] is None and self.vae_spec["model_class"] in (PixelIdentityVAE, PixelLogitVAE):
-            self.pipe.vae = self.vae_spec["model_class"](**self.vae_spec["config"]).to(device=device, dtype=torch.bfloat16)
+        if self.vae_spec["model_file"] is None and self.vae_spec["model_class"] in (
+            PixelIdentityVAE,
+            PixelLogitVAE,
+            PixelNormalizedVAE,
+        ):
+            self.pipe.vae = self.vae_spec["model_class"](**self.vae_spec["config"]).to(device=device, dtype=torch.float32)
         else:
             self.pipe.vae = load_aux_model(
                 self.vae_spec["model_class"],

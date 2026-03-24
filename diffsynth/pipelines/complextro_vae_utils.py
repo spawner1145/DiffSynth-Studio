@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..models.flux2_vae import Flux2VAE
-from ..models.pixel_identity_vae import PixelIdentityVAE, PixelLogitVAE
+from ..models.pixel_identity_vae import PixelIdentityVAE, PixelLogitVAE, PixelNormalizedVAE
 from ..models.qwen_image_vae import QwenImageVAE
 
 
@@ -28,6 +28,14 @@ def _parse_pixel_vae_type(vae_type: str | None) -> tuple[str, int | None]:
         if patch_size <= 0:
             raise ValueError(f"Pixel-logit patch size must be positive, got {patch_size}.")
         return "pixel_logit", patch_size
+    if value.startswith("pixel_norm:"):
+        _, raw_patch_size = value.split(":", 1)
+        if raw_patch_size == "":
+            raise ValueError("Pixel-norm VAE type must be 'pixel_norm' or 'pixel_norm:<patch_size>'.")
+        patch_size = int(raw_patch_size)
+        if patch_size <= 0:
+            raise ValueError(f"Pixel-norm patch size must be positive, got {patch_size}.")
+        return "pixel_norm", patch_size
     return value, None
 
 
@@ -45,10 +53,13 @@ def normalize_complextro_vae_type(vae_type: str | None) -> str:
         "pixel_logit": "pixel_logit",
         "pixel-logit": "pixel_logit",
         "logit": "pixel_logit",
+        "pixel_norm": "pixel_norm",
+        "pixel-norm": "pixel_norm",
+        "pixel_normalized": "pixel_norm",
     }
     if value not in aliases:
         raise ValueError(
-            f"Unsupported Complextro VAE type: {vae_type!r}. Expected 'flux2', 'qwen_image', 'pixel', 'pixel_logit', or 'pixel:<patch_size>' / 'pixel_logit:<patch_size>'."
+            f"Unsupported Complextro VAE type: {vae_type!r}. Expected 'flux2', 'qwen_image', 'pixel', 'pixel_logit', 'pixel_norm', or 'pixel:<patch_size>' / 'pixel_norm:<patch_size>'."
         )
     return aliases[value]
 
@@ -61,7 +72,7 @@ def get_complextro_vae_spec(
 ) -> dict[str, Any]:
     raw_type, pixel_patch_size = _parse_pixel_vae_type(vae_type)
     resolved_type = normalize_complextro_vae_type(raw_type)
-    if resolved_type not in ("pixel", "pixel_logit") and vae_file in (None, ""):
+    if resolved_type not in ("pixel", "pixel_logit", "pixel_norm") and vae_file in (None, ""):
         raise ValueError("Complextro VAE requires vae_file to be set explicitly.")
     if resolved_type == "flux2":
         return {
@@ -91,6 +102,18 @@ def get_complextro_vae_spec(
         return {
             "vae_type": "pixel_logit",
             "model_class": PixelLogitVAE,
+            "model_file": None,
+            "config": {"image_channels": image_channels},
+            "latent_channels": image_channels,
+            "latent_downsample_factor": 1,
+            "latent_patch_size": patch_size,
+        }
+    if resolved_type == "pixel_norm":
+        image_channels = 4 if use_alpha_layer_vae else 3
+        patch_size = DEFAULT_PIXEL_PATCH_SIZE if pixel_patch_size is None else int(pixel_patch_size)
+        return {
+            "vae_type": "pixel_norm",
+            "model_class": PixelNormalizedVAE,
             "model_file": None,
             "config": {"image_channels": image_channels},
             "latent_channels": image_channels,
@@ -152,6 +175,8 @@ def infer_complextro_vae_latent_channels(vae) -> int | None:
         return None
     if isinstance(vae, PixelLogitVAE):
         return int(vae.image_channels)
+    if isinstance(vae, PixelNormalizedVAE):
+        return int(vae.image_channels)
     if isinstance(vae, PixelIdentityVAE):
         return int(vae.image_channels)
     if isinstance(vae, QwenImageVAE):
@@ -170,6 +195,8 @@ def infer_complextro_vae_latent_channels(vae) -> int | None:
 
 def infer_complextro_vae_downsample_factor(vae) -> int:
     if isinstance(vae, PixelLogitVAE):
+        return 1
+    if isinstance(vae, PixelNormalizedVAE):
         return 1
     if isinstance(vae, PixelIdentityVAE):
         return 1

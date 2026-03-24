@@ -19,7 +19,7 @@ from diffsynth.diffusion import (
 from diffsynth.models.qwen_image_text_encoder import QwenImageTextEncoder
 from diffsynth.utils.state_dict_converters.qwen_image_text_encoder import QwenImageTextEncoderStateDictConverter
 from diffsynth.models.complextro_dit import ComplextroImageDiT
-from diffsynth.models.pixel_identity_vae import PixelIdentityVAE, PixelLogitVAE
+from diffsynth.models.pixel_identity_vae import PixelIdentityVAE, PixelLogitVAE, PixelNormalizedVAE
 from diffsynth.models.siglip2_image_encoder import Siglip2ImageEncoder428M
 from diffsynth.pipelines.complextro import ComplextroPipeline
 from diffsynth.pipelines.complextro_vae_utils import (
@@ -96,7 +96,10 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         self.pipe.jit_cfg_interval_max = float(jit_cfg_interval_max)
         self.pipe.jit_loss_weighting = str(jit_loss_weighting)
         if self.pipe.prediction_type in ("jit_xpred", "bridge_xpred") and int(self.vae_spec["latent_downsample_factor"]) != 1:
-            raise NotImplementedError("JiT-style x-pred training requires pixel-space Complextro (use vae_type='pixel' or 'pixel:<patch_size>').")
+            raise NotImplementedError(
+                "JiT-style x-pred training requires pixel-space Complextro "
+                "(use vae_type='pixel', 'pixel_logit', 'pixel_norm', or their ':<patch_size>' variants)."
+            )
 
         if enable_vram_offload:
             if vram_config is None:
@@ -149,8 +152,12 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             config={"model_type": "qwen3_5", "model_size": qwen_model_size},
             state_dict_converter=QwenImageTextEncoderStateDictConverter,
         )
-        if self.vae_spec["model_file"] is None and self.vae_spec["model_class"] in (PixelIdentityVAE, PixelLogitVAE):
-            self.pipe.vae = self.vae_spec["model_class"](**self.vae_spec["config"]).to(device=device, dtype=torch.bfloat16)
+        if self.vae_spec["model_file"] is None and self.vae_spec["model_class"] in (
+            PixelIdentityVAE,
+            PixelLogitVAE,
+            PixelNormalizedVAE,
+        ):
+            self.pipe.vae = self.vae_spec["model_class"](**self.vae_spec["config"]).to(device=device, dtype=torch.float32)
         else:
             self.pipe.vae = load_aux_model(
                 self.vae_spec["model_class"],
@@ -396,8 +403,18 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Complextro Training Script")
-    parser.add_argument("--vae_type", type=str, default="flux2", help="Complextro VAE type: flux2 / qwen_image / pixel / pixel:<patch_size> (pixel defaults to patch_size=32)")
-    parser.add_argument("--vae_file", type=str, default="/mnt/raid0/linux-train/diffusion-model-v1/flux2-vae/diffusion_pytorch_model.safetensors", help="Complextro VAE model file; ignored when --vae_type pixel")
+    parser.add_argument(
+        "--vae_type",
+        type=str,
+        default="flux2",
+        help="Complextro VAE type: flux2 / qwen_image / pixel / pixel_logit / pixel_norm / <type>:<patch_size>",
+    )
+    parser.add_argument(
+        "--vae_file",
+        type=str,
+        default="/mnt/raid0/linux-train/diffusion-model-v1/flux2-vae/diffusion_pytorch_model.safetensors",
+        help="Complextro VAE model file; ignored when --vae_type is pixel / pixel_logit / pixel_norm",
+    )
     parser.add_argument("--use_image_text_pairs", action="store_true", help="True: 使用 ImageTextPairDataset（图片+txt目录），False: 使用 UnifiedDataset（metadata文件）")
     parser.add_argument("--train_omni", action="store_true", default=True, help="是否开启 Omni/编辑训练模式")
     parser.add_argument("--use_alpha_layer_vae", action="store_true", help="是否使用带 alpha 层 VAE")
