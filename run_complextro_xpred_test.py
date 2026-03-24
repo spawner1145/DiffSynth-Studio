@@ -11,7 +11,7 @@ from diffsynth.configs.vram_management_module_maps import VRAM_MANAGEMENT_MODULE
 from diffsynth.models.qwen_image_text_encoder import QwenImageTextEncoder
 from diffsynth.utils.state_dict_converters.qwen_image_text_encoder import QwenImageTextEncoderStateDictConverter
 from diffsynth.models.complextro_dit import ComplextroImageDiT
-from diffsynth.models.pixel_identity_vae import PixelIdentityVAE
+from diffsynth.models.pixel_identity_vae import PixelIdentityVAE, PixelLogitVAE
 from diffsynth.models.siglip2_image_encoder import Siglip2ImageEncoder428M
 from diffsynth.pipelines.complextro import ComplextroPipeline
 from diffsynth.pipelines.complextro_vae_utils import (
@@ -135,8 +135,8 @@ def build_complextro_pipe(
         config={"model_type": "qwen3_5", "model_size": qwen_model_size},
         state_dict_converter=QwenImageTextEncoderStateDictConverter,
     )
-    if vae_spec["model_file"] is None and vae_spec["model_class"] is PixelIdentityVAE:
-        pipe.vae = PixelIdentityVAE(**vae_spec["config"]).to(device=device, dtype=torch_dtype)
+    if vae_spec["model_file"] is None and vae_spec["model_class"] in (PixelIdentityVAE, PixelLogitVAE):
+        pipe.vae = vae_spec["model_class"](**vae_spec["config"]).to(device=device, dtype=torch_dtype)
     else:
         pipe.vae = load_model_with_optional_offload(
             vae_spec["model_class"],
@@ -197,8 +197,8 @@ def debug_xpred_once(
 ):
     if pipe.prediction_type not in ("jit_xpred", "bridge_xpred"):
         raise ValueError("debug_xpred_once requires prediction_type='jit_xpred' or 'bridge_xpred'.")
-    if not isinstance(pipe.vae, PixelIdentityVAE):
-        raise ValueError("debug_xpred_once requires pixel-space Complextro (PixelIdentityVAE).")
+    if not isinstance(pipe.vae, (PixelIdentityVAE, PixelLogitVAE)):
+        raise ValueError("debug_xpred_once requires pixel-space Complextro (PixelIdentityVAE or PixelLogitVAE).")
 
     os.makedirs(out_dir, exist_ok=True)
     pipe.load_models_to_device(["vae", "text_encoder", "dit"])

@@ -13,7 +13,7 @@ from transformers import AutoTokenizer, AutoProcessor
 from ..models.complextro_dit import ComplextroImageDiT
 from ..models.qwen_image_text_encoder import QwenImageTextEncoder
 from ..models.flux2_vae import Flux2VAE
-from ..models.pixel_identity_vae import PixelIdentityVAE
+from ..models.pixel_identity_vae import PixelIdentityVAE, PixelLogitVAE
 from ..models.qwen_image_vae import QwenImageVAE
 from ..models.siglip2_image_encoder import Siglip2ImageEncoder428M
 from .complextro_vae_utils import (
@@ -651,7 +651,7 @@ class ComplextroUnit_NoiseInitializer(PipelineUnit):
     def process(self, pipe: ComplextroPipeline, height, width, seed, rand_device, batch_size=1):
         latent_channels = int(pipe.dit.latent_channels) if pipe.dit is not None else 128
         downsample_factor = pipe._get_vae_downsample_factor()
-        noise_dtype = torch.float32 if isinstance(pipe.vae, PixelIdentityVAE) else pipe.torch_dtype
+        noise_dtype = torch.float32 if isinstance(pipe.vae, (PixelIdentityVAE, PixelLogitVAE)) else pipe.torch_dtype
         noise = pipe.generate_noise(
             (int(batch_size), latent_channels, height // downsample_factor, width // downsample_factor),
             seed=seed,
@@ -678,7 +678,7 @@ class ComplextroUnit_InputImageEmbedder(PipelineUnit):
             image = torch.cat([pipe.preprocess_image(img) for img in input_image], dim=0)
         else:
             image = pipe.preprocess_image(input_image)
-        image_dtype = torch.float32 if isinstance(pipe.vae, PixelIdentityVAE) else pipe.torch_dtype
+        image_dtype = torch.float32 if isinstance(pipe.vae, (PixelIdentityVAE, PixelLogitVAE)) else pipe.torch_dtype
         image = image.to(device=pipe.device, dtype=image_dtype)
         input_latents = pipe.vae.encode(image)
         if pipe.prediction_type in ("jit_xpred", "bridge_xpred") and not pipe.scheduler.training:
