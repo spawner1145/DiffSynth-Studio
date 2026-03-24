@@ -54,6 +54,22 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         jit_cfg_interval_min: float = 0.0,
         jit_cfg_interval_max: float = 1.0,
         jit_loss_weighting: str = "balanced",
+        freq_loss_enabled: bool = False,  # DeCo 原始推荐：开启；这里默认关闭以保持原行为
+        freq_loss_weight: float = 0.0,  # DeCo 原值：1.0
+        freq_loss_mode: str = "dct",  # DeCo 原值：DCT block spectral loss
+        freq_loss_block_size: int = 8,  # DeCo 原值：8
+        freq_loss_profile: str = "jpeg",  # DeCo 风格：JPEG-inspired weighting
+        freq_loss_quality: int = 85,  # DeCo 原值：85
+        freq_loss_jpeg_mode: str = "inv_gamma",  # DeCo 原值：inv_gamma
+        freq_loss_gamma: float = 1.0,  # DeCo 原值：1.0
+        freq_loss_color_space: str = "rgb",  # DeCo 原实现等价于先转 YCbCr；推荐实验时改成 ycbcr
+        freq_loss_weight_floor: float = 0.1,
+        freq_loss_hf_scale: float = 0.25,
+        freq_loss_lf_scale: float = 1.0,
+        freq_loss_t_adaptive: bool = False,
+        freq_loss_t_min_hf_scale: float = 0.25,
+        freq_loss_t_max_hf_scale: float = 1.0,
+        freq_loss_t_gamma: float = 1.0,
         enable_vram_offload: bool = False,
         vram_config: Optional[dict] = None,
         vram_limit: Optional[float] = None,
@@ -95,6 +111,22 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         self.pipe.jit_cfg_interval_min = float(jit_cfg_interval_min)
         self.pipe.jit_cfg_interval_max = float(jit_cfg_interval_max)
         self.pipe.jit_loss_weighting = str(jit_loss_weighting)
+        self.pipe.freq_loss_enabled = bool(freq_loss_enabled)
+        self.pipe.freq_loss_weight = float(freq_loss_weight)
+        self.pipe.freq_loss_mode = str(freq_loss_mode)
+        self.pipe.freq_loss_block_size = int(freq_loss_block_size)
+        self.pipe.freq_loss_profile = str(freq_loss_profile)
+        self.pipe.freq_loss_quality = int(freq_loss_quality)
+        self.pipe.freq_loss_jpeg_mode = str(freq_loss_jpeg_mode)
+        self.pipe.freq_loss_gamma = float(freq_loss_gamma)
+        self.pipe.freq_loss_color_space = str(freq_loss_color_space)
+        self.pipe.freq_loss_weight_floor = float(freq_loss_weight_floor)
+        self.pipe.freq_loss_hf_scale = float(freq_loss_hf_scale)
+        self.pipe.freq_loss_lf_scale = float(freq_loss_lf_scale)
+        self.pipe.freq_loss_t_adaptive = bool(freq_loss_t_adaptive)
+        self.pipe.freq_loss_t_min_hf_scale = float(freq_loss_t_min_hf_scale)
+        self.pipe.freq_loss_t_max_hf_scale = float(freq_loss_t_max_hf_scale)
+        self.pipe.freq_loss_t_gamma = float(freq_loss_t_gamma)
         if self.pipe.prediction_type in ("jit_xpred", "bridge_xpred") and int(self.vae_spec["latent_downsample_factor"]) != 1:
             raise NotImplementedError(
                 "JiT-style x-pred training requires pixel-space Complextro "
@@ -398,6 +430,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             loss = BridgeXPredLoss(self.pipe, **inputs_shared, **inputs_posi)
         else:
             loss = FlowMatchSFTLoss(self.pipe, **inputs_shared, **inputs_posi)
+        self.latest_loss_metrics = dict(getattr(self.pipe, "_last_loss_metrics", {}))
         return loss
 
 
@@ -439,6 +472,22 @@ if __name__ == "__main__":
     parser.add_argument("--jit_cfg_interval_min", type=float, default=0.0, help="JiT x-pred CFG interval minimum t")
     parser.add_argument("--jit_cfg_interval_max", type=float, default=1.0, help="JiT x-pred CFG interval maximum t")
     parser.add_argument("--jit_loss_weighting", type=str, default="balanced", help="JiT x-pred loss weighting: velocity / balanced / x_pred")
+    parser.add_argument("--freq_loss_enabled", action="store_true", help="Enable frequency-aware residual loss. DeCo 推荐开启；这里默认关闭以保持原行为")
+    parser.add_argument("--freq_loss_weight", type=float, default=0.0, help="Multiplier for the frequency-aware residual loss term. DeCo 原值: 1.0")
+    parser.add_argument("--freq_loss_mode", type=str, default="dct", help="Frequency loss mode. Currently supports: dct. DeCo 原值: dct")
+    parser.add_argument("--freq_loss_block_size", type=int, default=8, help="Block size used by the DCT frequency-aware residual loss. DeCo 原值: 8")
+    parser.add_argument("--freq_loss_profile", type=str, default="jpeg", help="Frequency weighting profile: jpeg / linear / uniform. DeCo 风格: jpeg")
+    parser.add_argument("--freq_loss_quality", type=int, default=85, help="JPEG quality proxy used by the DeCo-style frequency weighting. DeCo 原值: 85")
+    parser.add_argument("--freq_loss_jpeg_mode", type=str, default="inv_gamma", help="JPEG weight mapping: inv / inv_gamma. DeCo 原值: inv_gamma")
+    parser.add_argument("--freq_loss_gamma", type=float, default=1.0, help="Gamma used by inv_gamma JPEG weighting. DeCo 原值: 1.0")
+    parser.add_argument("--freq_loss_color_space", type=str, default="rgb", help="Color space before block DCT: rgb / ycbcr. DeCo 推荐: ycbcr")
+    parser.add_argument("--freq_loss_weight_floor", type=float, default=0.1, help="Minimum normalized frequency weight before LF/HF scaling")
+    parser.add_argument("--freq_loss_hf_scale", type=float, default=0.25, help="Base multiplier applied to high-frequency residual energy")
+    parser.add_argument("--freq_loss_lf_scale", type=float, default=1.0, help="Base multiplier applied to low-frequency residual energy")
+    parser.add_argument("--freq_loss_t_adaptive", action="store_true", help="Make high-frequency weighting depend on normalized timestep t")
+    parser.add_argument("--freq_loss_t_min_hf_scale", type=float, default=0.25, help="High-frequency scale used near t=0 when t-adaptive weighting is enabled")
+    parser.add_argument("--freq_loss_t_max_hf_scale", type=float, default=1.0, help="High-frequency scale used near t=1 when t-adaptive weighting is enabled")
+    parser.add_argument("--freq_loss_t_gamma", type=float, default=1.0, help="Exponent for timestep-adaptive high-frequency scaling")
     parser.add_argument("--lr_scheduler", type=str, default="constant", help="学习率调度器名称，例如 constant / warmup_stable_decay")
     parser.add_argument("--lr_warmup_steps", type=float, default=0, help="warmup 步数；传小数时按总步数比例计算")
     parser.add_argument("--lr_decay_steps", type=float, default=0, help="decay 步数；传小数时按总步数比例计算")
@@ -721,6 +770,22 @@ if __name__ == "__main__":
         jit_cfg_interval_min=args.jit_cfg_interval_min,
         jit_cfg_interval_max=args.jit_cfg_interval_max,
         jit_loss_weighting=args.jit_loss_weighting,
+        freq_loss_enabled=args.freq_loss_enabled,
+        freq_loss_weight=args.freq_loss_weight,
+        freq_loss_mode=args.freq_loss_mode,
+        freq_loss_block_size=args.freq_loss_block_size,
+        freq_loss_profile=args.freq_loss_profile,
+        freq_loss_quality=args.freq_loss_quality,
+        freq_loss_jpeg_mode=args.freq_loss_jpeg_mode,
+        freq_loss_gamma=args.freq_loss_gamma,
+        freq_loss_color_space=args.freq_loss_color_space,
+        freq_loss_weight_floor=args.freq_loss_weight_floor,
+        freq_loss_hf_scale=args.freq_loss_hf_scale,
+        freq_loss_lf_scale=args.freq_loss_lf_scale,
+        freq_loss_t_adaptive=args.freq_loss_t_adaptive,
+        freq_loss_t_min_hf_scale=args.freq_loss_t_min_hf_scale,
+        freq_loss_t_max_hf_scale=args.freq_loss_t_max_hf_scale,
+        freq_loss_t_gamma=args.freq_loss_t_gamma,
         enable_vram_offload=enable_vram_offload,
         vram_config=vram_config,
     )

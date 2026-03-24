@@ -1027,6 +1027,12 @@ def launch_training_task(
                             metrics["train/lr"] = float(lr)
                         if grad_norm is not None:
                             metrics["train/grad_norm"] = float(grad_norm_item)
+                        extra_loss_metrics = getattr(model, "latest_loss_metrics", None)
+                        if isinstance(extra_loss_metrics, dict):
+                            for key, value in extra_loss_metrics.items():
+                                if key == "total_loss":
+                                    continue
+                                metrics[f"train/{key}"] = float(value)
                         if layer_grad_norms is not None:
                             for layer_name, layer_grad_norm in layer_grad_norms.items():
                                 metrics[f"grad_norm_layers/{layer_name.replace('.', '/')}"] = float(layer_grad_norm)

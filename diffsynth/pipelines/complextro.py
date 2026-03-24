@@ -47,6 +47,22 @@ class ComplextroPipeline(BasePipeline):
         self.jit_cfg_interval_min = 0.0
         self.jit_cfg_interval_max = 1.0
         self.jit_loss_weighting = "x_pred"  # "velocity" | "balanced" | "x_pred"
+        self.freq_loss_enabled = False
+        self.freq_loss_weight = 0.0
+        self.freq_loss_mode = "dct"
+        self.freq_loss_block_size = 8
+        self.freq_loss_profile = "jpeg"
+        self.freq_loss_quality = 85
+        self.freq_loss_jpeg_mode = "inv_gamma"
+        self.freq_loss_gamma = 1.0
+        self.freq_loss_color_space = "rgb"
+        self.freq_loss_weight_floor = 0.1
+        self.freq_loss_hf_scale = 0.25
+        self.freq_loss_lf_scale = 1.0
+        self.freq_loss_t_adaptive = False
+        self.freq_loss_t_min_hf_scale = 0.25
+        self.freq_loss_t_max_hf_scale = 1.0
+        self.freq_loss_t_gamma = 1.0
         self.in_iteration_models = ("dit",)
         self.units = [
             ComplextroUnit_ShapeChecker(),

@@ -55,6 +55,22 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         jit_cfg_interval_min: float = 0.0,
         jit_cfg_interval_max: float = 1.0,
         jit_loss_weighting: str = "balanced",
+        freq_loss_enabled: bool = False,  # DeCo 原始推荐：开启；这里默认关闭以保持原行为
+        freq_loss_weight: float = 0.0,  # DeCo 原值：1.0
+        freq_loss_mode: str = "dct",  # DeCo 原值：DCT block spectral loss
+        freq_loss_block_size: int = 8,  # DeCo 原值：8
+        freq_loss_profile: str = "jpeg",  # DeCo 风格：JPEG-inspired weighting
+        freq_loss_quality: int = 85,  # DeCo 原值：85
+        freq_loss_jpeg_mode: str = "inv_gamma",  # DeCo 原值：inv_gamma
+        freq_loss_gamma: float = 1.0,  # DeCo 原值：1.0
+        freq_loss_color_space: str = "rgb",  # DeCo 原实现等价于先转 YCbCr；推荐实验时改成 ycbcr
+        freq_loss_weight_floor: float = 0.1,
+        freq_loss_hf_scale: float = 0.25,
+        freq_loss_lf_scale: float = 1.0,
+        freq_loss_t_adaptive: bool = False,
+        freq_loss_t_min_hf_scale: float = 0.25,
+        freq_loss_t_max_hf_scale: float = 1.0,
+        freq_loss_t_gamma: float = 1.0,
         enable_vram_offload: bool = False,
         vram_config: Optional[dict] = None,
         vram_limit: Optional[float] = None,
@@ -96,6 +112,22 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         self.pipe.jit_cfg_interval_min = float(jit_cfg_interval_min)
         self.pipe.jit_cfg_interval_max = float(jit_cfg_interval_max)
         self.pipe.jit_loss_weighting = str(jit_loss_weighting)
+        self.pipe.freq_loss_enabled = bool(freq_loss_enabled)
+        self.pipe.freq_loss_weight = float(freq_loss_weight)
+        self.pipe.freq_loss_mode = str(freq_loss_mode)
+        self.pipe.freq_loss_block_size = int(freq_loss_block_size)
+        self.pipe.freq_loss_profile = str(freq_loss_profile)
+        self.pipe.freq_loss_quality = int(freq_loss_quality)
+        self.pipe.freq_loss_jpeg_mode = str(freq_loss_jpeg_mode)
+        self.pipe.freq_loss_gamma = float(freq_loss_gamma)
+        self.pipe.freq_loss_color_space = str(freq_loss_color_space)
+        self.pipe.freq_loss_weight_floor = float(freq_loss_weight_floor)
+        self.pipe.freq_loss_hf_scale = float(freq_loss_hf_scale)
+        self.pipe.freq_loss_lf_scale = float(freq_loss_lf_scale)
+        self.pipe.freq_loss_t_adaptive = bool(freq_loss_t_adaptive)
+        self.pipe.freq_loss_t_min_hf_scale = float(freq_loss_t_min_hf_scale)
+        self.pipe.freq_loss_t_max_hf_scale = float(freq_loss_t_max_hf_scale)
+        self.pipe.freq_loss_t_gamma = float(freq_loss_t_gamma)
         if self.pipe.prediction_type in ("jit_xpred", "bridge_xpred") and int(self.vae_spec["latent_downsample_factor"]) != 1:
             raise NotImplementedError(
                 "JiT-style pixel-space training requires pixel-space Complextro "
@@ -399,6 +431,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             loss = BridgeXPredLoss(self.pipe, **inputs_shared, **inputs_posi)
         else:
             loss = FlowMatchSFTLoss(self.pipe, **inputs_shared, **inputs_posi)
+        self.latest_loss_metrics = dict(getattr(self.pipe, "_last_loss_metrics", {}))
         return loss
 
 
@@ -599,6 +632,34 @@ if __name__ == "__main__":
     vae_type = "flux2"
     prediction_type = "flow"
     condition_drop_prob = 0.0
+    # Frequency-aware loss knobs.
+    # DeCo 原始推荐值：
+    #   freq_loss_enabled=True
+    #   freq_loss_weight=1.0
+    #   freq_loss_mode="dct"
+    #   freq_loss_block_size=8
+    #   freq_loss_profile="jpeg"
+    #   freq_loss_quality=85
+    #   freq_loss_jpeg_mode="inv_gamma"
+    #   freq_loss_gamma=1.0
+    #   freq_loss_color_space="ycbcr"
+    # 这里默认保持关闭，以不改变原训练行为。
+    freq_loss_enabled = False
+    freq_loss_weight = 0.0
+    freq_loss_mode = "dct"
+    freq_loss_block_size = 8
+    freq_loss_profile = "jpeg"
+    freq_loss_quality = 85
+    freq_loss_jpeg_mode = "inv_gamma"
+    freq_loss_gamma = 1.0
+    freq_loss_color_space = "rgb"
+    freq_loss_weight_floor = 0.1
+    freq_loss_hf_scale = 0.25
+    freq_loss_lf_scale = 1.0
+    freq_loss_t_adaptive = False
+    freq_loss_t_min_hf_scale = 0.25
+    freq_loss_t_max_hf_scale = 1.0
+    freq_loss_t_gamma = 1.0
     use_alpha_layer_vae = False
     vae_file = "/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors"
     siglip_model_file = ""
@@ -759,6 +820,22 @@ if __name__ == "__main__":
         complextro_model_config=complextro_model_config,
         prediction_type=prediction_type,
         condition_drop_prob=condition_drop_prob,
+        freq_loss_enabled=freq_loss_enabled,
+        freq_loss_weight=freq_loss_weight,
+        freq_loss_mode=freq_loss_mode,
+        freq_loss_block_size=freq_loss_block_size,
+        freq_loss_profile=freq_loss_profile,
+        freq_loss_quality=freq_loss_quality,
+        freq_loss_jpeg_mode=freq_loss_jpeg_mode,
+        freq_loss_gamma=freq_loss_gamma,
+        freq_loss_color_space=freq_loss_color_space,
+        freq_loss_weight_floor=freq_loss_weight_floor,
+        freq_loss_hf_scale=freq_loss_hf_scale,
+        freq_loss_lf_scale=freq_loss_lf_scale,
+        freq_loss_t_adaptive=freq_loss_t_adaptive,
+        freq_loss_t_min_hf_scale=freq_loss_t_min_hf_scale,
+        freq_loss_t_max_hf_scale=freq_loss_t_max_hf_scale,
+        freq_loss_t_gamma=freq_loss_t_gamma,
         jit_sampling_method="heun",
         jit_cfg_interval_min=0.0,
         jit_cfg_interval_max=1.0,
