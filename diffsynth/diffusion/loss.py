@@ -14,6 +14,8 @@ def FlowMatchSFTLoss(pipe: BasePipeline, **inputs):
     inputs["latents"] = pipe.scheduler.add_noise(inputs["input_latents"], noise, timesteps)
     training_target = pipe.scheduler.training_target(inputs["input_latents"], noise, timesteps)
 
+    inputs["latents"] = inputs["latents"].to(dtype=pipe.torch_dtype)
+
     if "first_frame_latents" in inputs:
         inputs["latents"][:, :, 0:1] = inputs["first_frame_latents"]
 
