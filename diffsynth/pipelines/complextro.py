@@ -907,6 +907,12 @@ def model_fn_complextro(
     # so the sinusoidal embedding ultimately sees the correct value.
     timestep_model = timestep / 1000
 
+    # Ensure latents dtype matches DiT parameters (e.g. PixelIdentityVAE
+    # produces float32 latents but DiT weights are typically bfloat16).
+    model_dtype = next(dit.parameters()).dtype
+    if latents is not None and not isinstance(latents, list) and latents.dtype != model_dtype:
+        latents = latents.to(dtype=model_dtype)
+
     if omni_mode and edit_latents is not None and len(edit_latents) > 0:
         batch_size = latents.shape[0]
 
