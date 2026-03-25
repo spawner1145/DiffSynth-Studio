@@ -53,7 +53,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         jit_sampling_method: str = "heun",
         jit_cfg_interval_min: float = 0.0,
         jit_cfg_interval_max: float = 1.0,
-        jit_loss_weighting: str = "balanced",
+        jit_loss_weighting: str = "velocity",
         freq_loss_enabled: bool = False,  # DeCo 原始推荐：开启；这里默认关闭以保持原行为
         freq_loss_weight: float = 0.0,  # DeCo 原值：1.0
         freq_loss_mode: str = "dct",  # DeCo 原值：DCT block spectral loss
@@ -465,7 +465,7 @@ if __name__ == "__main__":
     parser.add_argument("--jit_sampling_method", type=str, default="heun", help="JiT x-pred sampling method: euler / heun")
     parser.add_argument("--jit_cfg_interval_min", type=float, default=0.0, help="JiT x-pred CFG interval minimum t")
     parser.add_argument("--jit_cfg_interval_max", type=float, default=1.0, help="JiT x-pred CFG interval maximum t")
-    parser.add_argument("--jit_loss_weighting", type=str, default="balanced", help="JiT x-pred loss weighting: velocity / balanced / x_pred")
+    parser.add_argument("--jit_loss_weighting", type=str, default="velocity", help="JiT x-pred loss weighting: velocity / balanced / x_pred")
     parser.add_argument("--freq_loss_enabled", action="store_true", help="Enable frequency-aware residual loss. DeCo 推荐开启；这里默认关闭以保持原行为")
     parser.add_argument("--freq_loss_weight", type=float, default=0.0, help="Multiplier for the frequency-aware residual loss term. DeCo 原值: 1.0")
     parser.add_argument("--freq_loss_mode", type=str, default="dct", help="Frequency loss mode. Currently supports: dct. DeCo 原值: dct")

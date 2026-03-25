@@ -54,7 +54,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         jit_sampling_method: str = "heun",
         jit_cfg_interval_min: float = 0.0,
         jit_cfg_interval_max: float = 1.0,
-        jit_loss_weighting: str = "balanced",
+        jit_loss_weighting: str = "velocity",
         freq_loss_enabled: bool = False,  # DeCo 原始推荐：开启；这里默认关闭以保持原行为
         freq_loss_weight: float = 0.0,  # DeCo 原值：1.0
         freq_loss_mode: str = "dct",  # DeCo 原值：DCT block spectral loss

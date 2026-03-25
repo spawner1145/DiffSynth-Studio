@@ -46,7 +46,7 @@ class ComplextroPipeline(BasePipeline):
         self.jit_sampling_method = "heun"
         self.jit_cfg_interval_min = 0.0
         self.jit_cfg_interval_max = 1.0
-        self.jit_loss_weighting = "x_pred"  # "velocity" | "balanced" | "x_pred"
+        self.jit_loss_weighting = "velocity"  # "velocity" | "balanced" | "x_pred"
         self.freq_loss_enabled = False
         self.freq_loss_weight = 0.0
         self.freq_loss_mode = "dct"
