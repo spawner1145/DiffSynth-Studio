@@ -361,7 +361,7 @@ if __name__ == "__main__":
     }
 
     inference_num_inference_steps = 50
-    inference_cfg_scale = 1.0
+    inference_cfg_scale = 7.0
     inference_denoising_strengths = [0.8, 0.85, 0.9, 1.0]
     inference_omni_mode = False
     inference_output_root = "complextro_xpred_sweep"
@@ -379,7 +379,7 @@ if __name__ == "__main__":
         qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/Qwen3_5_2b_claude_heretic",
         qwen_model_size="2B",
         siglip_model_file="",
-        vae_type="pixel:16",
+        vae_type="pixel_norm:16",
         use_alpha_layer_vae=False,
         prediction_type="jit_xpred",
         jit_sampling_method="heun",
