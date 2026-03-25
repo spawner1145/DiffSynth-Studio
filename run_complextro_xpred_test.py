@@ -201,11 +201,6 @@ def debug_xpred_once(
 ):
     if pipe.prediction_type not in ("jit_xpred", "bridge_xpred"):
         raise ValueError("debug_xpred_once requires prediction_type='jit_xpred' or 'bridge_xpred'.")
-    if not isinstance(pipe.vae, (PixelIdentityVAE, PixelLogitVAE, PixelNormalizedVAE)):
-        raise ValueError(
-            "debug_xpred_once requires pixel-space Complextro "
-            "(PixelIdentityVAE, PixelLogitVAE, or PixelNormalizedVAE)."
-        )
 
     os.makedirs(out_dir, exist_ok=True)
     pipe.load_models_to_device(["vae", "text_encoder", "dit"])
@@ -263,8 +258,13 @@ def debug_xpred_once(
     else:
         x_pred = model_pred
 
+    def to_image_space(tensor):
+        if isinstance(pipe.vae, (PixelIdentityVAE, PixelLogitVAE, PixelNormalizedVAE)):
+            return tensor
+        return pipe.vae.decode(tensor.to(dtype=pipe.torch_dtype)).float()
+
     def save_tensor_image(tensor, path):
-        tensor = tensor.detach().cpu().clamp(-1, 1)
+        tensor = to_image_space(tensor).detach().cpu().clamp(-1, 1)
         tensor = (tensor + 1.0) / 2.0
         vutils.save_image(tensor, path)
 

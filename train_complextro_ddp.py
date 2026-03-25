@@ -127,12 +127,6 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         self.pipe.freq_loss_t_min_hf_scale = float(freq_loss_t_min_hf_scale)
         self.pipe.freq_loss_t_max_hf_scale = float(freq_loss_t_max_hf_scale)
         self.pipe.freq_loss_t_gamma = float(freq_loss_t_gamma)
-        if self.pipe.prediction_type in ("jit_xpred", "bridge_xpred") and int(self.vae_spec["latent_downsample_factor"]) != 1:
-            raise NotImplementedError(
-                "JiT-style x-pred training requires pixel-space Complextro "
-                "(use vae_type='pixel', 'pixel_logit', 'pixel_norm', or their ':<patch_size>' variants)."
-            )
-
         if enable_vram_offload:
             if vram_config is None:
                 vram_config = {

@@ -290,8 +290,6 @@ def JiTXPredLoss(pipe: BasePipeline, **inputs):
       - "balanced"  : ||x - x_pred||² / (1-t)    — 部分修正
       - "x_pred"    : ||x - x_pred||²            — 直接 x 预测 MSE
     """
-    if hasattr(pipe, "_get_vae_downsample_factor") and int(pipe._get_vae_downsample_factor()) != 1:
-        raise NotImplementedError("JiT-style x-pred training is only valid for pixel-space inputs (VAE downsample factor must be 1).")
     x = inputs["input_latents"]
     batch_size = x.shape[0]
     p_mean = float(inputs.get("jit_p_mean", getattr(pipe, "jit_p_mean", -0.8)))
@@ -355,8 +353,6 @@ def JiTXPredLoss(pipe: BasePipeline, **inputs):
 
 
 def BridgeXPredLoss(pipe: BasePipeline, **inputs):
-    if hasattr(pipe, "_get_vae_downsample_factor") and int(pipe._get_vae_downsample_factor()) != 1:
-        raise NotImplementedError("Bridge x-pred training is only valid for pixel-space inputs (VAE downsample factor must be 1).")
     x = inputs["input_latents"]
     batch_size = x.shape[0]
     p_mean = float(inputs.get("jit_p_mean", getattr(pipe, "jit_p_mean", -0.8)))
