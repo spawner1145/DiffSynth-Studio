@@ -996,12 +996,18 @@ def model_fn_complextro(
         )
         return model_output
 
+    siglip_arg = None
+    if image_embeds is not None:
+        siglip_arg = image_embeds
+        if isinstance(siglip_arg, list):
+            siglip_arg = torch.stack(siglip_arg, dim=0)
+
     model_output = dit(
         latents=latents,
         timestep=timestep_model,
         prompt_emb=prompt_emb,
         prompt_emb_mask=prompt_emb_mask,
-        siglip_feats=None,
+        siglip_feats=siglip_arg,
         image_noise_mask=None,
         use_gradient_checkpointing=use_gradient_checkpointing,
         use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,

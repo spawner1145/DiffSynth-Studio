@@ -813,6 +813,23 @@ class ComplextroImageDiT(torch.nn.Module):
         pooled = pooled / cond_token_mask.sum().clamp(min=1.0)
         return self.edit_pool_proj(pooled)
 
+    @staticmethod
+    def _build_condition_token_mask(
+        length_list: List[int],
+        valid_token_mask: List[int],
+    ) -> torch.Tensor:
+        cond_token_mask = []
+        offset = 0
+        for image_idx, image_len in enumerate(length_list):
+            is_cond_image = image_idx != len(length_list) - 1
+            local_valid = valid_token_mask[offset : offset + image_len]
+            if is_cond_image:
+                cond_token_mask.extend(local_valid)
+            else:
+                cond_token_mask.extend([0] * image_len)
+            offset += image_len
+        return torch.tensor(cond_token_mask, dtype=torch.float32)
+
     def _resolve_token_type_embed_ids(self, token_type_ids: torch.Tensor) -> torch.Tensor:
         token_type_ids = token_type_ids.clamp(TOKEN_TYPE_TEXT, TOKEN_TYPE_COND_IMAGE)
         # Keep text and SigLIP distinct, but let cond/target images share the same role embedding.
@@ -1527,11 +1544,10 @@ class ComplextroImageDiT(torch.nn.Module):
 
                 image_tokens = torch.cat(image_tokens_list, dim=0)
                 image_tokens = self.img_in(image_tokens)
-                cond_token_mask = []
-                for image_idx, image_len in enumerate(length_list):
-                    is_cond_image = image_idx != len(length_list) - 1
-                    cond_token_mask.extend([1 if is_cond_image else 0] * image_len)
-                cond_token_mask = torch.tensor(cond_token_mask, dtype=image_tokens.dtype, device=image_tokens.device)
+                cond_token_mask = self._build_condition_token_mask(length_list, image_token_valid_mask).to(
+                    device=image_tokens.device,
+                    dtype=image_tokens.dtype,
+                )
                 edit_pool_cond = self._compute_edit_pool_conditioning(image_tokens, cond_token_mask)
                 local_conditioning_noisy = conditioning_noisy[b : b + 1]
                 local_conditioning_clean = conditioning_clean[b : b + 1]
