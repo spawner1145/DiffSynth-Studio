@@ -125,6 +125,8 @@ class UnifiedDataset(torch.utils.data.Dataset):
         bucket_base_reso=None,
         bucket_index_path=None,
         jsonl_index_path=None,
+        dynamic_prompt=False,
+        prompt_key="prompt",
     ):
         self.base_path = base_path
         self.metadata_path = metadata_path
@@ -143,8 +145,12 @@ class UnifiedDataset(torch.utils.data.Dataset):
         self.bucket_base_reso = bucket_base_reso
         self.bucket_index_path = bucket_index_path
         self.jsonl_index_path = jsonl_index_path
+        self.dynamic_prompt = bool(dynamic_prompt)
+        self.prompt_key = str(prompt_key)
         self.metadata_file_path = None
         self.jsonl_offsets = []  # list[int], data_id -> file offset
+        self._jsonl_file_handle = None
+        self._jsonl_file_handle_pid = None
         self.bucket_manager = None
         self.bucket_reso_by_data_id = {}
         self.bucket_info = {}
@@ -158,6 +164,7 @@ class UnifiedDataset(torch.utils.data.Dataset):
         self.max_skip_retries = 32
         self.data = []
         self.cached_data = []
+        self._bucket_image_operator_cache = {}
         self.load_from_cache = metadata_path is None
         self.load_metadata(metadata_path)
         self.setup_buckets_if_needed()
@@ -346,6 +353,36 @@ class UnifiedDataset(torch.utils.data.Dataset):
             metadata = pandas.read_csv(metadata_path)
             self.data = [metadata.iloc[i].to_dict() for i in range(len(metadata))]
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_jsonl_file_handle"] = None
+        state["_jsonl_file_handle_pid"] = None
+        return state
+
+    def _get_jsonl_file_handle(self):
+        if self.metadata_file_path is None:
+            raise RuntimeError("jsonl metadata file path is not initialized")
+
+        current_pid = os.getpid()
+        if self._jsonl_file_handle_pid != current_pid:
+            self._close_jsonl_file_handle()
+        if self._jsonl_file_handle is None or self._jsonl_file_handle.closed:
+            self._jsonl_file_handle = open(self.metadata_file_path, "r", encoding="utf-8")
+            self._jsonl_file_handle_pid = current_pid
+        return self._jsonl_file_handle
+
+    def _close_jsonl_file_handle(self):
+        if self._jsonl_file_handle is not None:
+            try:
+                self._jsonl_file_handle.close()
+            except Exception:
+                pass
+            self._jsonl_file_handle = None
+            self._jsonl_file_handle_pid = None
+
+    def __del__(self):
+        self._close_jsonl_file_handle()
+
     def get_record_by_id(self, data_id: int):
         """Return a single metadata record by id.
 
@@ -358,9 +395,9 @@ class UnifiedDataset(torch.utils.data.Dataset):
             if data_id < 0 or data_id >= len(self.jsonl_offsets):
                 raise IndexError("data_id out of range for jsonl metadata")
             offset = self.jsonl_offsets[data_id]
-            with open(self.metadata_file_path, "r", encoding="utf-8") as f:
-                f.seek(offset)
-                line = f.readline()
+            f = self._get_jsonl_file_handle()
+            f.seek(offset)
+            line = f.readline()
             return json.loads(line.strip())
 
         # Legacy in-memory behavior
@@ -475,40 +512,43 @@ class UnifiedDataset(torch.utils.data.Dataset):
         skipped_missing_file = 0
         skipped_unreadable = 0
 
-        # Iterate over all items regardless of whether metadata is kept in memory
-        # or accessed lazily via jsonl index.
-        num_items = len(self.jsonl_offsets) if (self.metadata_file_path is not None and self.jsonl_offsets) else len(self.data)
-        for data_id in range(num_items):
-            data = self.get_record_by_id(data_id)
-            if bucket_data_key not in data:
-                skipped_missing_key += 1
-                continue
+        try:
+            # Iterate over all items regardless of whether metadata is kept in memory
+            # or accessed lazily via jsonl index.
+            num_items = len(self.jsonl_offsets) if (self.metadata_file_path is not None and self.jsonl_offsets) else len(self.data)
+            for data_id in range(num_items):
+                data = self.get_record_by_id(data_id)
+                if bucket_data_key not in data:
+                    skipped_missing_key += 1
+                    continue
 
-            value = data[bucket_data_key]
-            path = None
-            if isinstance(value, str):
-                path = value
-            elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], str):
-                path = value[0]
+                value = data[bucket_data_key]
+                path = None
+                if isinstance(value, str):
+                    path = value
+                elif isinstance(value, list) and len(value) > 0 and isinstance(value[0], str):
+                    path = value[0]
 
-            if path is None:
-                skipped_invalid_value += 1
-                continue
+                if path is None:
+                    skipped_invalid_value += 1
+                    continue
 
-            path = self.resolve_data_path(path)
-            if not os.path.exists(path):
-                skipped_missing_file += 1
-                continue
+                path = self.resolve_data_path(path)
+                if not os.path.exists(path):
+                    skipped_missing_file += 1
+                    continue
 
-            size = self.fetch_image_size_from_data_value(value)
-            if size is None:
-                skipped_unreadable += 1
-                continue
-            image_width, image_height = size
+                size = self.fetch_image_size_from_data_value(value)
+                if size is None:
+                    skipped_unreadable += 1
+                    continue
+                image_width, image_height = size
 
-            reso, _, _ = self.bucket_manager.select_bucket(image_width, image_height)
-            self.bucket_reso_by_data_id[data_id] = reso
-            bucket_counts[reso] = bucket_counts.get(reso, 0) + 1
+                reso, _, _ = self.bucket_manager.select_bucket(image_width, image_height)
+                self.bucket_reso_by_data_id[data_id] = reso
+                bucket_counts[reso] = bucket_counts.get(reso, 0) + 1
+        finally:
+            self._close_jsonl_file_handle()
 
         if len(self.bucket_reso_by_data_id) == 0:
             raise ValueError(
@@ -563,6 +603,89 @@ class UnifiedDataset(torch.utils.data.Dataset):
     def set_current_step(self, step):
         self.current_step = int(step)
 
+    def _sync_shared_state(self):
+        shared_epoch = getattr(self, '_shared_epoch_value', None)
+        if shared_epoch is not None:
+            epoch = int(shared_epoch.value)
+            if self.current_epoch != epoch:
+                self.current_epoch = epoch
+                self.shuffle_buckets()
+        shared_step = getattr(self, '_shared_step_value', None)
+        if shared_step is not None:
+            self.current_step = int(shared_step.value)
+
+    def _build_prompt_rng(self, source_data_id):
+        seed = (
+            (int(self.seed) * 1000003)
+            + (int(self.current_step) * 9176)
+            + int(source_data_id)
+        ) & 0xFFFFFFFFFFFFFFFF
+        return random.Random(seed)
+
+    def _normalize_dynamic_prompt_groups(self, prompt_value):
+        if not isinstance(prompt_value, dict):
+            return None
+
+        groups = []
+        for _, group_value in prompt_value.items():
+            weight = 1.0
+            prompts = None
+            if isinstance(group_value, dict):
+                weight = group_value.get("weight", 1.0)
+                prompts = group_value.get("prompts", group_value.get("list", None))
+            elif isinstance(group_value, list):
+                prompts = group_value
+
+            if not isinstance(prompts, list):
+                continue
+
+            normalized_prompts = []
+            for prompt in prompts:
+                prompt = str(prompt).strip()
+                if prompt != "":
+                    normalized_prompts.append(prompt)
+
+            if len(normalized_prompts) == 0:
+                continue
+
+            try:
+                weight = float(weight)
+            except Exception:
+                weight = 1.0
+
+            if weight <= 0:
+                continue
+
+            groups.append((weight, normalized_prompts))
+
+        return groups if len(groups) > 0 else None
+
+    def _sample_dynamic_prompt(self, prompt_value, source_data_id):
+        groups = self._normalize_dynamic_prompt_groups(prompt_value)
+        if groups is None:
+            return prompt_value
+
+        rng = self._build_prompt_rng(source_data_id)
+        total_weight = sum(weight for weight, _ in groups)
+        pick = rng.random() * total_weight
+        chosen_prompts = groups[-1][1]
+        cumulative_weight = 0.0
+        for weight, prompts in groups:
+            cumulative_weight += weight
+            if pick <= cumulative_weight:
+                chosen_prompts = prompts
+                break
+
+        if len(chosen_prompts) == 1:
+            return chosen_prompts[0]
+        return chosen_prompts[rng.randrange(len(chosen_prompts))]
+
+    def _apply_dynamic_prompt_if_needed(self, data, source_data_id):
+        if (not self.dynamic_prompt) or self.prompt_key not in data:
+            return data
+        data[self.prompt_key] = self._sample_dynamic_prompt(data[self.prompt_key], source_data_id)
+        return data
+
     def rebuild_bucket_batches_if_needed(self):
         self.bucket_to_data_ids = {}
         self.bucket_batch_indices = []
@@ -607,9 +730,20 @@ class UnifiedDataset(torch.utils.data.Dataset):
             random.shuffle(self.bucket_to_data_ids[reso])
         random.shuffle(self.bucket_batch_indices)
 
+    def get_bucket_image_operator(self, reso):
+        if reso not in self._bucket_image_operator_cache:
+            target_width, target_height = reso
+            self._bucket_image_operator_cache[reso] = ImageCropAndResize(
+                height=target_height,
+                width=target_width,
+                max_pixels=None,
+                height_division_factor=1,
+                width_division_factor=1,
+            )
+        return self._bucket_image_operator_cache[reso]
+
     def apply_bucket_image_operator(self, value, reso):
-        target_width, target_height = reso
-        operator = ImageCropAndResize(height=target_height, width=target_width, max_pixels=None, height_division_factor=1, width_division_factor=1)
+        operator = self.get_bucket_image_operator(reso)
 
         if isinstance(value, str):
             image = LoadImage()(ToAbsolutePath(self.base_path)(value))
@@ -620,6 +754,7 @@ class UnifiedDataset(torch.utils.data.Dataset):
 
     def process_single_data(self, source_data_id, force_reso=None):
         data = self.get_record_by_id(source_data_id).copy()
+        data = self._apply_dynamic_prompt_if_needed(data, source_data_id)
         for key in self.data_file_keys:
             if key in data:
                 if key in self.special_operator_map:
@@ -669,6 +804,7 @@ class UnifiedDataset(torch.utils.data.Dataset):
         ) from last_error
 
     def __getitem__(self, data_id):
+        self._sync_shared_state()
         if self.load_from_cache:
             data = self.cached_data[data_id % len(self.cached_data)]
             data = self.cached_data_operator(data)
