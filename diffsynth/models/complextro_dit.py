@@ -78,6 +78,16 @@ class ApproximateGELU(nn.Module):
         x = self.proj(x)
         return x * torch.sigmoid(1.702 * x)
 
+
+class ComplextroSwiGLU(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.gate_fn = nn.SiLU()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x1, x2 = x.chunk(2, dim=-1)
+        return self.gate_fn(x1) * x2
+
 def apply_rotary_emb_complextro(
     x: torch.Tensor,
     freqs_cis: Union[torch.Tensor, Tuple[torch.Tensor]]
@@ -402,19 +412,138 @@ class ComplextroFeedForward(nn.Module):
         self,
         dim: int,
         dim_out: Optional[int] = None,
-        dropout: float = 0.0,
+        mult: float = 4.0,
+        bias: bool = True,
     ):
         super().__init__()
-        inner_dim = int(dim * 4)
-        self.net = nn.ModuleList([])
-        self.net.append(ApproximateGELU(dim, inner_dim))
-        self.net.append(nn.Dropout(dropout))
-        self.net.append(nn.Linear(inner_dim, dim_out))
+        inner_dim = int(dim * mult)
+        dim_out = dim if dim_out is None else dim_out
 
-    def forward(self, hidden_states: torch.Tensor, *args, **kwargs) -> torch.Tensor:
-        for module in self.net:
-            hidden_states = module(hidden_states)
+        self.linear_in = nn.Linear(dim, inner_dim * 2, bias=bias)
+        self.act_fn = ComplextroSwiGLU()
+        self.linear_out = nn.Linear(inner_dim, dim_out, bias=bias)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.linear_in(hidden_states)
+        hidden_states = self.act_fn(hidden_states)
+        hidden_states = self.linear_out(hidden_states)
         return hidden_states
+
+
+class ComplextroModulation(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_token_types: int = 4,
+        use_token_type_bias: bool = True,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.num_token_types = num_token_types
+        self.use_token_type_bias = use_token_type_bias
+
+        self.act_fn = nn.SiLU()
+        self.base = nn.Linear(dim, 6 * dim)
+        if use_token_type_bias:
+            self.type_bias = nn.Embedding(num_token_types, 6 * dim)
+        else:
+            self.type_bias = None
+
+    def forward(
+        self,
+        temb: torch.Tensor,
+        token_type_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        mod = self.base(self.act_fn(temb))
+        if token_type_ids is None or self.type_bias is None:
+            return mod
+
+        token_type_ids = token_type_ids.to(device=temb.device, dtype=torch.long).clamp(0, self.num_token_types - 1)
+        type_bias = self.type_bias(token_type_ids)
+        return mod + type_bias
+
+    def init_zero(self):
+        nn.init.zeros_(self.base.weight)
+        nn.init.zeros_(self.base.bias)
+        if self.type_bias is not None:
+            nn.init.zeros_(self.type_bias.weight)
+
+    def expand_legacy_state_dict(self, state_dict: dict, module_prefix: str):
+        base_prefix = f"{module_prefix}.base"
+        legacy_prefix = f"{module_prefix}_legacy"
+        base_weight_key = f"{base_prefix}.weight"
+        base_bias_key = f"{base_prefix}.bias"
+        legacy_weight_key = f"{legacy_prefix}.weight"
+        legacy_bias_key = f"{legacy_prefix}.bias"
+        if base_weight_key not in state_dict and legacy_weight_key in state_dict:
+            state_dict[base_weight_key] = state_dict[legacy_weight_key].detach().clone()
+        if base_bias_key not in state_dict and legacy_bias_key in state_dict:
+            state_dict[base_bias_key] = state_dict[legacy_bias_key].detach().clone()
+
+
+class ComplextroParallelSingleStreamAttention(nn.Module):
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        head_dim: int,
+        mlp_ratio: float = 4.0,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.inner_dim = dim
+        self.mlp_hidden_dim = int(dim * mlp_ratio)
+
+        self.to_qkv_mlp = nn.Linear(dim, self.inner_dim * 3 + self.mlp_hidden_dim * 2, bias=bias)
+        self.norm_q = RMSNorm(head_dim, eps=1e-6)
+        self.norm_k = RMSNorm(head_dim, eps=1e-6)
+        self.mlp_act = ComplextroSwiGLU()
+        self.to_attn_out = nn.Linear(self.inner_dim, dim, bias=bias)
+        self.to_mlp_out = nn.Linear(self.mlp_hidden_dim, dim, bias=bias)
+
+    def forward(
+        self,
+        attn_hidden_states: torch.FloatTensor,
+        mlp_hidden_states: torch.FloatTensor,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        enable_fp8_attention: bool = False,
+    ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
+        if mlp_hidden_states.data_ptr() == attn_hidden_states.data_ptr():
+            fused = self.to_qkv_mlp(attn_hidden_states)
+            qkv, mlp_fused = fused.split([self.inner_dim * 3, self.mlp_hidden_dim * 2], dim=-1)
+        else:
+            fused_attn = self.to_qkv_mlp(attn_hidden_states)
+            qkv, _ = fused_attn.split([self.inner_dim * 3, self.mlp_hidden_dim * 2], dim=-1)
+            fused_mlp = self.to_qkv_mlp(mlp_hidden_states)
+            _, mlp_fused = fused_mlp.split([self.inner_dim * 3, self.mlp_hidden_dim * 2], dim=-1)
+
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = rearrange(q, "b s (h d) -> b h s d", h=self.num_heads)
+        k = rearrange(k, "b s (h d) -> b h s d", h=self.num_heads)
+        v = rearrange(v, "b s (h d) -> b h s d", h=self.num_heads)
+
+        q, k = self.norm_q(q), self.norm_k(k)
+
+        if image_rotary_emb is not None:
+            q = apply_rotary_emb_complextro(q, image_rotary_emb)
+            k = apply_rotary_emb_complextro(k, image_rotary_emb)
+
+        attn_out = complextro_image_flash_attention(
+            q,
+            k,
+            v,
+            num_heads=q.shape[1],
+            attention_mask=attention_mask,
+            enable_fp8_attention=enable_fp8_attention,
+        ).to(q.dtype)
+        attn_out = self.to_attn_out(attn_out)
+
+        mlp_out = self.mlp_act(mlp_fused)
+        mlp_out = self.to_mlp_out(mlp_out)
+        return attn_out, mlp_out
 
 
 class ComplextroSingleStreamAttention(nn.Module):
@@ -464,7 +593,55 @@ class ComplextroSingleStreamAttention(nn.Module):
         return attn_out
 
 
-class ComplextroSingleTransformerBlock(nn.Module):
+class ComplextroModulatedBlockMixin:
+    def _prepare_temb(
+        self,
+        hidden_states: torch.Tensor,
+        temb: torch.Tensor,
+        token_type_ids: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        target_batch, target_seq = hidden_states.shape[:2]
+
+        if temb.ndim == 2:
+            if temb.shape[0] == 1 and target_batch > 1:
+                temb = temb.expand(target_batch, -1)
+            elif temb.shape[0] != target_batch:
+                raise ValueError("temb batch size must match hidden_states batch size.")
+            temb = temb.unsqueeze(1).expand(-1, target_seq, -1)
+        elif temb.ndim == 3:
+            if temb.shape[0] == 1 and target_batch > 1:
+                temb = temb.expand(target_batch, -1, -1)
+            elif temb.shape[0] != target_batch:
+                raise ValueError("temb batch size must match hidden_states batch size.")
+            if temb.shape[1] == 1 and target_seq > 1:
+                temb = temb.expand(-1, target_seq, -1)
+            elif temb.shape[1] != target_seq:
+                raise ValueError("temb sequence length must match hidden_states sequence length.")
+        else:
+            raise ValueError("temb must be 2D or 3D.")
+
+        if token_type_ids is not None:
+            if token_type_ids.shape[0] == 1 and target_batch > 1:
+                token_type_ids = token_type_ids.expand(target_batch, -1)
+            elif token_type_ids.shape[0] != target_batch:
+                raise ValueError("token_type_ids batch size must match hidden_states batch size.")
+            if token_type_ids.shape[1] != target_seq:
+                raise ValueError("token_type_ids sequence length must match hidden_states sequence length.")
+
+        return temb
+
+    def _compute_modulation_params(self, temb: torch.Tensor, token_type_ids: Optional[torch.Tensor] = None):
+        if token_type_ids is not None:
+            token_type_ids = token_type_ids.to(device=temb.device, dtype=torch.long).clamp(TOKEN_TYPE_TEXT, TOKEN_TYPE_COND_IMAGE)
+            mod = self.modulation_layer(temb, token_type_ids)
+        else:
+            mod = self.modulation_layer(temb)
+            if mod.ndim == 2:
+                mod = mod.unsqueeze(1)
+        return mod.chunk(6, dim=-1)
+
+
+class ComplextroSingleTransformerBlock(ComplextroModulatedBlockMixin, nn.Module):
     def __init__(
         self,
         dim: int,
@@ -490,18 +667,93 @@ class ComplextroSingleTransformerBlock(nn.Module):
         self.mlp = ComplextroFeedForward(dim=dim, dim_out=dim)
 
         if modulation:
-            self.modulation_mlp = nn.Sequential(
-                nn.SiLU(),
-                nn.Linear(dim, 6 * dim),
+            self.modulation_layer = ComplextroModulation(
+                dim=dim,
+                num_token_types=4,
+                use_token_type_bias=True,
             )
-            self.modulation_mlps = nn.ModuleList(
-                [
-                    nn.Sequential(
-                        nn.SiLU(),
-                        nn.Linear(dim, 6 * dim),
-                    )
-                    for _ in range(4)
-                ]
+
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        temb: Optional[torch.Tensor] = None,
+        token_type_ids: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        enable_fp8_attention: bool = False,
+    ) -> torch.Tensor:
+        if not self.modulation:
+            attn_out = self.attn(
+                hidden_states=self.norm1(hidden_states),
+                image_rotary_emb=image_rotary_emb,
+                attention_mask=attention_mask,
+                enable_fp8_attention=enable_fp8_attention,
+            )
+            hidden_states = hidden_states + attn_out
+            hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+            return hidden_states
+
+        if temb is None:
+            raise ValueError("temb must be provided when modulation is enabled.")
+
+        temb = self._prepare_temb(hidden_states, temb, token_type_ids)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._compute_modulation_params(
+            temb, token_type_ids
+        )
+
+        norm_hidden_states = self.norm1(hidden_states)
+        norm_hidden_states = (1 + scale_msa) * norm_hidden_states + shift_msa
+        attn_out = self.attn(
+            hidden_states=norm_hidden_states,
+            image_rotary_emb=image_rotary_emb,
+            attention_mask=attention_mask,
+            enable_fp8_attention=enable_fp8_attention,
+        )
+        hidden_states = hidden_states + gate_msa * attn_out
+
+        norm_hidden_states = self.norm2(hidden_states)
+        norm_hidden_states = (1 + scale_mlp) * norm_hidden_states + shift_mlp
+        mlp_out = self.mlp(norm_hidden_states)
+        hidden_states = hidden_states + gate_mlp * mlp_out
+
+        return hidden_states
+
+
+class ComplextroRefinerBlock(ComplextroSingleTransformerBlock):
+    """Light type-specific refinement block used before omni packing into the unified trunk."""
+    pass
+
+
+class ComplextroMainBlock(ComplextroModulatedBlockMixin, nn.Module):
+    """Unified omni trunk block operating on packed multimodal sequences."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_attention_heads: int,
+        attention_head_dim: int,
+        mlp_ratio: float = 4.0,
+        eps: float = 1e-6,
+        modulation: bool = True,
+    ):
+        super().__init__()
+        self.dim = dim
+        self.modulation = modulation
+        self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
+        self.parallel_attn = ComplextroParallelSingleStreamAttention(
+            dim=dim,
+            num_heads=num_attention_heads,
+            head_dim=attention_head_dim,
+            mlp_ratio=mlp_ratio,
+            bias=True,
+        )
+
+        if modulation:
+            self.modulation_layer = ComplextroModulation(
+                dim=dim,
+                num_token_types=4,
+                use_token_type_bias=True,
             )
 
     def forward(
@@ -513,85 +765,74 @@ class ComplextroSingleTransformerBlock(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         enable_fp8_attention: bool = False,
     ) -> torch.Tensor:
-        if self.modulation:
-            if temb is None:
-                raise ValueError("temb must be provided when modulation is enabled.")
-
-            if token_type_ids is not None:
-                target_batch = hidden_states.shape[0]
-
-                if temb.ndim == 2:
-                    if temb.shape[0] == 1 and target_batch > 1:
-                        temb = temb.expand(target_batch, -1)
-                    elif temb.shape[0] != target_batch:
-                        raise ValueError("temb batch size must match hidden_states batch size.")
-                    temb = temb.unsqueeze(1).expand(-1, hidden_states.shape[1], -1)
-                elif temb.ndim == 3:
-                    if temb.shape[0] == 1 and target_batch > 1:
-                        temb = temb.expand(target_batch, -1, -1)
-                    elif temb.shape[0] != target_batch:
-                        raise ValueError("temb batch size must match hidden_states batch size.")
-                    if temb.shape[1] == 1 and hidden_states.shape[1] > 1:
-                        temb = temb.expand(-1, hidden_states.shape[1], -1)
-                    elif temb.shape[1] != hidden_states.shape[1]:
-                        raise ValueError("temb sequence length must match hidden_states when token_type_ids is provided.")
-                else:
-                    raise ValueError("temb must be 2D or 3D when token_type_ids is provided.")
-
-                if token_type_ids.shape[0] == 1 and target_batch > 1:
-                    token_type_ids = token_type_ids.expand(target_batch, -1)
-                elif token_type_ids.shape[0] != target_batch:
-                    raise ValueError("token_type_ids batch size must match hidden_states batch size.")
-                if token_type_ids.shape[1] != hidden_states.shape[1]:
-                    raise ValueError("token_type_ids sequence length must match hidden_states sequence length.")
-
-                token_type_ids = token_type_ids.to(device=hidden_states.device, dtype=torch.long).clamp(
-                    TOKEN_TYPE_TEXT, TOKEN_TYPE_COND_IMAGE
-                )
-                flat_temb = temb.reshape(-1, temb.shape[-1])
-                flat_token_type_ids = token_type_ids.reshape(-1)
-                flat_mod = torch.empty(
-                    (flat_temb.shape[0], 6 * self.dim),
-                    device=flat_temb.device,
-                    dtype=flat_temb.dtype,
-                )
-                for type_id, mlp in enumerate(self.modulation_mlps):
-                    type_mask = flat_token_type_ids == type_id
-                    if type_mask.any():
-                        flat_mod[type_mask] = mlp(flat_temb[type_mask])
-                mod = flat_mod.view(*temb.shape[:-1], -1)
-            else:
-                mod = self.modulation_mlp(temb)
-                if mod.ndim == 2:
-                    mod = mod.unsqueeze(1)
-
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mod.chunk(6, dim=-1)
-
-            normed = self.norm1(hidden_states)
-            normed = normed * (1 + scale_msa) + shift_msa
-            attn_out = self.attn(
-                hidden_states=normed,
+        if not self.modulation:
+            norm_hidden_states = self.norm(hidden_states)
+            attn_out, mlp_out = self.parallel_attn(
+                attn_hidden_states=norm_hidden_states,
+                mlp_hidden_states=norm_hidden_states,
                 image_rotary_emb=image_rotary_emb,
                 attention_mask=attention_mask,
                 enable_fp8_attention=enable_fp8_attention,
             )
-            hidden_states = hidden_states + gate_msa * attn_out
+            return hidden_states + attn_out + mlp_out
 
-            normed = self.norm2(hidden_states)
-            normed = normed * (1 + scale_mlp) + shift_mlp
-            mlp_out = self.mlp(normed)
-            hidden_states = hidden_states + gate_mlp * mlp_out
-        else:
-            attn_out = self.attn(
-                hidden_states=self.norm1(hidden_states),
-                image_rotary_emb=image_rotary_emb,
-                attention_mask=attention_mask,
-                enable_fp8_attention=enable_fp8_attention,
-            )
-            hidden_states = hidden_states + attn_out
-            hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+        if temb is None:
+            raise ValueError("temb must be provided when modulation is enabled.")
 
-        return hidden_states
+        temb = self._prepare_temb(hidden_states, temb, token_type_ids)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._compute_modulation_params(temb, token_type_ids)
+        norm_hidden_states = self.norm(hidden_states)
+        attn_hidden_states = (1 + scale_msa) * norm_hidden_states + shift_msa
+        mlp_hidden_states = (1 + scale_mlp) * norm_hidden_states + shift_mlp
+        attn_out, mlp_out = self.parallel_attn(
+            attn_hidden_states=attn_hidden_states,
+            mlp_hidden_states=mlp_hidden_states,
+            image_rotary_emb=image_rotary_emb,
+            attention_mask=attention_mask,
+            enable_fp8_attention=enable_fp8_attention,
+        )
+        return hidden_states + gate_msa * attn_out + gate_mlp * mlp_out
+
+
+class ComplextroPackedSequence:
+    def __init__(
+        self,
+        hidden_states: torch.Tensor,
+        freqs: torch.Tensor,
+        key_mask: Optional[torch.Tensor],
+        temb: Optional[torch.Tensor] = None,
+        token_type_ids: Optional[torch.Tensor] = None,
+        seq_lens: Optional[List[int]] = None,
+        offsets: Optional[List[Tuple[int, int]]] = None,
+    ):
+        self.hidden_states = hidden_states
+        self.freqs = freqs
+        self.key_mask = key_mask
+        self.temb = temb
+        self.token_type_ids = token_type_ids
+        self.seq_lens = seq_lens if seq_lens is not None else []
+        self.offsets = offsets if offsets is not None else []
+
+
+class ComplextroSegment:
+    def __init__(
+        self,
+        kind: str,
+        tokens: torch.Tensor,
+        freqs: Optional[torch.Tensor] = None,
+        temb: Optional[torch.Tensor] = None,
+        token_type_ids: Optional[torch.Tensor] = None,
+        valid_mask: Optional[torch.Tensor] = None,
+        metadata: Optional[dict] = None,
+    ):
+        self.kind = kind
+        self.tokens = tokens
+        self.freqs = freqs
+        self.temb = temb
+        self.token_type_ids = token_type_ids
+        self.valid_mask = valid_mask
+        self.metadata = metadata or {}
+
 
 
 class ComplextroImageDiT(torch.nn.Module):
@@ -692,7 +933,7 @@ class ComplextroImageDiT(torch.nn.Module):
 
         self.noise_refiner = nn.ModuleList(
             [
-                ComplextroSingleTransformerBlock(
+                ComplextroRefinerBlock(
                     dim=self.hidden_size,
                     num_attention_heads=self.num_attention_heads,
                     attention_head_dim=self.attention_head_dim,
@@ -703,7 +944,7 @@ class ComplextroImageDiT(torch.nn.Module):
         )
         self.context_refiner = nn.ModuleList(
             [
-                ComplextroSingleTransformerBlock(
+                ComplextroRefinerBlock(
                     dim=self.hidden_size,
                     num_attention_heads=self.num_attention_heads,
                     attention_head_dim=self.attention_head_dim,
@@ -722,7 +963,7 @@ class ComplextroImageDiT(torch.nn.Module):
             self.siglip_pad_token = nn.Parameter(torch.empty((1, self.hidden_size)))
             self.siglip_refiner = nn.ModuleList(
                 [
-                    ComplextroSingleTransformerBlock(
+                    ComplextroRefinerBlock(
                         dim=self.hidden_size,
                         num_attention_heads=self.num_attention_heads,
                         attention_head_dim=self.attention_head_dim,
@@ -738,7 +979,7 @@ class ComplextroImageDiT(torch.nn.Module):
 
         self.transformer_blocks = nn.ModuleList(
             [
-                ComplextroSingleTransformerBlock(
+                ComplextroMainBlock(
                     dim=self.hidden_size,
                     num_attention_heads=self.num_attention_heads,
                     attention_head_dim=self.attention_head_dim,
@@ -779,11 +1020,7 @@ class ComplextroImageDiT(torch.nn.Module):
         for block in list(self.transformer_blocks) + list(self.noise_refiner) + list(self.context_refiner):
             if block.modulation:
                 # DiT-style adaLN-Zero: start each modulated block close to identity.
-                nn.init.zeros_(block.modulation_mlp[-1].weight)
-                nn.init.zeros_(block.modulation_mlp[-1].bias)
-                for mlp in block.modulation_mlps:
-                    nn.init.zeros_(mlp[-1].weight)
-                    nn.init.zeros_(mlp[-1].bias)
+                block.modulation_layer.init_zero()
 
         nn.init.zeros_(self.norm_out.linear.weight)
         nn.init.zeros_(self.norm_out.linear.bias)
@@ -863,38 +1100,34 @@ class ComplextroImageDiT(torch.nn.Module):
             state_dict = dict(state_dict)
 
         for module_prefix, module in self.named_modules():
-            if not isinstance(module, ComplextroSingleTransformerBlock) or not getattr(module, "modulation", False):
+            if not isinstance(module, (ComplextroSingleTransformerBlock, ComplextroMainBlock)) or not getattr(module, "modulation", False):
                 continue
 
-            base_prefix = f"{module_prefix}.modulation_mlp.1"
+            base_prefix = f"{module_prefix}.modulation_layer.base"
             base_weight_key = f"{base_prefix}.weight"
             base_bias_key = f"{base_prefix}.bias"
+            legacy_prefix = f"{module_prefix}.modulation_mlp.1"
+            legacy_weight_key = f"{legacy_prefix}.weight"
+            legacy_bias_key = f"{legacy_prefix}.bias"
+
+            if base_weight_key not in state_dict and legacy_weight_key in state_dict:
+                state_dict[base_weight_key] = state_dict[legacy_weight_key].detach().clone()
+            if base_bias_key not in state_dict and legacy_bias_key in state_dict:
+                state_dict[base_bias_key] = state_dict[legacy_bias_key].detach().clone()
 
             if base_weight_key not in state_dict or base_bias_key not in state_dict:
                 continue
 
-            for head_idx in range(4):
-                head_prefix = f"{module_prefix}.modulation_mlps.{head_idx}.1"
-                head_weight_key = f"{head_prefix}.weight"
-                head_bias_key = f"{head_prefix}.bias"
-                if head_weight_key not in state_dict:
-                    if head_idx == TOKEN_TYPE_COND_IMAGE:
-                        old_image_weight_key = f"{module_prefix}.modulation_mlps.{TOKEN_TYPE_TARGET_IMAGE}.1.weight"
-                        if old_image_weight_key in state_dict:
-                            state_dict[head_weight_key] = state_dict[old_image_weight_key].detach().clone()
-                        else:
-                            state_dict[head_weight_key] = state_dict[base_weight_key].detach().clone()
-                    else:
-                        state_dict[head_weight_key] = state_dict[base_weight_key].detach().clone()
-                if head_bias_key not in state_dict:
-                    if head_idx == TOKEN_TYPE_COND_IMAGE:
-                        old_image_bias_key = f"{module_prefix}.modulation_mlps.{TOKEN_TYPE_TARGET_IMAGE}.1.bias"
-                        if old_image_bias_key in state_dict:
-                            state_dict[head_bias_key] = state_dict[old_image_bias_key].detach().clone()
-                        else:
-                            state_dict[head_bias_key] = state_dict[base_bias_key].detach().clone()
-                    else:
-                        state_dict[head_bias_key] = state_dict[base_bias_key].detach().clone()
+            if getattr(module.modulation_layer, "type_bias", None) is not None:
+                for head_idx in range(module.modulation_layer.num_token_types):
+                    head_prefix = f"{module_prefix}.modulation_layer.type_bias"
+                    head_weight_key = f"{head_prefix}.weight"
+                    legacy_head_prefix = f"{module_prefix}.modulation_mlps.{head_idx}.1"
+                    legacy_head_weight_key =f"{legacy_head_prefix}.weight"
+                    if head_weight_key not in state_dict:
+                        state_dict[head_weight_key] = torch.zeros_like(module.modulation_layer.type_bias.weight)
+                    if legacy_head_weight_key in state_dict:
+                        state_dict[head_weight_key][head_idx].copy_(state_dict[legacy_head_weight_key].detach().clone().mean(dim=0))
 
         if self.siglip_pad_token is not None:
             if "siglip_pad_token" not in state_dict:
@@ -1322,6 +1555,441 @@ class ComplextroImageDiT(torch.nn.Module):
         return image_freqs, txt_freqs, siglip_freqs
 
 
+    def _pack_sequence(
+        self,
+        unified_list: List[torch.Tensor],
+        freqs_list: List[torch.Tensor],
+        seq_lens: List[int],
+        dtype: torch.dtype,
+        device: torch.device,
+        temb: Optional[torch.Tensor] = None,
+        token_type_ids: Optional[torch.Tensor] = None,
+        token_valid_masks: Optional[List[torch.Tensor]] = None,
+        offsets: Optional[List[Tuple[int, int]]] = None,
+    ) -> ComplextroPackedSequence:
+        hidden_states, freqs, key_mask = self._build_padded_unified(
+            unified_list,
+            freqs_list,
+            seq_lens,
+            dtype=dtype,
+            device=device,
+            token_valid_masks=token_valid_masks,
+        )
+        return ComplextroPackedSequence(
+            hidden_states=hidden_states,
+            freqs=freqs,
+            key_mask=key_mask,
+            temb=temb,
+            token_type_ids=token_type_ids,
+            seq_lens=seq_lens,
+            offsets=offsets,
+        )
+
+
+    def _run_blocks(
+        self,
+        packed: ComplextroPackedSequence,
+        blocks: nn.ModuleList,
+        use_gradient_checkpointing: bool = False,
+        use_gradient_checkpointing_offload: bool = False,
+        enable_fp8_attention: bool = False,
+    ) -> ComplextroPackedSequence:
+        for block in blocks:
+            packed.hidden_states = gradient_checkpoint_forward(
+                block,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+                hidden_states=packed.hidden_states,
+                temb=packed.temb,
+                token_type_ids=packed.token_type_ids,
+                image_rotary_emb=packed.freqs,
+                attention_mask=packed.key_mask,
+                enable_fp8_attention=enable_fp8_attention,
+            )
+        return packed
+
+    def _route_start(
+        self,
+        packed: ComplextroPackedSequence,
+        token_type_ids: torch.Tensor,
+        route: dict,
+    ) -> Tuple[ComplextroPackedSequence, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        route_original_hidden = packed.hidden_states
+        route_original_freqs = packed.freqs
+        route_original_temb = packed.temb
+        route_original_types = token_type_ids
+        route_ids_keep = self.tread_router.get_mask(packed.hidden_states, selection_rate=route["selection_ratio"])
+        packed.hidden_states = self.tread_router.start_route(packed.hidden_states, route_ids_keep)
+        packed.freqs = self.tread_router.start_route(packed.freqs, route_ids_keep)
+        if packed.temb is not None:
+            packed.temb = self.tread_router.start_route(packed.temb, route_ids_keep)
+        routed_types = self.tread_router.start_route(token_type_ids.unsqueeze(-1), route_ids_keep).squeeze(-1)
+        routed_key_mask = None
+        if packed.key_mask is not None:
+            routed_key_mask = packed.key_mask.gather(
+                -1,
+                route_ids_keep.unsqueeze(1).unsqueeze(1).expand(-1, packed.key_mask.shape[1], packed.key_mask.shape[2], -1),
+            )
+            packed.key_mask = routed_key_mask
+        return packed, routed_types, route_ids_keep, route_original_hidden, route_original_freqs, route_original_temb, route_original_types, routed_key_mask
+
+    def _route_end(
+        self,
+        packed: ComplextroPackedSequence,
+        routed_token_types: torch.Tensor,
+        route_ids_keep: torch.Tensor,
+        route_original_hidden: torch.Tensor,
+        route_original_freqs: torch.Tensor,
+        route_original_temb: Optional[torch.Tensor],
+        route_original_types: torch.Tensor,
+        original_key_mask: Optional[torch.Tensor],
+    ) -> Tuple[ComplextroPackedSequence, torch.Tensor]:
+        packed.hidden_states = self.tread_router.end_route(packed.hidden_states, route_ids_keep, route_original_hidden)
+        packed.freqs = self.tread_router.end_route(packed.freqs, route_ids_keep, route_original_freqs)
+        if packed.temb is not None and route_original_temb is not None:
+            packed.temb = self.tread_router.end_route(packed.temb, route_ids_keep, route_original_temb)
+        token_type_ids = self.tread_router.end_route(
+            routed_token_types.unsqueeze(-1),
+            route_ids_keep,
+            route_original_types.unsqueeze(-1),
+        ).squeeze(-1)
+        packed.key_mask = original_key_mask
+        return packed, token_type_ids
+
+
+    @staticmethod
+    def _segment_token_types(kind: str, seq_len: int, device: torch.device) -> torch.Tensor:
+        if kind == "text":
+            token_type = TOKEN_TYPE_TEXT
+        elif kind == "target_image":
+            token_type = TOKEN_TYPE_TARGET_IMAGE
+        elif kind == "cond_image":
+            token_type = TOKEN_TYPE_COND_IMAGE
+        elif kind == "siglip":
+            token_type = TOKEN_TYPE_SIGLIP
+        else:
+            raise ValueError(f"Unknown segment kind: {kind}")
+        return torch.full((seq_len,), token_type, dtype=torch.long, device=device)
+
+    def _make_segment(
+        self,
+        kind: str,
+        tokens: torch.Tensor,
+        freqs: Optional[torch.Tensor] = None,
+        temb: Optional[torch.Tensor] = None,
+        valid_mask: Optional[torch.Tensor] = None,
+        metadata: Optional[dict] = None,
+    ) -> ComplextroSegment:
+        token_type_ids = self._segment_token_types(kind, tokens.shape[0], tokens.device)
+        return ComplextroSegment(
+            kind=kind,
+            tokens=tokens,
+            freqs=freqs,
+            temb=temb,
+            token_type_ids=token_type_ids,
+            valid_mask=valid_mask,
+            metadata=metadata,
+        )
+
+    def _pack_segments(
+        self,
+        batch_segments: List[List[ComplextroSegment]],
+        dtype: torch.dtype,
+        device: torch.device,
+        default_temb: Optional[torch.Tensor] = None,
+        offsets: Optional[List[Tuple[int, int]]] = None,
+    ) -> ComplextroPackedSequence:
+        unified_list = []
+        freqs_list = []
+        token_type_list = []
+        valid_masks = []
+        seq_lens = []
+        temb_list = []
+
+        for batch_idx, segments in enumerate(batch_segments):
+            sample_tokens = []
+            sample_freqs = []
+            sample_types = []
+            sample_valids = []
+            sample_temb = []
+            for segment in segments:
+                sample_tokens.append(segment.tokens)
+                if segment.freqs is None:
+                    raise ValueError(f"Segment {segment.kind} is missing freqs.")
+                sample_freqs.append(segment.freqs)
+                sample_types.append(segment.token_type_ids)
+                if segment.valid_mask is not None:
+                    sample_valids.append(segment.valid_mask.bool())
+                else:
+                    sample_valids.append(torch.ones(segment.tokens.shape[0], dtype=torch.bool, device=device))
+                if segment.temb is not None:
+                    sample_temb.append(segment.temb)
+                elif default_temb is not None:
+                    if default_temb.ndim == 3:
+                        sample_temb.append(default_temb[batch_idx, : segment.tokens.shape[0]])
+                    elif default_temb.ndim == 2:
+                        sample_temb.append(default_temb[batch_idx : batch_idx + 1].expand(segment.tokens.shape[0], -1))
+                    else:
+                        raise ValueError("default_temb must be 2D or 3D.")
+
+            sample_tokens = torch.cat(sample_tokens, dim=0)
+            sample_freqs = torch.cat(sample_freqs, dim=0)
+            sample_types = torch.cat(sample_types, dim=0)
+            sample_valids = torch.cat(sample_valids, dim=0)
+            unified_list.append(sample_tokens)
+            freqs_list.append(sample_freqs)
+            token_type_list.append(sample_types)
+            valid_masks.append(sample_valids)
+            seq_lens.append(sample_tokens.shape[0])
+            if len(sample_temb) > 0:
+                temb_list.append(torch.cat(sample_temb, dim=0))
+
+        temb = None
+        if len(temb_list) > 0:
+            temb = pad_sequence(temb_list, batch_first=True, padding_value=0.0)
+        token_type_ids = pad_sequence(token_type_list, batch_first=True, padding_value=TOKEN_TYPE_TEXT)
+        return self._pack_sequence(
+            unified_list,
+            freqs_list,
+            seq_lens,
+            dtype=dtype,
+            device=device,
+            temb=temb,
+            token_type_ids=token_type_ids,
+            token_valid_masks=valid_masks,
+            offsets=offsets,
+        )
+
+    def _run_main_trunk(
+        self,
+        packed: ComplextroPackedSequence,
+        token_type_ids: torch.Tensor,
+        use_gradient_checkpointing: bool = False,
+        use_gradient_checkpointing_offload: bool = False,
+    ) -> Tuple[ComplextroPackedSequence, torch.Tensor]:
+        use_tread_routing = self.training and self.tread_router is not None
+        route_idx = 0
+        current_route = self.tread_routes[route_idx] if use_tread_routing else None
+        routed_key_mask = None
+
+        for block_idx, block in enumerate(self.transformer_blocks):
+            route_ids_keep = None
+            route_original_hidden = None
+            route_original_freqs = None
+            route_original_temb = None
+            route_original_types = None
+            original_key_mask = packed.key_mask
+
+            if use_tread_routing and current_route is not None and block_idx == current_route["start_layer_idx"]:
+                packed, token_type_ids, route_ids_keep, route_original_hidden, route_original_freqs, route_original_temb, route_original_types, routed_key_mask = self._route_start(
+                    packed,
+                    token_type_ids,
+                    current_route,
+                )
+
+            active_token_types = token_type_ids if self.use_unified_token_type_modulation else None
+            packed.token_type_ids = active_token_types
+            packed = self._run_blocks(
+                packed,
+                nn.ModuleList([block]),
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+            )
+
+            if use_tread_routing and current_route is not None and block_idx == current_route["end_layer_idx"]:
+                packed, token_type_ids = self._route_end(
+                    packed,
+                    token_type_ids,
+                    route_ids_keep,
+                    route_original_hidden,
+                    route_original_freqs,
+                    route_original_temb,
+                    route_original_types,
+                    original_key_mask,
+                )
+                routed_key_mask = None
+                route_idx += 1
+                current_route = self.tread_routes[route_idx] if route_idx < len(self.tread_routes) else None
+
+        packed.token_type_ids = token_type_ids
+        if routed_key_mask is not None and packed.key_mask is None:
+            packed.key_mask = routed_key_mask
+        return packed, token_type_ids
+
+
+    def _build_basic_segments(
+        self,
+        image_tokens: torch.Tensor,
+        text_tokens: torch.Tensor,
+        txt_seq_lens: List[int],
+        latent_h: int,
+        latent_w: int,
+        device: torch.device,
+        conditioning: torch.Tensor,
+        siglip_tokens: Optional[torch.Tensor] = None,
+        siglip_shape: Optional[Tuple[int, int, int]] = None,
+    ) -> Tuple[List[List[ComplextroSegment]], List[Tuple[int, int]]]:
+        batch_segments: List[List[ComplextroSegment]] = []
+        x_pos_offsets: List[Tuple[int, int]] = []
+        x_seqlen = image_tokens.shape[1]
+
+        for b in range(text_tokens.shape[0]):
+            txt_len = int(txt_seq_lens[b])
+            text_b = text_tokens[b, :txt_len]
+            image_b = image_tokens[b]
+
+            img_shapes = [(1, latent_h, latent_w)]
+            if siglip_shape is not None:
+                img_shapes.append(siglip_shape)
+
+            img_freqs_all, txt_freqs = self.pos_embed(img_shapes, [txt_len], device=device)
+            txt_freqs = txt_freqs[:txt_len]
+            img_freqs = img_freqs_all[:x_seqlen]
+
+            sample_segments = [
+                self._make_segment(
+                    kind="target_image",
+                    tokens=image_b,
+                    freqs=img_freqs,
+                    metadata={"decode_offset": (0, x_seqlen)},
+                ),
+                self._make_segment(
+                    kind="text",
+                    tokens=text_b,
+                    freqs=txt_freqs,
+                ),
+            ]
+
+            if siglip_tokens is not None:
+                siglip_b = siglip_tokens[b]
+                siglip_len = siglip_b.shape[0]
+                siglip_freqs = img_freqs_all[x_seqlen : x_seqlen + siglip_len]
+                sample_segments.append(
+                    self._make_segment(
+                        kind="siglip",
+                        tokens=siglip_b,
+                        freqs=siglip_freqs,
+                    )
+                )
+
+            batch_segments.append(sample_segments)
+            x_pos_offsets.append((0, x_seqlen))
+
+        return batch_segments, x_pos_offsets
+
+    def _build_omni_segments(
+        self,
+        prepared_image_tokens: List[torch.Tensor],
+        prepared_image_valid_masks: List[List[int]],
+        prepared_size_lists: List[List[Optional[Tuple[int, int]]]],
+        prepared_length_lists: List[List[int]],
+        prepared_txt_tokens: List[torch.Tensor],
+        prepared_txt_seq_lens: List[int],
+        prepared_sig_tokens: List[Optional[torch.Tensor]],
+        prepared_sig_shapes: List[List[Optional[Tuple[int, int]]]],
+        prepared_sig_lengths: List[List[int]],
+        prepared_sig_valid_masks: List[List[int]],
+        conditioning_noisy: torch.Tensor,
+        conditioning_clean: torch.Tensor,
+        prepared_image_noise_masks: List[List[int]],
+        prepared_sig_noise_masks: List[List[int]],
+        device: torch.device,
+    ) -> Tuple[List[List[ComplextroSegment]], List[List[Optional[Tuple[int, int]]]], List[List[int]], List[Tuple[int, int]]]:
+        batch_segments: List[List[ComplextroSegment]] = []
+        x_sizes: List[List[Optional[Tuple[int, int]]]] = []
+        x_lengths: List[List[int]] = []
+        x_pos_offsets: List[Tuple[int, int]] = []
+
+        for b in range(len(prepared_image_tokens)):
+            image_tokens = prepared_image_tokens[b]
+            image_valid_mask = prepared_image_valid_masks[b]
+            size_list = prepared_size_lists[b]
+            length_list = prepared_length_lists[b]
+            text_tokens_b = prepared_txt_tokens[b]
+            txt_seq_len = int(prepared_txt_seq_lens[b])
+            sig_tokens = prepared_sig_tokens[b]
+            sig_shapes = prepared_sig_shapes[b]
+            sig_lengths = prepared_sig_lengths[b]
+            sig_valid_mask = prepared_sig_valid_masks[b]
+            image_noise_mask = prepared_image_noise_masks[b]
+            sig_noise_mask = prepared_sig_noise_masks[b]
+
+            img_freqs, txt_freqs, sig_freqs = self._build_omni_unified_freqs(
+                image_sizes=size_list,
+                image_lengths=length_list,
+                txt_seq_len=txt_seq_len,
+                device=device,
+                siglip_sizes=sig_shapes if sig_tokens is not None else None,
+                siglip_lengths=sig_lengths if sig_tokens is not None else None,
+                siglip_ref_sizes=size_list if sig_tokens is not None else None,
+            )
+
+            txt_token_noise_mask = [0] * txt_seq_len
+            sig_valid = sig_valid_mask if sig_tokens is not None else []
+            sig_noise = sig_noise_mask if sig_tokens is not None else []
+            unified_noise_mask = image_noise_mask + txt_token_noise_mask + sig_noise
+            unified_temb = self._build_per_token_temb(
+                unified_noise_mask,
+                conditioning_noisy[b : b + 1],
+                conditioning_clean[b : b + 1],
+            ).squeeze(0)
+
+            sample_segments: List[ComplextroSegment] = []
+            image_offset = 0
+            image_decode_len = sum(length_list)
+            for image_idx, image_len in enumerate(length_list):
+                token_type = "target_image" if image_idx == len(length_list) - 1 else "cond_image"
+                local_tokens = image_tokens[image_offset : image_offset + image_len]
+                local_freqs = img_freqs[image_offset : image_offset + image_len]
+                local_valid = torch.tensor(
+                    image_valid_mask[image_offset : image_offset + image_len],
+                    dtype=torch.bool,
+                    device=device,
+                )
+                local_temb = unified_temb[image_offset : image_offset + image_len]
+                sample_segments.append(
+                    self._make_segment(
+                        kind=token_type,
+                        tokens=local_tokens,
+                        freqs=local_freqs,
+                        temb=local_temb,
+                        valid_mask=local_valid,
+                    )
+                )
+                image_offset += image_len
+
+            text_offset = image_offset
+            sample_segments.append(
+                self._make_segment(
+                    kind="text",
+                    tokens=text_tokens_b,
+                    freqs=txt_freqs,
+                    temb=unified_temb[text_offset : text_offset + txt_seq_len],
+                    valid_mask=torch.ones(txt_seq_len, dtype=torch.bool, device=device),
+                )
+            )
+
+            if sig_tokens is not None and sig_freqs is not None:
+                sig_offset = text_offset + txt_seq_len
+                sample_segments.append(
+                    self._make_segment(
+                        kind="siglip",
+                        tokens=sig_tokens,
+                        freqs=sig_freqs,
+                        temb=unified_temb[sig_offset : sig_offset + sig_tokens.shape[0]],
+                        valid_mask=torch.tensor(sig_valid_mask, dtype=torch.bool, device=device),
+                    )
+                )
+
+            batch_segments.append(sample_segments)
+            x_sizes.append(size_list)
+            x_lengths.append(length_list)
+            x_pos_offsets.append((0, image_decode_len))
+
+        return batch_segments, x_sizes, x_lengths, x_pos_offsets
+
+
+
     def process_entity_masks(self, latents, prompt_emb, prompt_emb_mask, entity_prompt_emb, entity_prompt_emb_mask, entity_masks, height, width, image, img_shapes):
         # prompt_emb
         all_prompt_emb = entity_prompt_emb + [prompt_emb]
@@ -1682,26 +2350,18 @@ class ComplextroImageDiT(torch.nn.Module):
             )
 
             image_refiner_seq_lens = [sum(length_list) for length_list in prepared_length_lists]
-            batched_image_tokens, batched_image_freqs_for_refiner, image_refiner_key_mask = self._build_padded_unified(
+            image_refiner_packed = self._pack_sequence(
                 prepared_image_tokens,
                 prepared_image_freqs_for_refiner,
                 image_refiner_seq_lens,
                 dtype=text_tokens.dtype,
                 device=prompt_emb.device,
+                temb=pad_sequence(prepared_image_temb, batch_first=True, padding_value=0.0),
+                token_type_ids=batched_image_token_types,
                 token_valid_masks=prepared_image_valid_mask_tensors,
             )
-            batched_image_temb = pad_sequence(prepared_image_temb, batch_first=True, padding_value=0.0)
-            for block in self.noise_refiner:
-                batched_image_tokens = gradient_checkpoint_forward(
-                    block,
-                    use_gradient_checkpointing=use_gradient_checkpointing,
-                    use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-                    hidden_states=batched_image_tokens,
-                    temb=batched_image_temb,
-                    token_type_ids=batched_image_token_types,
-                    image_rotary_emb=batched_image_freqs_for_refiner,
-                    attention_mask=image_refiner_key_mask,
-                )
+            image_refiner_packed = self._run_blocks(image_refiner_packed, self.noise_refiner, use_gradient_checkpointing, use_gradient_checkpointing_offload)
+            batched_image_tokens = image_refiner_packed.hidden_states
 
             for b in range(batch_size):
                 image_len = image_refiner_seq_lens[b]
@@ -1718,7 +2378,7 @@ class ComplextroImageDiT(torch.nn.Module):
                     if freqs is None:
                         raise ValueError(f"Missing siglip refiner frequencies for sample {idx} in omni mode.")
                     sig_freqs_for_batch.append(freqs)
-                batched_sig_tokens, batched_sig_freqs_for_refiner, sig_refiner_key_mask = self._build_padded_unified(
+                sig_refiner_packed = self._pack_sequence(
                     prepared_sig_tokens,
                     sig_freqs_for_batch,
                     sig_refiner_seq_lens,
@@ -1726,193 +2386,89 @@ class ComplextroImageDiT(torch.nn.Module):
                     device=prompt_emb.device,
                     token_valid_masks=prepared_sig_valid_mask_tensors,
                 )
-                for block in self.siglip_refiner:
-                    batched_sig_tokens = gradient_checkpoint_forward(
-                        block,
-                        use_gradient_checkpointing=use_gradient_checkpointing,
-                        use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-                        hidden_states=batched_sig_tokens,
-                        image_rotary_emb=batched_sig_freqs_for_refiner,
-                        attention_mask=sig_refiner_key_mask,
-                    )
+                sig_refiner_packed = self._run_blocks(
+                    sig_refiner_packed,
+                    self.siglip_refiner,
+                    use_gradient_checkpointing=use_gradient_checkpointing,
+                    use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+                )
+                batched_sig_tokens = sig_refiner_packed.hidden_states
 
                 for b in range(batch_size):
                     sig_len = sig_refiner_seq_lens[b]
                     prepared_sig_tokens[b] = batched_sig_tokens[b, :sig_len, :]
 
             text_refiner_seq_lens = [int(v) for v in prepared_txt_seq_lens]
-            batched_text_tokens, batched_text_freqs_for_refiner, text_refiner_key_mask = self._build_padded_unified(
+            text_refiner_packed = self._pack_sequence(
                 prepared_txt_tokens,
                 prepared_txt_freqs_for_refiner,
                 text_refiner_seq_lens,
                 dtype=text_tokens.dtype,
                 device=prompt_emb.device,
+                temb=conditioning_noisy,
+                token_type_ids=torch.full(
+                    (len(text_refiner_seq_lens), max(text_refiner_seq_lens)),
+                    TOKEN_TYPE_TEXT,
+                    dtype=torch.long,
+                    device=prompt_emb.device,
+                ),
             )
-            for block in self.context_refiner:
-                batched_text_tokens = gradient_checkpoint_forward(
-                    block,
-                    use_gradient_checkpointing=use_gradient_checkpointing,
-                    use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-                    hidden_states=batched_text_tokens,
-                    temb=conditioning_noisy,
-                    token_type_ids=torch.full(
-                        (batched_text_tokens.shape[0], batched_text_tokens.shape[1]),
-                        TOKEN_TYPE_TEXT,
-                        dtype=torch.long,
-                        device=prompt_emb.device,
-                    ) if block.modulation else None,
-                    image_rotary_emb=batched_text_freqs_for_refiner,
-                    attention_mask=text_refiner_key_mask,
-                )
+            text_refiner_packed = self._run_blocks(
+                text_refiner_packed,
+                self.context_refiner,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+            )
+            batched_text_tokens = text_refiner_packed.hidden_states
 
             for b in range(batch_size):
                 txt_seq_len = text_refiner_seq_lens[b]
                 text_tokens_b = batched_text_tokens[b, :txt_seq_len, :]
-                image_tokens = prepared_image_tokens[b]
-                image_token_noise_mask = prepared_image_noise_masks[b]
-                image_token_valid_mask = prepared_image_valid_masks[b]
-                size_list = prepared_size_lists[b]
-                length_list = prepared_length_lists[b]
-                sig_tokens = prepared_sig_tokens[b]
-                sig_shapes = prepared_sig_shapes[b]
-                sig_lengths = prepared_sig_lengths[b]
-                sig_token_noise_mask = prepared_sig_noise_masks[b]
-                sig_token_valid_mask = prepared_sig_valid_masks[b]
+                prepared_txt_tokens[b] = text_tokens_b
 
-                img_freqs, txt_freqs, sig_freqs = self._build_omni_unified_freqs(
-                    image_sizes=size_list,
-                    image_lengths=length_list,
-                    txt_seq_len=txt_seq_len,
-                    device=prompt_emb.device,
-                    siglip_sizes=sig_shapes if sig_tokens is not None else None,
-                    siglip_lengths=sig_lengths if sig_tokens is not None else None,
-                    siglip_ref_sizes=size_list if sig_tokens is not None else None,
-                )
+            omni_segments, x_sizes, x_lengths, x_pos_offsets = self._build_omni_segments(
+                prepared_image_tokens=prepared_image_tokens,
+                prepared_image_valid_masks=prepared_image_valid_masks,
+                prepared_size_lists=prepared_size_lists,
+                prepared_length_lists=prepared_length_lists,
+                prepared_txt_tokens=prepared_txt_tokens,
+                prepared_txt_seq_lens=prepared_txt_seq_lens,
+                prepared_sig_tokens=prepared_sig_tokens,
+                prepared_sig_shapes=prepared_sig_shapes,
+                prepared_sig_lengths=prepared_sig_lengths,
+                prepared_sig_valid_masks=prepared_sig_valid_masks,
+                conditioning_noisy=conditioning_noisy,
+                conditioning_clean=conditioning_clean,
+                prepared_image_noise_masks=prepared_image_noise_masks,
+                prepared_sig_noise_masks=prepared_sig_noise_masks,
+                device=prompt_emb.device,
+            )
 
-                txt_token_noise_mask = [0] * txt_seq_len
-                unified_token_noise_mask = image_token_noise_mask + txt_token_noise_mask + sig_token_noise_mask
-                unified_token_valid_mask = image_token_valid_mask + [1] * txt_seq_len + sig_token_valid_mask
-                unified_temb = self._build_per_token_temb(
-                    unified_token_noise_mask,
-                    conditioning_noisy[b : b + 1],
-                    conditioning_clean[b : b + 1],
-                ).squeeze(0)
-                unified_token_types = []
-                for image_idx, image_len in enumerate(length_list):
-                    token_type = TOKEN_TYPE_TARGET_IMAGE if image_idx == len(length_list) - 1 else TOKEN_TYPE_COND_IMAGE
-                    unified_token_types.extend([token_type] * image_len)
-                unified_token_types.extend([TOKEN_TYPE_TEXT] * txt_seq_len)
-                if sig_tokens is not None:
-                    unified_token_types = unified_token_types + [TOKEN_TYPE_SIGLIP] * sig_tokens.shape[0]
-
-                # Align omni unified order with base branch: [x, cap, siglip]
-                unified = torch.cat([image_tokens, text_tokens_b] + ([sig_tokens] if sig_tokens is not None else []), dim=0)
-                unified_freqs = torch.cat(
-                    [img_freqs, txt_freqs] + ([sig_freqs] if sig_freqs is not None else []),
-                    dim=0,
-                )
-
-                unified_list.append(unified)
-                freqs_list.append(unified_freqs)
-                temb_list.append(unified_temb)
-                token_type_list.append(torch.tensor(unified_token_types, dtype=torch.long, device=prompt_emb.device))
-                valid_masks_list.append(torch.tensor(unified_token_valid_mask, dtype=torch.bool, device=prompt_emb.device))
-                seq_lens.append(unified.shape[0])
-                x_sizes.append(size_list)
-                x_lengths.append(length_list)
-                x_pos_offsets.append((0, sum(length_list)))
-
-            unified, unified_freqs, key_mask = self._build_padded_unified(
-                unified_list,
-                freqs_list,
-                seq_lens,
+            packed = self._pack_segments(
+                omni_segments,
                 dtype=text_tokens.dtype,
                 device=prompt_emb.device,
-                token_valid_masks=valid_masks_list,
             )
-            unified_temb = pad_sequence(temb_list, batch_first=True, padding_value=0.0)
-            unified_token_types = pad_sequence(token_type_list, batch_first=True, padding_value=TOKEN_TYPE_TEXT)
+            unified_token_types = packed.token_type_ids
             if self.token_type_embed is not None:
-                unified = unified + self.token_type_embed(self._resolve_token_type_embed_ids(unified_token_types))
+                packed.hidden_states = packed.hidden_states + self.token_type_embed(self._resolve_token_type_embed_ids(unified_token_types))
 
-            use_tread_routing = self.training and self.tread_router is not None
-            route_idx = 0
-            current_route = self.tread_routes[route_idx] if use_tread_routing else None
-            route_ids_keep = None
-            routed_key_mask = None
-            routed_unified_temb = unified_temb
-            routed_unified_token_types = unified_token_types
-            route_original_unified = None
-            route_original_freqs = None
-            route_original_temb = None
-            route_original_token_types = None
-
-            for block_idx, block in enumerate(self.transformer_blocks):
-                if use_tread_routing and current_route is not None and block_idx == current_route["start_layer_idx"]:
-                    route_original_unified = unified
-                    route_original_freqs = unified_freqs
-                    route_original_temb = unified_temb
-                    route_original_token_types = unified_token_types
-                    route_ids_keep = self.tread_router.get_mask(unified, selection_rate=current_route["selection_ratio"])
-                    unified = self.tread_router.start_route(unified, route_ids_keep)
-                    unified_freqs = self.tread_router.start_route(unified_freqs, route_ids_keep)
-                    routed_unified_temb = self.tread_router.start_route(unified_temb, route_ids_keep)
-                    routed_unified_token_types = self.tread_router.start_route(
-                        unified_token_types.unsqueeze(-1), route_ids_keep
-                    ).squeeze(-1)
-                    if key_mask is not None:
-                        routed_key_mask = key_mask.gather(
-                            -1,
-                            route_ids_keep.unsqueeze(1).unsqueeze(1).expand(-1, key_mask.shape[1], key_mask.shape[2], -1),
-                        )
-                    else:
-                        routed_key_mask = None
-
-                active_key_mask = routed_key_mask if route_ids_keep is not None else key_mask
-                active_temb = routed_unified_temb if route_ids_keep is not None else unified_temb
-                active_token_types = None
-                if self.use_omni_token_type_modulation:
-                    active_token_types = routed_unified_token_types if route_ids_keep is not None else unified_token_types
-
-                unified = gradient_checkpoint_forward(
-                    block,
-                    use_gradient_checkpointing=use_gradient_checkpointing,
-                    use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-                    hidden_states=unified,
-                    temb=active_temb,
-                    token_type_ids=active_token_types,
-                    image_rotary_emb=unified_freqs,
-                    attention_mask=active_key_mask,
-                )
-
-                if use_tread_routing and current_route is not None and block_idx == current_route["end_layer_idx"]:
-                    unified = self.tread_router.end_route(unified, route_ids_keep, route_original_unified)
-                    unified_freqs = self.tread_router.end_route(unified_freqs, route_ids_keep, route_original_freqs)
-                    unified_temb = self.tread_router.end_route(routed_unified_temb, route_ids_keep, route_original_temb)
-                    unified_token_types = self.tread_router.end_route(
-                        routed_unified_token_types.unsqueeze(-1),
-                        route_ids_keep,
-                        route_original_token_types.unsqueeze(-1),
-                    ).squeeze(-1)
-                    route_ids_keep = None
-                    routed_key_mask = None
-                    routed_unified_temb = unified_temb
-                    routed_unified_token_types = unified_token_types
-                    route_original_unified = None
-                    route_original_freqs = None
-                    route_original_temb = None
-                    route_original_token_types = None
-                    route_idx += 1
-                    current_route = self.tread_routes[route_idx] if route_idx < len(self.tread_routes) else None
+            packed, unified_token_types = self._run_main_trunk(
+                packed,
+                unified_token_types,
+                use_gradient_checkpointing=use_gradient_checkpointing,
+                use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+            )
 
             # Extract only image tokens before norm_out/proj_out to avoid
             # wasting computation on text/siglip tokens that will be discarded.
             image_token_list = []
             for i, (start, end) in enumerate(x_pos_offsets):
-                img_tok = unified[i, start:end, :].unsqueeze(0)
+                img_tok = packed.hidden_states[i, start:end, :].unsqueeze(0)
                 img_tok = self.norm_out(img_tok, conditioning_noisy[i:i+1])
                 img_tok = self.proj_out(img_tok)
                 image_token_list.append(img_tok.squeeze(0))
+
 
             # _unpatchify_omni expects per-sample tokens; since we already
             # sliced to [start:end], use zero-based offsets.
@@ -2066,123 +2622,41 @@ class ComplextroImageDiT(torch.nn.Module):
                     image_rotary_emb=siglip_freqs_for_refiner,
                 )
 
-        # RoPE for unified sequence (text + image + optional siglip)
-        # Align basic unified order with z_image_dit: [x, cap]
-        # (keep optional siglip support by appending after cap when present)
-        unified_list = []
-        freqs_list = []
-        token_type_list = []
-        seq_lens = []
-        x_seqlen = image_tokens.shape[1]
-        x_pos_offsets = []
-
-        for b in range(text_tokens.shape[0]):
-            txt_len = int(txt_seq_lens[b])
-            text_b = text_tokens[b, :txt_len]
-            image_b = image_tokens[b]
-
-            img_shapes = [(1, latent_h, latent_w)]
-            if siglip_shape is not None:
-                img_shapes.append(siglip_shape)
-
-            img_freqs_all, txt_freqs = self.pos_embed(img_shapes, [txt_len], device=image_tokens.device)
-            txt_freqs = txt_freqs[:txt_len]
-            img_freqs = img_freqs_all[:x_seqlen]
-
-            if siglip_tokens is not None:
-                siglip_b = siglip_tokens[b]
-                siglip_len = siglip_b.shape[0]
-                siglip_freqs = img_freqs_all[x_seqlen : x_seqlen + siglip_len]
-                unified_b = torch.cat([image_b, text_b, siglip_b], dim=0)
-                freqs_b = torch.cat([img_freqs, txt_freqs, siglip_freqs], dim=0)
-                unified_type_b = [TOKEN_TYPE_TARGET_IMAGE] * x_seqlen + [TOKEN_TYPE_TEXT] * txt_len + [TOKEN_TYPE_SIGLIP] * siglip_len
-            else:
-                unified_b = torch.cat([image_b, text_b], dim=0)
-                freqs_b = torch.cat([img_freqs, txt_freqs], dim=0)
-                unified_type_b = [TOKEN_TYPE_TARGET_IMAGE] * x_seqlen + [TOKEN_TYPE_TEXT] * txt_len
-
-            unified_list.append(unified_b)
-            freqs_list.append(freqs_b)
-            token_type_list.append(torch.tensor(unified_type_b, dtype=torch.long, device=image_tokens.device))
-            seq_lens.append(unified_b.shape[0])
-            x_pos_offsets.append((0, x_seqlen))
-
-        unified, unified_freqs, key_mask = self._build_padded_unified(
-            unified_list,
-            freqs_list,
-            seq_lens,
+        batch_segments, x_pos_offsets = self._build_basic_segments(
+            image_tokens=image_tokens,
+            text_tokens=text_tokens,
+            txt_seq_lens=txt_seq_lens,
+            latent_h=latent_h,
+            latent_w=latent_w,
+            device=image_tokens.device,
+            conditioning=conditioning,
+            siglip_tokens=siglip_tokens,
+            siglip_shape=siglip_shape,
+        )
+        packed = self._pack_segments(
+            batch_segments,
             dtype=image_tokens.dtype,
             device=image_tokens.device,
+            default_temb=conditioning,
+            offsets=x_pos_offsets,
         )
-        unified_token_types = pad_sequence(token_type_list, batch_first=True, padding_value=TOKEN_TYPE_TEXT)
+        packed.temb = conditioning
+        unified_token_types = packed.token_type_ids
         if self.token_type_embed is not None:
-            unified = unified + self.token_type_embed(self._resolve_token_type_embed_ids(unified_token_types))
+            packed.hidden_states = packed.hidden_states + self.token_type_embed(self._resolve_token_type_embed_ids(unified_token_types))
 
-        use_tread_routing = self.training and self.tread_router is not None
-        route_idx = 0
-        current_route = self.tread_routes[route_idx] if use_tread_routing else None
-        route_ids_keep = None
-        routed_key_mask = None
-        route_original_unified = None
-        route_original_freqs = None
-        route_original_token_types = None
-        routed_unified_token_types = unified_token_types
+        packed, unified_token_types = self._run_main_trunk(
+            packed,
+            unified_token_types,
+            use_gradient_checkpointing=use_gradient_checkpointing,
+            use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+        )
 
-        for block_idx, block in enumerate(self.transformer_blocks):
-            if use_tread_routing and current_route is not None and block_idx == current_route["start_layer_idx"]:
-                route_original_unified = unified
-                route_original_freqs = unified_freqs
-                route_original_token_types = unified_token_types
-                route_ids_keep = self.tread_router.get_mask(unified, selection_rate=current_route["selection_ratio"])
-                unified = self.tread_router.start_route(unified, route_ids_keep)
-                unified_freqs = self.tread_router.start_route(unified_freqs, route_ids_keep)
-                routed_unified_token_types = self.tread_router.start_route(
-                    unified_token_types.unsqueeze(-1), route_ids_keep
-                ).squeeze(-1)
-                if key_mask is not None:
-                    routed_key_mask = key_mask.gather(
-                        -1,
-                        route_ids_keep.unsqueeze(1).unsqueeze(1).expand(-1, key_mask.shape[1], key_mask.shape[2], -1),
-                    )
-                else:
-                    routed_key_mask = None
 
-            active_key_mask = routed_key_mask if route_ids_keep is not None else key_mask
-            active_token_types = None
-            if self.use_unified_token_type_modulation:
-                active_token_types = routed_unified_token_types if route_ids_keep is not None else unified_token_types
-
-            unified = gradient_checkpoint_forward(
-                block,
-                use_gradient_checkpointing=use_gradient_checkpointing,
-                use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
-                hidden_states=unified,
-                temb=conditioning,
-                token_type_ids=active_token_types,
-                image_rotary_emb=unified_freqs,
-                attention_mask=active_key_mask,
-            )
-
-            if use_tread_routing and current_route is not None and block_idx == current_route["end_layer_idx"]:
-                unified = self.tread_router.end_route(unified, route_ids_keep, route_original_unified)
-                unified_freqs = self.tread_router.end_route(unified_freqs, route_ids_keep, route_original_freqs)
-                unified_token_types = self.tread_router.end_route(
-                    routed_unified_token_types.unsqueeze(-1),
-                    route_ids_keep,
-                    route_original_token_types.unsqueeze(-1),
-                ).squeeze(-1)
-                route_ids_keep = None
-                routed_key_mask = None
-                routed_unified_token_types = unified_token_types
-                route_original_unified = None
-                route_original_freqs = None
-                route_original_token_types = None
-                route_idx += 1
-                current_route = self.tread_routes[route_idx] if route_idx < len(self.tread_routes) else None
 
         image_tokens = []
         for b, (start, end) in enumerate(x_pos_offsets):
-            image_tokens.append(unified[b, start:end, :])
+            image_tokens.append(packed.hidden_states[b, start:end, :])
         image_tokens = torch.stack(image_tokens, dim=0)
         image_tokens = self.norm_out(image_tokens, conditioning)
         image_tokens = self.proj_out(image_tokens)
