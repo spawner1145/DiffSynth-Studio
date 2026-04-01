@@ -239,15 +239,24 @@ if __name__ == "__main__":
         "rope_axes_dim": [16, 56, 56],
     }
     """
-    # 2.25B
+    # 0.9B
     complextro_model_config = {
         "num_layers": 10,
         "num_refiner_layers": 0,
         "hidden_size": 2304,
         "num_attention_heads": 24,
         "attention_head_dim": 96,
-        "rope_axes_dim": [32, 32, 32],
+        "rope_axes_dim": [16, 40, 40],
+        "enable_tread_routing": False,
+        "tread_routes": [
+            {
+                "selection_ratio": 0.5,
+                "start_layer_idx": 2,
+                "end_layer_idx": 4,
+            }
+        ],
         "use_text_modulation": True,
+        "shared_modulation_group_size": "all", # 改成None或者int来层分组调制 
     }
 
     pipe = build_complextro_pipe(

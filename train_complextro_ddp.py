@@ -456,8 +456,8 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=2, help="训练 batch size")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="学习率")
-    parser.add_argument("--prediction_type", type=str, default="flow", help="Training target type: flow / jit_xpred / bridge_xpred")
-    parser.add_argument("--condition_drop_prob", type=float, default=0.0, help="Classifier-free condition dropout probability used during training")
+    parser.add_argument("--prediction_type", type=str, default="jit_xpred", help="Training target type: flow / jit_xpred / bridge_xpred")
+    parser.add_argument("--condition_drop_prob", type=float, default=0.1, help="Classifier-free condition dropout probability used during training")
     parser.add_argument("--jit_p_mean", type=float, default=-0.8, help="JiT x-pred logit-normal P_mean")
     parser.add_argument("--jit_p_std", type=float, default=0.8, help="JiT x-pred logit-normal P_std")
     parser.add_argument("--jit_noise_scale", type=float, default=1.0, help="JiT x-pred noise scale")
@@ -622,13 +622,14 @@ if __name__ == "__main__":
 
         return operator
 
+    # 0.9B
     complextro_model_config = {
-        "num_layers": args.num_layers,
+        "num_layers": 10,
         "num_refiner_layers": 0,
-        "hidden_size": args.hidden_size,
-        "num_attention_heads": args.num_attention_heads,
-        "attention_head_dim": args.attention_head_dim,
-        "rope_axes_dim": [32, 32, 32],
+        "hidden_size": 2304,
+        "num_attention_heads": 24,
+        "attention_head_dim": 96,
+        "rope_axes_dim": [16, 40, 40],
         "enable_tread_routing": False,
         "tread_routes": [
             {
@@ -637,7 +638,8 @@ if __name__ == "__main__":
                 "end_layer_idx": 4,
             }
         ],
-        "use_text_modulation": False,
+        "use_text_modulation": True,
+        "shared_modulation_group_size": "all", # 改成None或者int来层分组调制 
     }
 
     train_resolution = tuple(args.train_resolution)

@@ -624,7 +624,7 @@ if __name__ == "__main__":
     use_image_text_pairs = False  # True: 使用 ImageTextPairDataset（图片+txt目录），False: 使用 UnifiedDataset（metadata文件）
     train_omni = True
     vae_type = "flux2"
-    prediction_type = "flow"
+    prediction_type = "jit_xpred"
     condition_drop_prob = 0.0
     # Frequency-aware loss knobs.
     # DeCo 原始推荐值：
@@ -710,14 +710,14 @@ if __name__ == "__main__":
         ],
     }
     """
-    # 2.25B, 加 "num_refiner_layers": 1 时为 2.54B
+    # 0.9B
     complextro_model_config = {
         "num_layers": 10,
         "num_refiner_layers": 0,
         "hidden_size": 2304,
         "num_attention_heads": 24,
         "attention_head_dim": 96,
-        "rope_axes_dim": [32, 32, 32],
+        "rope_axes_dim": [16, 40, 40],
         "enable_tread_routing": False,
         "tread_routes": [
             {
@@ -727,6 +727,7 @@ if __name__ == "__main__":
             }
         ],
         "use_text_modulation": True,
+        "shared_modulation_group_size": "all", # 改成None或者int来层分组调制 
     }
 
     train_resolution = (256, 256)

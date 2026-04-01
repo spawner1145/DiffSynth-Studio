@@ -592,6 +592,12 @@ def _prepare_temb(hidden_states, temb, token_type_ids=None):
     return temb
 
 
+def _chunk_modulation(modulation_layer, mod: torch.Tensor):
+    if mod.ndim == 2:
+        mod = mod.unsqueeze(1)
+    return mod.chunk(modulation_layer.num_outputs, dim=-1)
+
+
 def _compute_modulation(modulation_layer, temb, token_type_ids=None):
     """Run modulation layer and chunk outputs."""
     if token_type_ids is not None:
@@ -599,9 +605,7 @@ def _compute_modulation(modulation_layer, temb, token_type_ids=None):
         mod = modulation_layer(temb, token_type_ids)
     else:
         mod = modulation_layer(temb)
-        if mod.ndim == 2:
-            mod = mod.unsqueeze(1)
-    return mod.chunk(modulation_layer.num_outputs, dim=-1)
+    return _chunk_modulation(modulation_layer, mod)
 
 
 class ComplextroSerialBlock(nn.Module):
@@ -646,32 +650,38 @@ class ComplextroParallelBlock(nn.Module):
     """Parallel block: Attention + FFN fused projection, shared scale/shift (4-way modulation)."""
 
     def __init__(self, dim, num_attention_heads, attention_head_dim,
-                 mlp_ratio=4.0, eps=1e-6, modulation=True, shared_modulation=None):
+                 mlp_ratio=4.0, eps=1e-6, modulation=True, use_internal_modulation=True):
         super().__init__()
         self.dim = dim
         self.modulation = modulation
+        self.uses_internal_modulation = bool(modulation and use_internal_modulation)
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.parallel_attn = ComplextroParallelAttentionMLP(
             dim=dim, num_heads=num_attention_heads, head_dim=attention_head_dim,
             mlp_ratio=mlp_ratio, bias=True,
         )
 
-        if shared_modulation is not None:
-            self.modulation_layer = shared_modulation
-        elif modulation:
+        if self.uses_internal_modulation:
             self.modulation_layer = ComplextroModulation(dim=dim, num_outputs=4)
+        else:
+            self.modulation_layer = None
 
     def forward(self, hidden_states, temb=None, token_type_ids=None,
-                image_rotary_emb=None, attention_mask=None, enable_fp8_attention: bool = False):
+                image_rotary_emb=None, attention_mask=None, enable_fp8_attention: bool = False, modulation_params=None):
         if not self.modulation:
             normed = self.norm(hidden_states)
             attn_out, mlp_out = self.parallel_attn(normed,
                 image_rotary_emb=image_rotary_emb, attention_mask=attention_mask)
             return hidden_states + attn_out + mlp_out
 
-        temb = _prepare_temb(hidden_states, temb, token_type_ids)
-        shift, scale, gate_attn, gate_mlp = _compute_modulation(
-            self.modulation_layer, temb, token_type_ids)
+        if modulation_params is None:
+            if self.modulation_layer is None:
+                raise ValueError("ComplextroParallelBlock requires modulation_params when internal modulation is disabled.")
+            temb = _prepare_temb(hidden_states, temb, token_type_ids)
+            shift, scale, gate_attn, gate_mlp = _compute_modulation(
+                self.modulation_layer, temb, token_type_ids)
+        else:
+            shift, scale, gate_attn, gate_mlp = modulation_params
 
         normed = (1 + scale) * self.norm(hidden_states) + shift
         attn_out, mlp_out = self.parallel_attn(normed,
@@ -881,6 +891,7 @@ class ComplextroImageDiT(torch.nn.Module):
         # Build shared modulation layers if group_size is set. None means no sharing; 'all' means all trunk layers share one modulation.
         self.shared_modulation_group_size = shared_modulation_group_size
         shared_mods = None
+        self._shared_modulations = None
         if shared_modulation_group_size is not None:
             num_groups = math.ceil(num_layers / shared_modulation_group_size)
             shared_mods = nn.ModuleList([
@@ -891,15 +902,12 @@ class ComplextroImageDiT(torch.nn.Module):
 
         blocks = []
         for i in range(num_layers):
-            shared_mod = None
-            if shared_mods is not None:
-                shared_mod = shared_mods[i // shared_modulation_group_size]
             blocks.append(ComplextroParallelBlock(
                 dim=self.hidden_size,
                 num_attention_heads=self.num_attention_heads,
                 attention_head_dim=self.attention_head_dim,
                 modulation=True,
-                shared_modulation=shared_mod,
+                use_internal_modulation=shared_mods is None,
             ))
         self.transformer_blocks = nn.ModuleList(blocks)
         for route in self.tread_routes:
@@ -932,9 +940,13 @@ class ComplextroImageDiT(torch.nn.Module):
                     nn.init.zeros_(module.bias)
 
         for block in list(self.transformer_blocks) + list(self.noise_refiner) + list(self.context_refiner):
-            if block.modulation:
+            if block.modulation and getattr(block, "modulation_layer", None) is not None:
                 # DiT-style adaLN-Zero: start each modulated block close to identity.
                 block.modulation_layer.init_zero()
+
+        if self._shared_modulations is not None:
+            for modulation_layer in self._shared_modulations:
+                modulation_layer.init_zero()
 
         nn.init.zeros_(self.norm_out.linear.weight)
         nn.init.zeros_(self.norm_out.linear.bias)
@@ -1013,8 +1025,45 @@ class ComplextroImageDiT(torch.nn.Module):
         if not isinstance(state_dict, dict):
             state_dict = dict(state_dict)
 
+        if self._shared_modulations is not None:
+            for group_idx, modulation_layer in enumerate(self._shared_modulations):
+                shared_prefix = f"_shared_modulations.{group_idx}"
+                shared_weight_key = f"{shared_prefix}.base.weight"
+                shared_bias_key = f"{shared_prefix}.base.bias"
+                shared_type_bias_key = f"{shared_prefix}.type_bias.weight"
+
+                group_start = group_idx * self.shared_modulation_group_size
+                group_end = min(group_start + self.shared_modulation_group_size, len(self.transformer_blocks))
+                owner_prefix = f"transformer_blocks.{group_start}.modulation_layer"
+                owner_weight_key = f"{owner_prefix}.base.weight"
+                owner_bias_key = f"{owner_prefix}.base.bias"
+                owner_type_bias_key = f"{owner_prefix}.type_bias.weight"
+
+                if shared_weight_key not in state_dict and owner_weight_key in state_dict:
+                    state_dict[shared_weight_key] = state_dict[owner_weight_key].detach().clone()
+                if shared_bias_key not in state_dict and owner_bias_key in state_dict:
+                    state_dict[shared_bias_key] = state_dict[owner_bias_key].detach().clone()
+                if getattr(modulation_layer, "type_bias", None) is not None:
+                    if shared_type_bias_key not in state_dict and owner_type_bias_key in state_dict:
+                        state_dict[shared_type_bias_key] = state_dict[owner_type_bias_key].detach().clone()
+                elif shared_type_bias_key in state_dict:
+                    del state_dict[shared_type_bias_key]
+
+                legacy_prefix = f"transformer_blocks.{group_start}.modulation_mlp.1"
+                legacy_weight_key = f"{legacy_prefix}.weight"
+                legacy_bias_key = f"{legacy_prefix}.bias"
+                if shared_weight_key not in state_dict and legacy_weight_key in state_dict:
+                    state_dict[shared_weight_key] = state_dict[legacy_weight_key].detach().clone()
+                if shared_bias_key not in state_dict and legacy_bias_key in state_dict:
+                    state_dict[shared_bias_key] = state_dict[legacy_bias_key].detach().clone()
+
+                for block_idx in range(group_start, group_end):
+                    block_prefix = f"transformer_blocks.{block_idx}.modulation_layer"
         for module_prefix, module in self.named_modules():
             if not isinstance(module, (ComplextroSerialBlock, ComplextroParallelBlock)) or not getattr(module, "modulation", False):
+                continue
+
+            if isinstance(module, ComplextroParallelBlock) and getattr(module, "modulation_layer", None) is None:
                 continue
 
             base_prefix = f"{module_prefix}.modulation_layer.base"
@@ -1507,6 +1556,7 @@ class ComplextroImageDiT(torch.nn.Module):
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
         enable_fp8_attention: bool = False,
+        modulation_params=None,
     ) -> ComplextroPackedSequence:
         for block in blocks:
             packed.hidden_states = gradient_checkpoint_forward(
@@ -1518,6 +1568,7 @@ class ComplextroImageDiT(torch.nn.Module):
                 token_type_ids=packed.token_type_ids,
                 image_rotary_emb=packed.freqs,
                 attention_mask=packed.key_mask,
+                modulation_params=modulation_params if isinstance(block, ComplextroParallelBlock) else None,
                 enable_fp8_attention=enable_fp8_attention,
             )
         return packed
@@ -1701,6 +1752,13 @@ class ComplextroImageDiT(torch.nn.Module):
                     current_route,
                 )
 
+            modulation_params = None
+            if self._shared_modulations is not None:
+                temb = _prepare_temb(packed.hidden_states, packed.temb, token_type_ids)
+                active_token_types = token_type_ids if self.use_unified_token_type_modulation else None
+                modulation_layer = self._shared_modulations[block_idx // self.shared_modulation_group_size]
+                modulation_params = _compute_modulation(modulation_layer, temb, active_token_types)
+
             active_token_types = token_type_ids if self.use_unified_token_type_modulation else None
             packed.token_type_ids = active_token_types
             packed = self._run_blocks(
@@ -1708,6 +1766,7 @@ class ComplextroImageDiT(torch.nn.Module):
                 nn.ModuleList([block]),
                 use_gradient_checkpointing=use_gradient_checkpointing,
                 use_gradient_checkpointing_offload=use_gradient_checkpointing_offload,
+                modulation_params=modulation_params,
             )
 
             if use_tread_routing and current_route is not None and block_idx == current_route["end_layer_idx"]:
