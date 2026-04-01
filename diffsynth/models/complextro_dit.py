@@ -736,6 +736,7 @@ class ComplextroMainBlock(ComplextroModulatedBlockMixin, nn.Module):
         mlp_ratio: float = 4.0,
         eps: float = 1e-6,
         modulation: bool = True,
+        shared_modulation: Optional[nn.Module] = None,
     ):
         super().__init__()
         self.dim = dim
@@ -749,7 +750,10 @@ class ComplextroMainBlock(ComplextroModulatedBlockMixin, nn.Module):
             bias=True,
         )
 
-        if modulation:
+        if shared_modulation is not None:
+            # Use externally provided (shared) modulation
+            self.modulation_layer = shared_modulation
+        elif modulation:
             self.modulation_layer = ComplextroModulation(
                 dim=dim,
                 num_token_types=4,
@@ -857,6 +861,7 @@ class ComplextroImageDiT(torch.nn.Module):
         enable_tread_routing: bool = False,
         tread_routes: Optional[List[dict]] = None,
         use_text_modulation: bool = False,
+        shared_modulation_group_size: Optional[Union[int, str]] = None,
     ):
         super().__init__()
 
@@ -977,17 +982,50 @@ class ComplextroImageDiT(torch.nn.Module):
             self.siglip_refiner = None
             self.siglip_pad_token = None
 
-        self.transformer_blocks = nn.ModuleList(
-            [
-                ComplextroMainBlock(
-                    dim=self.hidden_size,
-                    num_attention_heads=self.num_attention_heads,
-                    attention_head_dim=self.attention_head_dim,
-                    modulation=True,
+        # Build shared modulation layers if group_size is set
+        resolved_shared_modulation_group_size: Optional[int] = None
+        if isinstance(shared_modulation_group_size, str):
+            shared_modulation_group_size_value = shared_modulation_group_size.strip().lower()
+            if shared_modulation_group_size_value == "":
+                resolved_shared_modulation_group_size = None
+            elif shared_modulation_group_size_value == "all":
+                resolved_shared_modulation_group_size = num_layers
+            else:
+                raise ValueError(
+                    "shared_modulation_group_size must be None, a positive integer, or the string 'all'. "
+                    f"Got {shared_modulation_group_size!r}."
                 )
-                for _ in range(num_layers)
-            ]
-        )
+        elif shared_modulation_group_size is not None:
+            resolved_shared_modulation_group_size = int(shared_modulation_group_size)
+            if resolved_shared_modulation_group_size <= 0:
+                raise ValueError(
+                    "shared_modulation_group_size must be a positive integer, None, or the string 'all'. "
+                    f"Got {shared_modulation_group_size!r}."
+                )
+
+        self.shared_modulation_group_size = resolved_shared_modulation_group_size
+        shared_mods = None
+        if resolved_shared_modulation_group_size is not None:
+            num_groups = math.ceil(num_layers / resolved_shared_modulation_group_size)
+            shared_mods = nn.ModuleList([
+                ComplextroModulation(dim=self.hidden_size, num_token_types=4, use_token_type_bias=True)
+                for _ in range(num_groups)
+            ])
+            self._shared_modulations = shared_mods
+
+        blocks = []
+        for i in range(num_layers):
+            shared_mod = None
+            if shared_mods is not None:
+                shared_mod = shared_mods[i // resolved_shared_modulation_group_size]
+            blocks.append(ComplextroMainBlock(
+                dim=self.hidden_size,
+                num_attention_heads=self.num_attention_heads,
+                attention_head_dim=self.attention_head_dim,
+                modulation=True,
+                shared_modulation=shared_mod,
+            ))
+        self.transformer_blocks = nn.ModuleList(blocks)
         for route in self.tread_routes:
             if route["start_layer_idx"] >= num_layers or route["end_layer_idx"] >= num_layers:
                 raise ValueError(
