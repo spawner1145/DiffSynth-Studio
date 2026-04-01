@@ -621,9 +621,10 @@ class ComplextroSerialBlock(nn.Module):
             self.modulation_layer = ComplextroModulation(dim=dim, num_outputs=6)
 
     def forward(self, hidden_states, temb=None, token_type_ids=None,
-                image_rotary_emb=None, attention_mask=None):
+                image_rotary_emb=None, attention_mask=None, enable_fp8_attention: bool = False):
         if not self.modulation:
             hidden_states = hidden_states + self.attn(self.norm1(hidden_states),
+                enable_fp8_attention=enable_fp8_attention,
                 image_rotary_emb=image_rotary_emb, attention_mask=attention_mask)
             hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
             return hidden_states
@@ -634,7 +635,7 @@ class ComplextroSerialBlock(nn.Module):
 
         normed = (1 + scale_msa) * self.norm1(hidden_states) + shift_msa
         hidden_states = hidden_states + gate_msa * self.attn(
-            normed, image_rotary_emb=image_rotary_emb, attention_mask=attention_mask)
+            normed, image_rotary_emb=image_rotary_emb, attention_mask=attention_mask, enable_fp8_attention=enable_fp8_attention)
 
         normed = (1 + scale_mlp) * self.norm2(hidden_states) + shift_mlp
         hidden_states = hidden_states + gate_mlp * self.mlp(normed)
@@ -661,7 +662,7 @@ class ComplextroParallelBlock(nn.Module):
             self.modulation_layer = ComplextroModulation(dim=dim, num_outputs=4)
 
     def forward(self, hidden_states, temb=None, token_type_ids=None,
-                image_rotary_emb=None, attention_mask=None):
+                image_rotary_emb=None, attention_mask=None, enable_fp8_attention: bool = False):
         if not self.modulation:
             normed = self.norm(hidden_states)
             attn_out, mlp_out = self.parallel_attn(normed,
