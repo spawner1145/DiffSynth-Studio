@@ -861,7 +861,7 @@ class ComplextroImageDiT(torch.nn.Module):
         enable_tread_routing: bool = False,
         tread_routes: Optional[List[dict]] = None,
         use_text_modulation: bool = False,
-        shared_modulation_group_size: Optional[Union[int, str]] = None,
+        shared_modulation_group_size: Optional[Union[int, str]] = "all",
     ):
         super().__init__()
 
