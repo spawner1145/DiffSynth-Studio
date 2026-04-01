@@ -1,6 +1,6 @@
 import torch, math, functools
 import torch.nn as nn
-from typing import Tuple, Optional, Union, List
+from typing import Tuple, Optional, Union, List, Literal
 from collections import OrderedDict
 from einops import rearrange
 from torch.nn.utils.rnn import pad_sequence
@@ -434,18 +434,20 @@ class ComplextroModulation(nn.Module):
     def __init__(
         self,
         dim: int,
+        num_outputs: int = 6,
         num_token_types: int = 4,
         use_token_type_bias: bool = True,
     ):
         super().__init__()
         self.dim = dim
+        self.num_outputs = num_outputs
         self.num_token_types = num_token_types
         self.use_token_type_bias = use_token_type_bias
 
         self.act_fn = nn.SiLU()
-        self.base = nn.Linear(dim, 6 * dim)
+        self.base = nn.Linear(dim, num_outputs * dim)
         if use_token_type_bias:
-            self.type_bias = nn.Embedding(num_token_types, 6 * dim)
+            self.type_bias = nn.Embedding(num_token_types, num_outputs * dim)
         else:
             self.type_bias = None
 
@@ -468,20 +470,9 @@ class ComplextroModulation(nn.Module):
         if self.type_bias is not None:
             nn.init.zeros_(self.type_bias.weight)
 
-    def expand_legacy_state_dict(self, state_dict: dict, module_prefix: str):
-        base_prefix = f"{module_prefix}.base"
-        legacy_prefix = f"{module_prefix}_legacy"
-        base_weight_key = f"{base_prefix}.weight"
-        base_bias_key = f"{base_prefix}.bias"
-        legacy_weight_key = f"{legacy_prefix}.weight"
-        legacy_bias_key = f"{legacy_prefix}.bias"
-        if base_weight_key not in state_dict and legacy_weight_key in state_dict:
-            state_dict[base_weight_key] = state_dict[legacy_weight_key].detach().clone()
-        if base_bias_key not in state_dict and legacy_bias_key in state_dict:
-            state_dict[base_bias_key] = state_dict[legacy_bias_key].detach().clone()
 
-
-class ComplextroParallelSingleStreamAttention(nn.Module):
+class ComplextroParallelAttentionMLP(nn.Module):
+    """Fused QKV + MLP input projection. Single input, single matmul."""
     def __init__(
         self,
         dim: int,
@@ -505,20 +496,12 @@ class ComplextroParallelSingleStreamAttention(nn.Module):
 
     def forward(
         self,
-        attn_hidden_states: torch.FloatTensor,
-        mlp_hidden_states: torch.FloatTensor,
+        hidden_states: torch.FloatTensor,
         image_rotary_emb: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.FloatTensor] = None,
-        enable_fp8_attention: bool = False,
     ) -> Tuple[torch.FloatTensor, torch.FloatTensor]:
-        if mlp_hidden_states.data_ptr() == attn_hidden_states.data_ptr():
-            fused = self.to_qkv_mlp(attn_hidden_states)
-            qkv, mlp_fused = fused.split([self.inner_dim * 3, self.mlp_hidden_dim * 2], dim=-1)
-        else:
-            fused_attn = self.to_qkv_mlp(attn_hidden_states)
-            qkv, _ = fused_attn.split([self.inner_dim * 3, self.mlp_hidden_dim * 2], dim=-1)
-            fused_mlp = self.to_qkv_mlp(mlp_hidden_states)
-            _, mlp_fused = fused_mlp.split([self.inner_dim * 3, self.mlp_hidden_dim * 2], dim=-1)
+        fused = self.to_qkv_mlp(hidden_states)
+        qkv, mlp_fused = fused.split([self.inner_dim * 3, self.mlp_hidden_dim * 2], dim=-1)
 
         q, k, v = qkv.chunk(3, dim=-1)
         q = rearrange(q, "b s (h d) -> b h s d", h=self.num_heads)
@@ -532,12 +515,9 @@ class ComplextroParallelSingleStreamAttention(nn.Module):
             k = apply_rotary_emb_complextro(k, image_rotary_emb)
 
         attn_out = complextro_image_flash_attention(
-            q,
-            k,
-            v,
+            q, k, v,
             num_heads=q.shape[1],
             attention_mask=attention_mask,
-            enable_fp8_attention=enable_fp8_attention,
         ).to(q.dtype)
         attn_out = self.to_attn_out(attn_out)
 
@@ -593,209 +573,109 @@ class ComplextroSingleStreamAttention(nn.Module):
         return attn_out
 
 
-class ComplextroModulatedBlockMixin:
-    def _prepare_temb(
-        self,
-        hidden_states: torch.Tensor,
-        temb: torch.Tensor,
-        token_type_ids: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        target_batch, target_seq = hidden_states.shape[:2]
-
-        if temb.ndim == 2:
-            if temb.shape[0] == 1 and target_batch > 1:
-                temb = temb.expand(target_batch, -1)
-            elif temb.shape[0] != target_batch:
-                raise ValueError("temb batch size must match hidden_states batch size.")
-            temb = temb.unsqueeze(1).expand(-1, target_seq, -1)
-        elif temb.ndim == 3:
-            if temb.shape[0] == 1 and target_batch > 1:
-                temb = temb.expand(target_batch, -1, -1)
-            elif temb.shape[0] != target_batch:
-                raise ValueError("temb batch size must match hidden_states batch size.")
-            if temb.shape[1] == 1 and target_seq > 1:
-                temb = temb.expand(-1, target_seq, -1)
-            elif temb.shape[1] != target_seq:
-                raise ValueError("temb sequence length must match hidden_states sequence length.")
-        else:
-            raise ValueError("temb must be 2D or 3D.")
-
-        if token_type_ids is not None:
-            if token_type_ids.shape[0] == 1 and target_batch > 1:
-                token_type_ids = token_type_ids.expand(target_batch, -1)
-            elif token_type_ids.shape[0] != target_batch:
-                raise ValueError("token_type_ids batch size must match hidden_states batch size.")
-            if token_type_ids.shape[1] != target_seq:
-                raise ValueError("token_type_ids sequence length must match hidden_states sequence length.")
-
-        return temb
-
-    def _compute_modulation_params(self, temb: torch.Tensor, token_type_ids: Optional[torch.Tensor] = None):
-        if token_type_ids is not None:
-            token_type_ids = token_type_ids.to(device=temb.device, dtype=torch.long).clamp(TOKEN_TYPE_TEXT, TOKEN_TYPE_COND_IMAGE)
-            mod = self.modulation_layer(temb, token_type_ids)
-        else:
-            mod = self.modulation_layer(temb)
-            if mod.ndim == 2:
-                mod = mod.unsqueeze(1)
-        return mod.chunk(6, dim=-1)
+def _prepare_temb(hidden_states, temb, token_type_ids=None):
+    """Expand temb to match hidden_states shape."""
+    target_batch, target_seq = hidden_states.shape[:2]
+    if temb.ndim == 2:
+        if temb.shape[0] != target_batch:
+            raise ValueError("temb batch size must match hidden_states batch size.")
+        temb = temb.unsqueeze(1).expand(-1, target_seq, -1)
+    elif temb.ndim == 3:
+        if temb.shape[0] != target_batch:
+            raise ValueError("temb batch size must match hidden_states batch size.")
+        if temb.shape[1] == 1 and target_seq > 1:
+            temb = temb.expand(-1, target_seq, -1)
+        elif temb.shape[1] != target_seq:
+            raise ValueError("temb sequence length must match hidden_states.")
+    else:
+        raise ValueError("temb must be 2D or 3D.")
+    return temb
 
 
-class ComplextroSingleTransformerBlock(ComplextroModulatedBlockMixin, nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        num_attention_heads: int,
-        attention_head_dim: int,
-        eps: float = 1e-6,
-        modulation: bool = True,
-    ):
+def _compute_modulation(modulation_layer, temb, token_type_ids=None):
+    """Run modulation layer and chunk outputs."""
+    if token_type_ids is not None:
+        token_type_ids = token_type_ids.to(device=temb.device, dtype=torch.long).clamp(TOKEN_TYPE_TEXT, TOKEN_TYPE_COND_IMAGE)
+        mod = modulation_layer(temb, token_type_ids)
+    else:
+        mod = modulation_layer(temb)
+        if mod.ndim == 2:
+            mod = mod.unsqueeze(1)
+    return mod.chunk(modulation_layer.num_outputs, dim=-1)
+
+
+class ComplextroSerialBlock(nn.Module):
+    """Serial block: Attention → FFN, each with independent AdaLN (6-way modulation)."""
+
+    def __init__(self, dim, num_attention_heads, attention_head_dim, eps=1e-6, modulation=True):
         super().__init__()
-
         self.dim = dim
-        self.num_attention_heads = num_attention_heads
-        self.attention_head_dim = attention_head_dim
         self.modulation = modulation
 
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.attn = ComplextroSingleStreamAttention(
-            dim=dim,
-            num_heads=num_attention_heads,
-            head_dim=attention_head_dim,
-        )
+        self.attn = ComplextroSingleStreamAttention(dim=dim, num_heads=num_attention_heads, head_dim=attention_head_dim)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.mlp = ComplextroFeedForward(dim=dim, dim_out=dim)
 
         if modulation:
-            self.modulation_layer = ComplextroModulation(
-                dim=dim,
-                num_token_types=4,
-                use_token_type_bias=True,
-            )
+            self.modulation_layer = ComplextroModulation(dim=dim, num_outputs=6)
 
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        temb: Optional[torch.Tensor] = None,
-        token_type_ids: Optional[torch.Tensor] = None,
-        image_rotary_emb: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        enable_fp8_attention: bool = False,
-    ) -> torch.Tensor:
+    def forward(self, hidden_states, temb=None, token_type_ids=None,
+                image_rotary_emb=None, attention_mask=None):
         if not self.modulation:
-            attn_out = self.attn(
-                hidden_states=self.norm1(hidden_states),
-                image_rotary_emb=image_rotary_emb,
-                attention_mask=attention_mask,
-                enable_fp8_attention=enable_fp8_attention,
-            )
-            hidden_states = hidden_states + attn_out
+            hidden_states = hidden_states + self.attn(self.norm1(hidden_states),
+                image_rotary_emb=image_rotary_emb, attention_mask=attention_mask)
             hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
             return hidden_states
 
-        if temb is None:
-            raise ValueError("temb must be provided when modulation is enabled.")
+        temb = _prepare_temb(hidden_states, temb, token_type_ids)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = _compute_modulation(
+            self.modulation_layer, temb, token_type_ids)
 
-        temb = self._prepare_temb(hidden_states, temb, token_type_ids)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._compute_modulation_params(
-            temb, token_type_ids
-        )
+        normed = (1 + scale_msa) * self.norm1(hidden_states) + shift_msa
+        hidden_states = hidden_states + gate_msa * self.attn(
+            normed, image_rotary_emb=image_rotary_emb, attention_mask=attention_mask)
 
-        norm_hidden_states = self.norm1(hidden_states)
-        norm_hidden_states = (1 + scale_msa) * norm_hidden_states + shift_msa
-        attn_out = self.attn(
-            hidden_states=norm_hidden_states,
-            image_rotary_emb=image_rotary_emb,
-            attention_mask=attention_mask,
-            enable_fp8_attention=enable_fp8_attention,
-        )
-        hidden_states = hidden_states + gate_msa * attn_out
-
-        norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = (1 + scale_mlp) * norm_hidden_states + shift_mlp
-        mlp_out = self.mlp(norm_hidden_states)
-        hidden_states = hidden_states + gate_mlp * mlp_out
-
+        normed = (1 + scale_mlp) * self.norm2(hidden_states) + shift_mlp
+        hidden_states = hidden_states + gate_mlp * self.mlp(normed)
         return hidden_states
 
 
-class ComplextroRefinerBlock(ComplextroSingleTransformerBlock):
-    """Light type-specific refinement block used before omni packing into the unified trunk."""
-    pass
+class ComplextroParallelBlock(nn.Module):
+    """Parallel block: Attention + FFN fused projection, shared scale/shift (4-way modulation)."""
 
-
-class ComplextroMainBlock(ComplextroModulatedBlockMixin, nn.Module):
-    """Unified omni trunk block operating on packed multimodal sequences."""
-
-    def __init__(
-        self,
-        dim: int,
-        num_attention_heads: int,
-        attention_head_dim: int,
-        mlp_ratio: float = 4.0,
-        eps: float = 1e-6,
-        modulation: bool = True,
-        shared_modulation: Optional[nn.Module] = None,
-    ):
+    def __init__(self, dim, num_attention_heads, attention_head_dim,
+                 mlp_ratio=4.0, eps=1e-6, modulation=True, shared_modulation=None):
         super().__init__()
         self.dim = dim
         self.modulation = modulation
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.parallel_attn = ComplextroParallelSingleStreamAttention(
-            dim=dim,
-            num_heads=num_attention_heads,
-            head_dim=attention_head_dim,
-            mlp_ratio=mlp_ratio,
-            bias=True,
+        self.parallel_attn = ComplextroParallelAttentionMLP(
+            dim=dim, num_heads=num_attention_heads, head_dim=attention_head_dim,
+            mlp_ratio=mlp_ratio, bias=True,
         )
 
         if shared_modulation is not None:
-            # Use externally provided (shared) modulation
             self.modulation_layer = shared_modulation
         elif modulation:
-            self.modulation_layer = ComplextroModulation(
-                dim=dim,
-                num_token_types=4,
-                use_token_type_bias=True,
-            )
+            self.modulation_layer = ComplextroModulation(dim=dim, num_outputs=4)
 
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        temb: Optional[torch.Tensor] = None,
-        token_type_ids: Optional[torch.Tensor] = None,
-        image_rotary_emb: Optional[torch.Tensor] = None,
-        attention_mask: Optional[torch.Tensor] = None,
-        enable_fp8_attention: bool = False,
-    ) -> torch.Tensor:
+    def forward(self, hidden_states, temb=None, token_type_ids=None,
+                image_rotary_emb=None, attention_mask=None):
         if not self.modulation:
-            norm_hidden_states = self.norm(hidden_states)
-            attn_out, mlp_out = self.parallel_attn(
-                attn_hidden_states=norm_hidden_states,
-                mlp_hidden_states=norm_hidden_states,
-                image_rotary_emb=image_rotary_emb,
-                attention_mask=attention_mask,
-                enable_fp8_attention=enable_fp8_attention,
-            )
+            normed = self.norm(hidden_states)
+            attn_out, mlp_out = self.parallel_attn(normed,
+                image_rotary_emb=image_rotary_emb, attention_mask=attention_mask)
             return hidden_states + attn_out + mlp_out
 
-        if temb is None:
-            raise ValueError("temb must be provided when modulation is enabled.")
+        temb = _prepare_temb(hidden_states, temb, token_type_ids)
+        shift, scale, gate_attn, gate_mlp = _compute_modulation(
+            self.modulation_layer, temb, token_type_ids)
 
-        temb = self._prepare_temb(hidden_states, temb, token_type_ids)
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self._compute_modulation_params(temb, token_type_ids)
-        norm_hidden_states = self.norm(hidden_states)
-        attn_hidden_states = (1 + scale_msa) * norm_hidden_states + shift_msa
-        mlp_hidden_states = (1 + scale_mlp) * norm_hidden_states + shift_mlp
-        attn_out, mlp_out = self.parallel_attn(
-            attn_hidden_states=attn_hidden_states,
-            mlp_hidden_states=mlp_hidden_states,
-            image_rotary_emb=image_rotary_emb,
-            attention_mask=attention_mask,
-            enable_fp8_attention=enable_fp8_attention,
-        )
-        return hidden_states + gate_msa * attn_out + gate_mlp * mlp_out
+        normed = (1 + scale) * self.norm(hidden_states) + shift
+        attn_out, mlp_out = self.parallel_attn(normed,
+            image_rotary_emb=image_rotary_emb, attention_mask=attention_mask)
+        return hidden_states + gate_attn * attn_out + gate_mlp * mlp_out
 
 
 class ComplextroPackedSequence:
@@ -861,7 +741,7 @@ class ComplextroImageDiT(torch.nn.Module):
         enable_tread_routing: bool = False,
         tread_routes: Optional[List[dict]] = None,
         use_text_modulation: bool = False,
-        shared_modulation_group_size: Optional[Union[int, str]] = "all",
+        shared_modulation_group_size: Optional[Union[int, Literal["all"]]] = "all",
     ):
         super().__init__()
 
@@ -938,7 +818,7 @@ class ComplextroImageDiT(torch.nn.Module):
 
         self.noise_refiner = nn.ModuleList(
             [
-                ComplextroRefinerBlock(
+                ComplextroSerialBlock(
                     dim=self.hidden_size,
                     num_attention_heads=self.num_attention_heads,
                     attention_head_dim=self.attention_head_dim,
@@ -949,7 +829,7 @@ class ComplextroImageDiT(torch.nn.Module):
         )
         self.context_refiner = nn.ModuleList(
             [
-                ComplextroRefinerBlock(
+                ComplextroSerialBlock(
                     dim=self.hidden_size,
                     num_attention_heads=self.num_attention_heads,
                     attention_head_dim=self.attention_head_dim,
@@ -968,7 +848,7 @@ class ComplextroImageDiT(torch.nn.Module):
             self.siglip_pad_token = nn.Parameter(torch.empty((1, self.hidden_size)))
             self.siglip_refiner = nn.ModuleList(
                 [
-                    ComplextroRefinerBlock(
+                    ComplextroSerialBlock(
                         dim=self.hidden_size,
                         num_attention_heads=self.num_attention_heads,
                         attention_head_dim=self.attention_head_dim,
@@ -982,33 +862,28 @@ class ComplextroImageDiT(torch.nn.Module):
             self.siglip_refiner = None
             self.siglip_pad_token = None
 
-        # Build shared modulation layers if group_size is set
-        resolved_shared_modulation_group_size: Optional[int] = None
         if isinstance(shared_modulation_group_size, str):
-            shared_modulation_group_size_value = shared_modulation_group_size.strip().lower()
-            if shared_modulation_group_size_value == "":
-                resolved_shared_modulation_group_size = None
-            elif shared_modulation_group_size_value == "all":
-                resolved_shared_modulation_group_size = num_layers
-            else:
+            if shared_modulation_group_size != "all":
                 raise ValueError(
-                    "shared_modulation_group_size must be None, a positive integer, or the string 'all'. "
-                    f"Got {shared_modulation_group_size!r}."
+                    "shared_modulation_group_size must be an integer, None, or 'all'. "
+                    f"Got: {shared_modulation_group_size!r}."
                 )
+            shared_modulation_group_size = num_layers
         elif shared_modulation_group_size is not None:
-            resolved_shared_modulation_group_size = int(shared_modulation_group_size)
-            if resolved_shared_modulation_group_size <= 0:
+            shared_modulation_group_size = int(shared_modulation_group_size)
+            if shared_modulation_group_size <= 0:
                 raise ValueError(
-                    "shared_modulation_group_size must be a positive integer, None, or the string 'all'. "
-                    f"Got {shared_modulation_group_size!r}."
+                    "shared_modulation_group_size must be a positive integer, None, or 'all'. "
+                    f"Got: {shared_modulation_group_size}."
                 )
 
-        self.shared_modulation_group_size = resolved_shared_modulation_group_size
+        # Build shared modulation layers if group_size is set. None means no sharing; 'all' means all trunk layers share one modulation.
+        self.shared_modulation_group_size = shared_modulation_group_size
         shared_mods = None
-        if resolved_shared_modulation_group_size is not None:
-            num_groups = math.ceil(num_layers / resolved_shared_modulation_group_size)
+        if shared_modulation_group_size is not None:
+            num_groups = math.ceil(num_layers / shared_modulation_group_size)
             shared_mods = nn.ModuleList([
-                ComplextroModulation(dim=self.hidden_size, num_token_types=4, use_token_type_bias=True)
+                ComplextroModulation(dim=self.hidden_size, num_outputs=4, num_token_types=4, use_token_type_bias=True)
                 for _ in range(num_groups)
             ])
             self._shared_modulations = shared_mods
@@ -1017,8 +892,8 @@ class ComplextroImageDiT(torch.nn.Module):
         for i in range(num_layers):
             shared_mod = None
             if shared_mods is not None:
-                shared_mod = shared_mods[i // resolved_shared_modulation_group_size]
-            blocks.append(ComplextroMainBlock(
+                shared_mod = shared_mods[i // shared_modulation_group_size]
+            blocks.append(ComplextroParallelBlock(
                 dim=self.hidden_size,
                 num_attention_heads=self.num_attention_heads,
                 attention_head_dim=self.attention_head_dim,
@@ -1138,7 +1013,7 @@ class ComplextroImageDiT(torch.nn.Module):
             state_dict = dict(state_dict)
 
         for module_prefix, module in self.named_modules():
-            if not isinstance(module, (ComplextroSingleTransformerBlock, ComplextroMainBlock)) or not getattr(module, "modulation", False):
+            if not isinstance(module, (ComplextroSerialBlock, ComplextroParallelBlock)) or not getattr(module, "modulation", False):
                 continue
 
             base_prefix = f"{module_prefix}.modulation_layer.base"
