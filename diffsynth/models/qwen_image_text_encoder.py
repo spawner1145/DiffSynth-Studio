@@ -358,6 +358,202 @@ class QwenImageTextEncoder(torch.nn.Module):
                 }),
             }
 
+        if model_type == "gemma4":
+            from transformers import AutoConfig, AutoModelForMultimodalLM
+            model_dict["gemma4"] = AutoModelForMultimodalLM.from_config
+            config_dict["gemma4"] = {
+                "2B": AutoConfig.from_dict({
+                    "architectures": [
+                        "Gemma4ForConditionalGeneration"
+                    ],
+                    "audio_config": {
+                        "_name_or_path": "",
+                        "architectures": None,
+                        "attention_chunk_size": 12,
+                        "attention_context_left": 13,
+                        "attention_context_right": 0,
+                        "attention_invalid_logits_value": -1000000000.0,
+                        "attention_logit_cap": 50.0,
+                        "chunk_size_feed_forward": 0,
+                        "conv_kernel_size": 5,
+                        "dtype": "bfloat16",
+                        "gradient_clipping": 10000000000.0,
+                        "hidden_act": "silu",
+                        "hidden_size": 1024,
+                        "id2label": {
+                        "0": "LABEL_0",
+                        "1": "LABEL_1"
+                        },
+                        "initializer_range": 0.02,
+                        "is_encoder_decoder": False,
+                        "label2id": {
+                        "LABEL_0": 0,
+                        "LABEL_1": 1
+                        },
+                        "model_type": "gemma4_audio",
+                        "num_attention_heads": 8,
+                        "num_hidden_layers": 12,
+                        "output_attentions": False,
+                        "output_hidden_states": False,
+                        "output_proj_dims": 1536,
+                        "problem_type": None,
+                        "residual_weight": 0.5,
+                        "return_dict": True,
+                        "rms_norm_eps": 1e-06,
+                        "subsampling_conv_channels": [
+                        128,
+                        32
+                        ],
+                        "use_clipped_linears": True
+                    },
+                    "audio_token_id": 258881,
+                    "boa_token_id": 256000,
+                    "boi_token_id": 255999,
+                    "dtype": "bfloat16",
+                    "eoa_token_id": 258883,
+                    "eoa_token_index": 258883,
+                    "eoi_token_id": 258882,
+                    "eos_token_id": [
+                        1,
+                        106
+                    ],
+                    "image_token_id": 258880,
+                    "initializer_range": 0.02,
+                    "model_type": "gemma4",
+                    "text_config": {
+                        "attention_bias": False,
+                        "attention_dropout": 0.0,
+                        "attention_k_eq_v": False,
+                        "bos_token_id": 2,
+                        "dtype": "bfloat16",
+                        "enable_moe_block": False,
+                        "eos_token_id": 1,
+                        "expert_intermediate_size": None,
+                        "final_logit_softcapping": 30.0,
+                        "global_head_dim": 512,
+                        "head_dim": 256,
+                        "hidden_activation": "gelu_pytorch_tanh",
+                        "hidden_size": 1536,
+                        "hidden_size_per_layer_input": 256,
+                        "initializer_range": 0.02,
+                        "intermediate_size": 6144,
+                        "layer_types": [
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "full_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "full_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "full_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "full_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "full_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "full_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "sliding_attention",
+                        "full_attention"
+                        ],
+                        "max_position_embeddings": 131072,
+                        "model_type": "gemma4_text",
+                        "num_attention_heads": 8,
+                        "num_experts": None,
+                        "num_global_key_value_heads": None,
+                        "num_hidden_layers": 35,
+                        "num_key_value_heads": 1,
+                        "num_kv_shared_layers": 20,
+                        "pad_token_id": 0,
+                        "rms_norm_eps": 1e-06,
+                        "rope_parameters": {
+                        "full_attention": {
+                            "partial_rotary_factor": 0.25,
+                            "rope_theta": 1000000.0,
+                            "rope_type": "proportional"
+                        },
+                        "sliding_attention": {
+                            "rope_theta": 10000.0,
+                            "rope_type": "default"
+                        }
+                        },
+                        "sliding_window": 512,
+                        "tie_word_embeddings": True,
+                        "top_k_experts": None,
+                        "use_bidirectional_attention": None,
+                        "use_cache": True,
+                        "use_double_wide_mlp": True,
+                        "vocab_size": 262144,
+                        "vocab_size_per_layer_input": 262144
+                    },
+                    "tie_word_embeddings": True,
+                    "transformers_version": "5.5.0.dev0",
+                    "video_token_id": 258884,
+                    "vision_config": {
+                        "_name_or_path": "",
+                        "architectures": None,
+                        "attention_bias": False,
+                        "attention_dropout": 0.0,
+                        "chunk_size_feed_forward": 0,
+                        "default_output_length": 280,
+                        "dtype": "bfloat16",
+                        "global_head_dim": 64,
+                        "head_dim": 64,
+                        "hidden_activation": "gelu_pytorch_tanh",
+                        "hidden_size": 768,
+                        "id2label": {
+                        "0": "LABEL_0",
+                        "1": "LABEL_1"
+                        },
+                        "initializer_range": 0.02,
+                        "intermediate_size": 3072,
+                        "is_encoder_decoder": False,
+                        "label2id": {
+                        "LABEL_0": 0,
+                        "LABEL_1": 1
+                        },
+                        "max_position_embeddings": 131072,
+                        "model_type": "gemma4_vision",
+                        "num_attention_heads": 12,
+                        "num_hidden_layers": 16,
+                        "num_key_value_heads": 12,
+                        "output_attentions": False,
+                        "output_hidden_states": False,
+                        "patch_size": 16,
+                        "pooling_kernel_size": 3,
+                        "position_embedding_size": 10240,
+                        "problem_type": None,
+                        "return_dict": True,
+                        "rms_norm_eps": 1e-06,
+                        "rope_parameters": {
+                        "rope_theta": 100.0,
+                        "rope_type": "default"
+                        },
+                        "standardize": False,
+                        "use_clipped_linears": True
+                    },
+                    "vision_soft_tokens_per_image": 280
+                    })
+            }
+
         if model_type not in model_dict:
             raise ValueError(f"Unsupported model_type: {model_type}")
         if model_type not in config_dict or model_size not in config_dict[model_type]:
@@ -365,7 +561,10 @@ class QwenImageTextEncoder(torch.nn.Module):
 
         config = config_dict[model_type][model_size]
         self.model_type = model_type
-        self.model = model_dict[model_type](config)
+        if model_type == "gemma4":
+            self.model = model_dict[model_type](config)
+        else:
+            self.model = model_dict[model_type](config)
         if model_type == "qwen2_5_vl":
             self.lm_head = torch.nn.Linear(config.text_config.hidden_size, config.text_config.vocab_size, bias=False)
         self.config = config

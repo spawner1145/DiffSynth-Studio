@@ -34,9 +34,10 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
     def __init__(
         self,
         device,
-        qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/Qwen3_5_2b_claude_heretic/model.safetensors",
+        qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/Qwen3_5_2b_claude_heretic/model.safetensors",  # 如果使用 Gemma4，改为对应的 safetensors 路径
+        qwen_model_type: str = "qwen3_5",  # 修改为 "gemma4" 如果要使用 Gemma4 模型
         vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
-        qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/Qwen3_5_2b_claude_heretic",
+        qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/Qwen3_5_2b_claude_heretic",  # 修改为 Gemma4 对应的 tokenizer 路径
         qwen_model_size: str = "2B",
         siglip_model_file="",
         #complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e43-s19221.safetensors",
@@ -176,7 +177,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         self.pipe.text_encoder = load_aux_model(
             QwenImageTextEncoder,
             qwen_model_file,
-            config={"model_type": "qwen3_5", "model_size": qwen_model_size},
+            config={"model_type": qwen_model_type, "model_size": qwen_model_size},
             state_dict_converter=QwenImageTextEncoderStateDictConverter,
         )
         if self.vae_spec["model_file"] is None and self.vae_spec["model_class"] in (
@@ -806,6 +807,7 @@ if __name__ == "__main__":
 
     model = ComplextroTrainingModule(
         device=accelerator.device,
+        qwen_model_type="qwen3_5",  # 如果要使用 gemma4 请改为 "gemma4"
         qwen_model_size="2B",
         siglip_model_file=siglip_model_file,
         train_omni=train_omni,
