@@ -12,10 +12,11 @@ def QwenImageTextEncoderStateDictConverter(state_dict):
     )
 
     is_gemma4_conditional_checkpoint = (
-        any(k.startswith("model.language_model.") for k in keys)
-        and any(k.startswith("model.language_model.audio_tower.") for k in keys)
-        and not any(k.startswith("model.model.") for k in keys)
-    )
+        any(k.startswith("model.language_model.audio_tower.") for k in keys)
+        or any(k.startswith("model.language_model.vision_tower.") for k in keys)
+        or any(k.startswith("model.language_model.embed_audio.") for k in keys)
+        or any(k.startswith("model.language_model.embed_vision.") for k in keys)
+    ) and not has_wrapped_qwen35_prefix
 
     state_dict_ = {}
     for k, v in state_dict.items():
