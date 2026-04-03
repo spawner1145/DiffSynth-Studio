@@ -587,18 +587,19 @@ class ComplextroUnit_PromptEmbedder(PipelineUnit):
         if not hasattr(template_source, "apply_chat_template"):
             raise ValueError("Selected tokenizer/processor does not support apply_chat_template.")
 
-        template_kwargs = {
+        processor_kwargs = {
             "tokenize": True,
             "return_dict": True,
             "return_tensors": "pt",
             "padding": "max_length",
             "truncation": True,
             "max_length": 1024,
-            "add_generation_prompt": True,
         }
+        template_kwargs = {"add_generation_prompt": True}
         signature = inspect.signature(template_source.apply_chat_template)
         if "enable_thinking" in signature.parameters:
             template_kwargs["enable_thinking"] = False
+        template_kwargs["processor_kwargs"] = processor_kwargs
 
         model_inputs = template_source.apply_chat_template(conversations, **template_kwargs).to(pipe.device)
 
