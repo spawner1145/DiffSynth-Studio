@@ -12,11 +12,11 @@ def QwenImageTextEncoderStateDictConverter(state_dict):
     )
 
     is_gemma4_conditional_checkpoint = (
-        any(k.startswith("model.language_model.audio_tower.") for k in keys)
-        or any(k.startswith("model.language_model.vision_tower.") for k in keys)
-        or any(k.startswith("model.language_model.embed_audio.") for k in keys)
-        or any(k.startswith("model.language_model.embed_vision.") for k in keys)
-    ) and not has_wrapped_qwen35_prefix
+        any(k.startswith("model.audio_tower.") for k in keys)
+        or any(k.startswith("model.vision_tower.") for k in keys)
+        or any(k.startswith("model.embed_audio.") for k in keys)
+        or any(k.startswith("model.embed_vision.") for k in keys)
+    ) and not any(k.startswith("model.model.") for k in keys)
 
     state_dict_ = {}
     for k, v in state_dict.items():
@@ -57,7 +57,11 @@ def QwenImageTextEncoderStateDictConverter(state_dict):
             state_dict_["model.lm_head.weight"] = state_dict_["model.language_model.embed_tokens.weight"]
 
     if is_gemma4_conditional_checkpoint and "model.lm_head.weight" not in state_dict_:
-        if "model.model.language_model.embed_tokens.weight" in state_dict_:
+        if "model.model.embed_tokens.weight" in state_dict_:
+            state_dict_["model.lm_head.weight"] = state_dict_["model.model.embed_tokens.weight"]
+        elif "model.embed_tokens.weight" in state_dict_:
+            state_dict_["model.lm_head.weight"] = state_dict_["model.embed_tokens.weight"]
+        elif "model.model.language_model.embed_tokens.weight" in state_dict_:
             state_dict_["model.lm_head.weight"] = state_dict_["model.model.language_model.embed_tokens.weight"]
         elif "model.language_model.embed_tokens.weight" in state_dict_:
             state_dict_["model.lm_head.weight"] = state_dict_["model.language_model.embed_tokens.weight"]
