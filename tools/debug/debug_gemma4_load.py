@@ -10,7 +10,7 @@ def main():
         description="Debug Gemma4 loading through the exact same load_aux_model path used in train_complextro.py"
     )
     parser.add_argument("--tokenizer-dir", required=True, help="Tokenizer/processor directory")
-    parser.add_argument("--qwen-model-type", required=True, help="Model type passed to QwenImageTextEncoder, e.g. gemma4")
+    parser.add_argument("--qwen-model-type", default="gemma4", help="Model type passed to QwenImageTextEncoder, e.g. gemma4")
     parser.add_argument("--qwen-model-file", required=True, help="Model checkpoint path")
     parser.add_argument("--output", default=None, help="Output txt path")
     parser.add_argument("--device", default=None, help="Override device. Default uses Accelerator().device")
