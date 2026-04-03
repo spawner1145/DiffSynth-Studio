@@ -28,7 +28,7 @@ def build_complextro_pipe(
     complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e3-s10059.safetensors",
     qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw",  # 使用 Gemma4 时修改为对应的 tokenizer/processor 目录或 HF ID
     qwen_model_type: str = "qwen3_5",  # 使用 Gemma4 时修改为 "gemma4"
-    qwen_model_size: str = "2B",
+    qwen_model_size: str = "2B",  # 使用 Gemma4 E2B 时修改为 "E2B"
     siglip_model_file="",
     vae_type: str = "flux2",
     use_alpha_layer_vae: bool = False,
