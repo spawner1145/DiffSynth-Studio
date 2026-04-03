@@ -26,7 +26,8 @@ def build_complextro_pipe(
     qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw/model.safetensors",
     vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
     complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e3-s10059.safetensors",
-    qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw",
+    qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/qwen3_5_nsfw",  # 使用 Gemma4 时修改为对应的 tokenizer/processor 目录或 HF ID
+    qwen_model_type: str = "qwen3_5",  # 使用 Gemma4 时修改为 "gemma4"
     qwen_model_size: str = "2B",
     siglip_model_file="",
     vae_type: str = "flux2",
@@ -131,7 +132,7 @@ def build_complextro_pipe(
     pipe.text_encoder = load_model_with_optional_offload(
         QwenImageTextEncoder,
         qwen_model_file,
-        config={"model_type": "qwen3_5", "model_size": qwen_model_size},
+        config={"model_type": qwen_model_type, "model_size": qwen_model_size},
         state_dict_converter=QwenImageTextEncoderStateDictConverter,
     )
     if vae_spec["model_file"] is None and vae_spec["model_class"] in (
@@ -176,7 +177,7 @@ def build_complextro_pipe(
     if text_hidden_size != dit_text_dim:
         raise ValueError(
             f"Text encoder hidden_size ({text_hidden_size}) != Complextro text_embed_dim ({dit_text_dim}). "
-            f"Please align QwenImageTextEncoder(model_type='qwen3_5', model_size='{qwen_model_size}') and ComplextroImageDiT(text_embed_dim=...)."
+            f"Please align QwenImageTextEncoder(model_type='{qwen_model_type}', model_size='{qwen_model_size}') and ComplextroImageDiT(text_embed_dim=...)."
         )
 
     if siglip_enabled:
@@ -263,6 +264,7 @@ if __name__ == "__main__":
         device=device,
         torch_dtype=dtype,
         qwen_model_file="/root/autodl-tmp/DiffSynth-Studio/Qwen3_5_2b_claude_heretic/model.safetensors",
+        qwen_model_type="qwen3_5",  # 如果要使用 gemma4 请改为 "gemma4"
         vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
         complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e4-s67044.safetensors",
         qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/Qwen3_5_2b_claude_heretic",
