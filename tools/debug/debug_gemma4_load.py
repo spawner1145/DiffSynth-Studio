@@ -5,53 +5,23 @@ from datetime import datetime
 from pathlib import Path
 
 
-def _read_state_dict(path, torch_dtype=None, device="cpu"):
-    from diffsynth.core.loader.file import load_state_dict
-
-    return load_state_dict(path, torch_dtype=torch_dtype, device=device)
-
-
-def _import_symbol(qualified_name: str):
-    import importlib
-
-    module_name, symbol_name = qualified_name.rsplit(".", 1)
-    module = importlib.import_module(module_name)
-    return getattr(module, symbol_name)
-
-
-def _safe_list(iterable, limit=None):
-    items = list(iterable)
-    if limit is not None:
-        return items[:limit]
-    return items
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Debug Gemma4 state_dict loading and dump full errors to txt.")
-    parser.add_argument("--model-path", required=True, help="Path to model file (.safetensors/.bin/.pth)")
-    parser.add_argument("--output", default=None, help="Output txt path. Default: tools/debug/gemma4_load_report_<timestamp>.txt")
-    parser.add_argument("--model-type", default="gemma4")
-    parser.add_argument("--model-size", default="2B")
-    parser.add_argument("--use-converter", action="store_true", help="Apply QwenImageTextEncoderStateDictConverter before loading")
+    parser = argparse.ArgumentParser(
+        description="Debug Gemma4 loading through the exact same load_aux_model path used in train_complextro.py"
+    )
+    parser.add_argument("--tokenizer-dir", required=True, help="Tokenizer/processor directory")
+    parser.add_argument("--qwen-model-type", required=True, help="Model type passed to QwenImageTextEncoder, e.g. gemma4")
+    parser.add_argument("--qwen-model-file", required=True, help="Model checkpoint path")
+    parser.add_argument("--output", default=None, help="Output txt path")
     parser.add_argument("--device", default="cpu")
-    parser.add_argument("--dtype", default="none", choices=["none", "float16", "bfloat16", "float32"])
-    parser.add_argument("--preview-limit", type=int, default=200000, help="How many keys to preview in each section")
+    parser.add_argument("--dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"])
+    parser.add_argument("--enable-vram-offload", action="store_true")
+    parser.add_argument("--vram-limit", type=float, default=None)
     args = parser.parse_args()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = Path(args.output or f"tools/debug/gemma4_load_report_{timestamp}.txt")
+    output_path = Path(args.output or f"tools/debug/gemma4_pipeline_path_report_{timestamp}.txt")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    import torch
-    from diffsynth.models.qwen_image_text_encoder import QwenImageTextEncoder
-
-    dtype_map = {
-        "none": None,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "float32": torch.float32,
-    }
-    torch_dtype = dtype_map[args.dtype]
 
     report = []
 
@@ -64,59 +34,116 @@ def main():
         report.append("\n")
 
     try:
+        import importlib
+        import torch
+        from transformers import AutoProcessor
+
+        from diffsynth.core import load_model
+        from diffsynth.core.loader.file import load_state_dict
+        from diffsynth.core.vram import AutoWrappedModule
+        from diffsynth.configs.vram_management_module_maps import VRAM_MANAGEMENT_MODULE_MAPS, VERSION_CHECKER_MAPS
+        from diffsynth.models.qwen_image_text_encoder import QwenImageTextEncoder
+        from diffsynth.utils.state_dict_converters.qwen_image_text_encoder import QwenImageTextEncoderStateDictConverter
+
+        dtype_map = {
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "float32": torch.float32,
+        }
+        torch_dtype = dtype_map[args.dtype]
+        device = args.device
+        qwen_model_type = args.qwen_model_type
+        qwen_model_file = args.qwen_model_file
+        qwen_tokenizer_dir = args.tokenizer_dir
+        qwen_model_size = "2B" if qwen_model_type == "gemma4" else "0.8B"
+
         log("ARGS", vars(args))
+        log(
+            "HARDCODED_PIPELINE_CALL",
+            "self.pipe.text_encoder = load_aux_model(\n"
+            "    QwenImageTextEncoder,\n"
+            "    qwen_model_file,\n"
+            "    config={\"model_type\": qwen_model_type, \"model_size\": qwen_model_size},\n"
+            "    state_dict_converter=QwenImageTextEncoderStateDictConverter,\n"
+            ")",
+        )
 
-        state_dict = _read_state_dict(args.model_path, torch_dtype=torch_dtype, device=args.device)
-        original_keys = list(state_dict.keys())
-        log("ORIGINAL_KEY_COUNT", str(len(original_keys)))
-        log("ORIGINAL_KEY_PREVIEW", "\n".join(original_keys[: args.preview_limit]))
+        def resolve_module_map(model_class):
+            def import_class(class_path: str):
+                split = class_path.rfind(".")
+                module_name, class_name = class_path[:split], class_path[split + 1:]
+                return getattr(importlib.import_module(module_name), class_name)
 
-        converted_state_dict = state_dict
-        if args.use_converter:
-            converter = _import_symbol(
-                "diffsynth.utils.state_dict_converters.qwen_image_text_encoder.QwenImageTextEncoderStateDictConverter"
-            )
-            converted_state_dict = converter(state_dict)
+            model_class_path = f"{model_class.__module__}.{model_class.__name__}"
+            if model_class_path == "diffsynth.models.qwen_image_text_encoder.QwenImageTextEncoder":
+                return {model_class: AutoWrappedModule}
+            if model_class_path in VERSION_CHECKER_MAPS:
+                raw_map = VERSION_CHECKER_MAPS[model_class_path]()
+                return {import_class(source): import_class(target) for source, target in raw_map.items()}
+            if model_class_path not in VRAM_MANAGEMENT_MODULE_MAPS:
+                raise KeyError(f"No VRAM management module map registered for {model_class_path}.")
+            raw_map = VRAM_MANAGEMENT_MODULE_MAPS[model_class_path]
+            return {import_class(source): import_class(target) for source, target in raw_map.items()}
 
-        converted_keys = list(converted_state_dict.keys())
-        log("CONVERTED_KEY_COUNT", str(len(converted_keys)))
-        log("CONVERTED_KEY_PREVIEW", "\n".join(converted_keys[: args.preview_limit]))
+        def load_aux_model(model_class, model_file, *, config=None, state_dict_converter=None):
+            load_kwargs = {
+                "config": config,
+                "torch_dtype": torch.bfloat16,
+                "device": device,
+                "state_dict_converter": state_dict_converter,
+            }
+            if args.enable_vram_offload:
+                vram_config = {
+                    "offload_dtype": torch.bfloat16,
+                    "offload_device": "cpu",
+                    "onload_dtype": torch.bfloat16,
+                    "onload_device": device,
+                    "preparing_dtype": torch.bfloat16,
+                    "preparing_device": device,
+                    "computation_dtype": torch.bfloat16,
+                    "computation_device": device,
+                }
+                load_kwargs["module_map"] = resolve_module_map(model_class)
+                load_kwargs["vram_config"] = vram_config
+                load_kwargs["vram_limit"] = args.vram_limit
+            return load_model(model_class, model_file, **load_kwargs)
 
-        model = QwenImageTextEncoder(model_type=args.model_type, model_size=args.model_size)
-        model_keys = list(model.state_dict().keys())
-        log("MODEL_KEY_COUNT", str(len(model_keys)))
-        log("MODEL_KEY_PREVIEW", "\n".join(model_keys[: args.preview_limit]))
+        raw_state_dict = load_state_dict(qwen_model_file, torch_dtype=torch_dtype, device=device)
+        log("RAW_KEY_COUNT", str(len(raw_state_dict)))
+        log("RAW_KEY_PREVIEW", "\n".join(list(raw_state_dict.keys())[:300]))
 
-        converted_key_set = set(converted_keys)
-        model_key_set = set(model_keys)
+        converted_state_dict = QwenImageTextEncoderStateDictConverter(raw_state_dict)
+        log("CONVERTED_KEY_COUNT", str(len(converted_state_dict)))
+        log("CONVERTED_KEY_PREVIEW", "\n".join(list(converted_state_dict.keys())[:300]))
 
-        unexpected = sorted(converted_key_set - model_key_set)
-        missing = sorted(model_key_set - converted_key_set)
+        probe_model = QwenImageTextEncoder(model_type=qwen_model_type, model_size=qwen_model_size)
+        probe_keys = list(probe_model.state_dict().keys())
+        log("MODEL_KEY_COUNT", str(len(probe_keys)))
+        log("MODEL_KEY_PREVIEW", "\n".join(probe_keys[:300]))
 
+        unexpected = sorted(set(converted_state_dict.keys()) - set(probe_keys))
+        missing = sorted(set(probe_keys) - set(converted_state_dict.keys()))
         log("UNEXPECTED_KEY_COUNT", str(len(unexpected)))
-        log("UNEXPECTED_KEY_PREVIEW", "\n".join(_safe_list(unexpected, args.preview_limit)))
+        log("UNEXPECTED_KEYS_FULL", "\n".join(unexpected))
         log("MISSING_KEY_COUNT", str(len(missing)))
-        log("MISSING_KEY_PREVIEW", "\n".join(_safe_list(missing, args.preview_limit)))
-
-        shape_mismatch = []
-        for k in sorted(converted_key_set & model_key_set):
-            try:
-                src_shape = tuple(converted_state_dict[k].shape)
-                dst_shape = tuple(model.state_dict()[k].shape)
-                if src_shape != dst_shape:
-                    shape_mismatch.append({
-                        "key": k,
-                        "checkpoint_shape": src_shape,
-                        "model_shape": dst_shape,
-                    })
-            except Exception:
-                pass
-        log("SHAPE_MISMATCH_COUNT", str(len(shape_mismatch)))
-        log("SHAPE_MISMATCH_PREVIEW", shape_mismatch[: args.preview_limit])
+        log("MISSING_KEYS_FULL", "\n".join(missing))
 
         try:
-            model.load_state_dict(converted_state_dict, assign=True)
-            log("LOAD_RESULT", "load_state_dict succeeded")
+            processor = AutoProcessor.from_pretrained(qwen_tokenizer_dir)
+            log("PROCESSOR_LOAD", f"SUCCESS: {type(processor).__name__}")
+            if hasattr(processor, "tokenizer"):
+                log("TOKENIZER_LOAD", f"SUCCESS: {type(processor.tokenizer).__name__}")
+        except Exception:
+            log("PROCESSOR_LOAD_EXCEPTION", traceback.format_exc())
+
+        try:
+            model = load_aux_model(
+                QwenImageTextEncoder,
+                qwen_model_file,
+                config={"model_type": qwen_model_type, "model_size": qwen_model_size},
+                state_dict_converter=QwenImageTextEncoderStateDictConverter,
+            )
+            log("LOAD_RESULT", f"SUCCESS: {type(model).__name__}")
         except Exception as e:
             log("LOAD_EXCEPTION_TYPE", type(e).__name__)
             log("LOAD_EXCEPTION_MESSAGE", str(e))
