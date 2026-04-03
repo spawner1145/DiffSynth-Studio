@@ -11,23 +11,15 @@ def QwenImageTextEncoderStateDictConverter(state_dict):
         and not has_wrapped_qwen35_prefix
     )
 
-    is_gemma4_checkpoint = any(k.startswith("model.language_model.audio_tower.") for k in keys) or any(
-        k.startswith("model.language_model.vision_tower.") for k in keys
-    ) or any(k.startswith("model.language_model.embed_audio.") for k in keys) or any(
-        k.startswith("model.language_model.embed_vision.") for k in keys
+    is_gemma4_conditional_checkpoint = (
+        any(k.startswith("model.language_model.") for k in keys)
+        and any(k.startswith("model.language_model.audio_tower.") for k in keys)
+        and not any(k.startswith("model.model.") for k in keys)
     )
 
     state_dict_ = {}
     for k, v in state_dict.items():
         if k.startswith("mtp."):
-            continue
-
-        if is_gemma4_checkpoint:
-            if k.startswith("model.language_model."):
-                k = k.replace("model.language_model.", "model.model.", 1)
-            elif k.startswith("lm_head."):
-                k = "model." + k
-            state_dict_[k] = v
             continue
 
         if has_wrapped_qwen35_prefix:
@@ -36,7 +28,7 @@ def QwenImageTextEncoderStateDictConverter(state_dict):
             state_dict_[k] = v
             continue
 
-        if is_qwen35_conditional_checkpoint:
+        if is_qwen35_conditional_checkpoint or is_gemma4_conditional_checkpoint:
             if k.startswith("model."):
                 k = "model." + k
             elif k.startswith("lm_head."):
@@ -63,7 +55,7 @@ def QwenImageTextEncoderStateDictConverter(state_dict):
         elif "model.language_model.embed_tokens.weight" in state_dict_:
             state_dict_["model.lm_head.weight"] = state_dict_["model.language_model.embed_tokens.weight"]
 
-    if is_gemma4_checkpoint and "model.lm_head.weight" not in state_dict_:
+    if is_gemma4_conditional_checkpoint and "model.lm_head.weight" not in state_dict_:
         if "model.model.language_model.embed_tokens.weight" in state_dict_:
             state_dict_["model.lm_head.weight"] = state_dict_["model.model.language_model.embed_tokens.weight"]
         elif "model.language_model.embed_tokens.weight" in state_dict_:
