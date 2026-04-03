@@ -38,7 +38,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         qwen_model_type: str = "qwen3_5",  # 修改为 "gemma4" 如果要使用 Gemma4 模型
         vae_file="/root/autodl-tmp/DiffSynth-Studio/diffusion_pytorch_model.safetensors",
         qwen_tokenizer_dir="/root/autodl-tmp/DiffSynth-Studio/Qwen3_5_2b_claude_heretic",  # 修改为 Gemma4 对应的 tokenizer 路径
-        qwen_model_size: str = "2B",
+        qwen_model_size: str = "2B", # gemma4 的话写 "E2B"
         siglip_model_file="",
         #complextro_dit_file="/root/autodl-tmp/DiffSynth-Studio/models/Complextro/v2/model-e43-s19221.safetensors",
         complextro_dit_file="",
@@ -808,7 +808,7 @@ if __name__ == "__main__":
     model = ComplextroTrainingModule(
         device=accelerator.device,
         qwen_model_type="qwen3_5",  # 如果要使用 gemma4 请改为 "gemma4"
-        qwen_model_size="2B",
+        qwen_model_size="2B",  # gemma4 的话写 "E2B"
         siglip_model_file=siglip_model_file,
         train_omni=train_omni,
         vae_file=vae_file,

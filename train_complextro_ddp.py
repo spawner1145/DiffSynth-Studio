@@ -34,6 +34,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         self,
         device,
         qwen_model_file="/mnt/raid0/linux-train/diffusion-model-v1/qwen3.5-2b/model.safetensors",
+        qwen_model_type: str = "qwen3_5",
         vae_file="/mnt/raid0/linux-train/diffusion-model-v1/flux2-vae/diffusion_pytorch_model.safetensors",
         qwen_tokenizer_dir="/mnt/raid0/linux-train/diffusion-model-v1/qwen3.5-2b",
         qwen_model_size: str = "2B",
@@ -175,7 +176,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         self.pipe.text_encoder = load_aux_model(
             QwenImageTextEncoder,
             qwen_model_file,
-            config={"model_type": "qwen3_5", "model_size": qwen_model_size},
+            config={"model_type": qwen_model_type, "model_size": qwen_model_size},
             state_dict_converter=QwenImageTextEncoderStateDictConverter,
         )
         if self.vae_spec["model_file"] is None and self.vae_spec["model_class"] in (
@@ -235,7 +236,7 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         if text_hidden_size != dit_text_dim:
             raise ValueError(
                 f"Text encoder hidden_size ({text_hidden_size}) != Complextro text_embed_dim ({dit_text_dim}). "
-                f"Please align QwenImageTextEncoder(model_type='qwen3_5', model_size='{qwen_model_size}') and ComplextroImageDiT(text_embed_dim=...)."
+                f"Please align QwenImageTextEncoder(model_type='{qwen_model_type}', model_size='{qwen_model_size}') and ComplextroImageDiT(text_embed_dim=...)."
             )
 
         self.pipe.freeze_except(["dit"])
@@ -448,6 +449,8 @@ if __name__ == "__main__":
     parser.add_argument("--siglip_model_file", type=str, default="", help="SigLIP 模型文件路径")
     parser.add_argument("--qwen_model_file", type=str, default="/mnt/raid0/linux-train/diffusion-model-v1/qwen3.5-2b/model.safetensors", help="Qwen 模型文件路径")
     parser.add_argument("--qwen_tokenizer_dir", type=str, default="/mnt/raid0/linux-train/diffusion-model-v1/qwen3.5-2b", help="Qwen Tokenizer 目录")
+    parser.add_argument("--qwen_model_type", type=str, default="qwen3_5", help="QwenImageTextEncoder 的模型类型，例如 qwen3_5 / gemma4")
+    parser.add_argument("--qwen_model_size", type=str, default="2B", help="QwenImageTextEncoder 的模型尺寸，例如 0.8B / 2B")
     parser.add_argument("--base_path", type=str, default="/root/autodl-tmp/DiffSynth-Studio/edit/images", help="数据集根路径")
     parser.add_argument("--metadata_path", type=str, default="/root/autodl-tmp/DiffSynth-Studio/edit/metadata_merged.jsonl", help="UnifiedDataset 的 metadata 路径")
     parser.add_argument("--data_dir", type=str, default="/root/autodl-tmp/DiffSynth-Studio/edit/images", help="ImageTextPairDataset 的目录路径")

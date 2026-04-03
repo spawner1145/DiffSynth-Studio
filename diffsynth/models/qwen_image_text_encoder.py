@@ -362,7 +362,7 @@ class QwenImageTextEncoder(torch.nn.Module):
             from transformers import Gemma4Config, Gemma4ForConditionalGeneration
             model_dict["gemma4"] = Gemma4ForConditionalGeneration
             config_dict["gemma4"] = {
-                "2B": Gemma4Config(**{
+                "E2B": Gemma4Config(**{
                     "architectures": [
                         "Gemma4ForConditionalGeneration"
                     ],
