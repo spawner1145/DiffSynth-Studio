@@ -598,10 +598,8 @@ class ComplextroUnit_PromptEmbedder(PipelineUnit):
             "truncation": True,
             "max_length": 1024,
         }
-        template_kwargs = {"add_generation_prompt": True}
+        template_kwargs = {"add_generation_prompt": True, "enable_thinking": False}
         signature = inspect.signature(template_source.apply_chat_template)
-        if "enable_thinking" in signature.parameters:
-            template_kwargs["enable_thinking"] = False
         if "processor_kwargs" in signature.parameters:
             template_kwargs["processor_kwargs"] = processor_kwargs
         else:
