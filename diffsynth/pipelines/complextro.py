@@ -1,4 +1,5 @@
 import torch
+from transformers.feature_extraction_utils import BatchFeature
 from PIL import Image
 from typing import Union, List, Optional, Any
 from tqdm import tqdm
@@ -557,6 +558,7 @@ class ComplextroUnit_PromptEmbedder(PipelineUnit):
         has_any_image = False
         conversations = []
         segment_owner = []
+        segment_images = []
         for owner_id, (prompt_item, images) in enumerate(zip(prompts, image_groups)):
             local_images = images
             if local_images is not None and len(local_images) > 0:
@@ -577,6 +579,7 @@ class ComplextroUnit_PromptEmbedder(PipelineUnit):
                     "content": self._build_chat_content(user_prompt, local_images),
                 })
                 conversations.append(messages)
+                segment_images.append(local_images)
                 segment_owner.append(owner_id)
 
         if len(prompts) == 0:
@@ -599,9 +602,57 @@ class ComplextroUnit_PromptEmbedder(PipelineUnit):
         signature = inspect.signature(template_source.apply_chat_template)
         if "enable_thinking" in signature.parameters:
             template_kwargs["enable_thinking"] = False
-        template_kwargs["processor_kwargs"] = processor_kwargs
+        if "processor_kwargs" in signature.parameters:
+            template_kwargs["processor_kwargs"] = processor_kwargs
+        else:
+            template_kwargs.update(processor_kwargs)
 
-        model_inputs = template_source.apply_chat_template(conversations, **template_kwargs).to(pipe.device)
+        model_inputs = template_source.apply_chat_template(conversations, **template_kwargs)
+        if isinstance(model_inputs, list):
+            if pipe.processor is None:
+                raise ValueError("apply_chat_template returned a list; an AutoProcessor is required to convert it to tensors.")
+            if has_any_image:
+                processed_inputs = []
+                for text_item, images_item in zip(model_inputs, segment_images):
+                    processed_inputs.append(
+                        pipe.processor(
+                            text=[text_item],
+                            images=images_item,
+                            padding="max_length",
+                            truncation=True,
+                            max_length=1024,
+                            return_tensors="pt",
+                        )
+                    )
+                merged_data = {}
+                feature_keys = set()
+                for item in processed_inputs:
+                    feature_keys.update(item.keys())
+                for key in feature_keys:
+                    values = [item[key] for item in processed_inputs if key in item]
+                    if len(values) == 0:
+                        continue
+                    first_value = values[0]
+                    if torch.is_tensor(first_value):
+                        merged_data[key] = torch.cat(values, dim=0)
+                    elif isinstance(first_value, list):
+                        merged = []
+                        for value in values:
+                            merged.extend(value)
+                        merged_data[key] = merged
+                    else:
+                        merged_data[key] = values
+                model_inputs = BatchFeature(data=merged_data)
+            else:
+                model_inputs = pipe.processor(
+                    text=model_inputs,
+                    images=None,
+                    padding="max_length",
+                    truncation=True,
+                    max_length=1024,
+                    return_tensors="pt",
+                )
+        model_inputs = model_inputs.to(pipe.device)
 
         model_kwargs = {
             "input_ids": model_inputs.input_ids,
