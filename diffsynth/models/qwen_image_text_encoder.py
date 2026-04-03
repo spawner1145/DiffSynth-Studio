@@ -359,10 +359,10 @@ class QwenImageTextEncoder(torch.nn.Module):
             }
 
         if model_type == "gemma4":
-            from transformers import PretrainedConfig, AutoModelForMultimodalLM
+            from transformers import Gemma4Config, AutoModelForMultimodalLM
             model_dict["gemma4"] = AutoModelForMultimodalLM.from_config
             config_dict["gemma4"] = {
-                "2B": PretrainedConfig.from_dict({
+                "2B": Gemma4Config(**{
                     "architectures": [
                         "Gemma4ForConditionalGeneration"
                     ],
