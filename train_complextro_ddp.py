@@ -751,9 +751,10 @@ if __name__ == "__main__":
     model = ComplextroTrainingModule(
         device=accelerator.device,
         qwen_model_file=args.qwen_model_file,
+        qwen_model_type=args.qwen_model_type,
         vae_file=args.vae_file,
         qwen_tokenizer_dir=args.qwen_tokenizer_dir,
-        qwen_model_size="2B",
+        qwen_model_size=args.qwen_model_size,
         siglip_model_file=siglip_model_file,
         train_omni=train_omni,
         vae_type=vae_type,
