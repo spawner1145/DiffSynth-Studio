@@ -1003,6 +1003,17 @@ class ComplextroImageDiT(torch.nn.Module):
         )
 
     def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        if not isinstance(state_dict, dict):
+            state_dict = dict(state_dict)
+
+        has_plain_keys = any(isinstance(key, str) and not key.startswith("dit.") for key in state_dict.keys())
+        has_dit_prefixed_keys = any(isinstance(key, str) and key.startswith("dit.") for key in state_dict.keys())
+        if not has_plain_keys and has_dit_prefixed_keys:
+            state_dict = {
+                (key[4:] if isinstance(key, str) and key.startswith("dit.") else key): value
+                for key, value in state_dict.items()
+            }
+
         if "image_pad_token" not in state_dict:
             state_dict = dict(state_dict)
             state_dict["image_pad_token"] = self.image_pad_token.detach().clone()
@@ -1021,9 +1032,6 @@ class ComplextroImageDiT(torch.nn.Module):
             state_dict["edit_pool_proj.weight"] = self.edit_pool_proj.weight.detach().clone()
             if self.edit_pool_proj.bias is not None:
                 state_dict["edit_pool_proj.bias"] = self.edit_pool_proj.bias.detach().clone()
-
-        if not isinstance(state_dict, dict):
-            state_dict = dict(state_dict)
 
         if self._shared_modulations is not None:
             for group_idx, modulation_layer in enumerate(self._shared_modulations):

@@ -929,6 +929,18 @@ def launch_training_task(
 
     model.to(device=accelerator.device)
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    
+    # 恢复优化器状态
+    resume_from_checkpoint = getattr(args, "resume_from_checkpoint", None)
+    if resume_from_checkpoint is not None:
+        state_dir = resume_from_checkpoint.replace(".safetensors", "_optimizer_state")
+        if os.path.exists(state_dir):
+            if accelerator.is_main_process:
+                print(f"检测到对应的优化器状态目录 {state_dir}，正在加载...")
+            accelerator.load_state(state_dir)
+            if accelerator.is_main_process:
+                print(f"优化器状态加载成功！")
+
     global_step = 0
     log_every_n_steps = max(1, int(log_every_n_steps))
     progress_loss_keys = _get_arg(args, "progress_loss_keys", None)
@@ -976,9 +988,9 @@ def launch_training_task(
                 optimizer.step()
                 if accelerator.sync_gradients:
                     optimizer.zero_grad()
-                    model_logger.on_step_end(accelerator, model, save_steps, loss=loss, epoch_id=epoch_id)
-                    scheduler.step()
                     global_step += 1
+                    model_logger.on_step_end(accelerator, model, save_steps, loss=loss, epoch_id=epoch_id, global_step=global_step)
+                    scheduler.step()
                     epoch_update_steps += 1
 
                     lr = optimizer.param_groups[0].get("lr", None)

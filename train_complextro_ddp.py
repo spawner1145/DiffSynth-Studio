@@ -1,8 +1,13 @@
 import os, ast, argparse, importlib
+import json
 import torch, accelerate
+from PIL import Image
 from accelerate import DistributedDataParallelKwargs
 from typing import List, Optional, Any
 
+# 建议配置以避免内存碎片化导致的 OOM
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from transformers import AutoProcessor
 from diffsynth.core import UnifiedDataset, ImageTextPairDataset, load_model
 from diffsynth.core.vram import AutoWrappedModule
@@ -27,6 +32,106 @@ from diffsynth.pipelines.complextro_vae_utils import (
     get_complextro_vae_spec,
     infer_complextro_vae_latent_channels,
 )
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+class SamplingModelLogger(ModelLogger):
+    def __init__(self, output_path, remove_prefix_in_ckpt=None, state_dict_converter=lambda x:x, checkpoint_name="model", pipe=None, sample_prompts=None, omni_mode=False, save_optimizer_state=False):
+        super().__init__(output_path, remove_prefix_in_ckpt, state_dict_converter, checkpoint_name)
+        self.pipe = pipe
+        self.sample_prompts = sample_prompts or ["1girl, masterpiece, best quality"]
+        self.omni_mode = omni_mode
+        self.sample_dir = os.path.join(self.output_path, "samples")
+        self.save_optimizer_state = save_optimizer_state
+
+    def save_model(self, accelerator: accelerate.Accelerator, model: torch.nn.Module, file_name):
+        super().save_model(accelerator, model, file_name)
+        
+        # 保存优化器状态
+        if self.save_optimizer_state:
+            state_dir = os.path.join(self.output_path, file_name.replace(".safetensors", "_optimizer_state"))
+            if accelerator.is_main_process:
+                print(f"正在保存优化器状态至 {state_dir} ...")
+            accelerator.save_state(output_dir=state_dir)
+            if accelerator.is_main_process:
+                print(f"优化器状态保存完成！")
+        
+        # 仅在主进程中执行采样
+        if accelerator.is_main_process and self.pipe is not None:
+            os.makedirs(self.sample_dir, exist_ok=True)
+            print(f"开始生成预览样本...")
+            
+            unwrapped_model = accelerator.unwrap_model(model)
+            was_training = unwrapped_model.pipe.dit.training
+            unwrapped_model.pipe.dit.eval()
+            
+            # 使用临时保存的 pipeline 中的 dit 来做推理
+            original_dit = self.pipe.dit
+            self.pipe.dit = unwrapped_model.pipe.dit
+            
+            with torch.no_grad():
+                for seed, prompt in enumerate(self.sample_prompts):
+                    try:
+                        print(f"[{seed+1}/{len(self.sample_prompts)}] 正在生成: {prompt}")
+                        image = self.pipe(
+                            prompt=prompt,
+                            negative_prompt="",
+                            num_inference_steps=30,
+                            cfg_scale=7.0,
+                            seed=seed,
+                            height=512,
+                            width=512,
+                            omni_mode=self.omni_mode,
+                        )
+                        sample_name = f"{file_name.replace('.safetensors', '')}_sample_{seed}.png"
+                        image.save(os.path.join(self.sample_dir, sample_name))
+                    except Exception as e:
+                        print(f"采样失败: {e}")
+                        import traceback
+                        traceback.print_exc()
+                    
+                    # 每次生成完后清空无用的变量缓存
+                    if 'image' in locals():
+                        del image
+                    torch.cuda.empty_cache()
+            
+            # 还原
+            self.pipe.dit = original_dit
+            if was_training:
+                unwrapped_model.pipe.dit.train()
+            print(f"预览样本已保存至 {self.sample_dir}")
+
+        accelerator.wait_for_everyone()
+
+def build_complextro_pipe_from_training_module(training_module: DiffusionTrainingModule, args, device):
+    """
+    创建一个专门用于推理的 pipeline，引用当前训练模型内部的模块
+    """
+    from diffsynth.pipelines.complextro import ComplextroPipeline
+    from transformers import AutoProcessor
+    
+    pipe = ComplextroPipeline(device=device, torch_dtype=torch.bfloat16)
+    pipe.text_encoder = training_module.pipe.text_encoder
+    pipe.vae = training_module.pipe.vae
+    pipe.dit = training_module.pipe.dit
+    
+    if hasattr(training_module.pipe, "image_encoder") and training_module.pipe.image_encoder is not None:
+        pipe.image_encoder = training_module.pipe.image_encoder
+        
+    pipe.processor = AutoProcessor.from_pretrained(args.qwen_tokenizer_dir)
+    pipe.tokenizer = pipe.processor.tokenizer
+    
+    pipe.prediction_type = str(args.prediction_type)
+    pipe.jit_p_mean = -0.8
+    pipe.jit_p_std = 0.8
+    pipe.jit_noise_scale = 1.0
+    pipe.jit_t_eps = 5e-2
+    pipe.jit_sampling_method = "heun"
+    pipe.jit_cfg_interval_min = 0.0
+    pipe.jit_cfg_interval_max = 1.0
+    
+    pipe.vram_management_enabled = False
+    return pipe
 
 
 class ComplextroTrainingModule(DiffusionTrainingModule):
@@ -74,10 +179,14 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         enable_vram_offload: bool = False,
         vram_config: Optional[dict] = None,
         vram_limit: Optional[float] = None,
+        use_gradient_checkpointing: bool = True,
+        use_gradient_checkpointing_offload: bool = False,
     ):
         super().__init__()
         self.train_omni = train_omni
         self.condition_drop_prob = float(condition_drop_prob)
+        self.use_gradient_checkpointing = use_gradient_checkpointing
+        self.use_gradient_checkpointing_offload = use_gradient_checkpointing_offload
         self.complextro_model_config = {} if complextro_model_config is None else dict(complextro_model_config)
         self.enable_vram_offload = enable_vram_offload
         self.vae_spec = get_complextro_vae_spec(
@@ -410,8 +519,8 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
             "edit_latent": edit_latent_inputs,
             "omni_mode": self.train_omni and has_any_omni_condition,
             "image_noise_mask": omni_noise_mask,
-            "use_gradient_checkpointing": True,
-            "use_gradient_checkpointing_offload": True,
+            "use_gradient_checkpointing": getattr(self, "use_gradient_checkpointing", True),
+            "use_gradient_checkpointing_offload": getattr(self, "use_gradient_checkpointing_offload", False),
         }
 
         for unit in self.pipe.units:
@@ -497,6 +606,19 @@ if __name__ == "__main__":
     parser.add_argument("--max_bucket_reso", type=int, default=1024, help="分桶最大分辨率")
     parser.add_argument("--prebucket_index_path", type=str, default=None, help="预分桶索引 jsonl 路径")
     parser.add_argument("--jsonl_index_path", type=str, default=None, help="jsonl metadata 行偏移索引路径")
+    
+    # Sampling config
+    parser.add_argument("--sample_prompts", type=str, nargs="+", default=[
+        "green, lizard, plant, Grass, Poison, seed on back, red eyes, smiling expression, short stout limbs, sharp claws",
+        "orange, cream, lizard, Fire, flame on tail tip, large eyes, smiling expression, cream-colored belly patch, sharp claws",
+        "蓝色，米色，棕色，乌龟，水系，龟壳，大眼睛，短四肢，卷曲尾巴",
+        "1girl, solo, upper body, masterpiece, best quality, beautiful detailed eyes",
+    ], help="List of prompts to generate preview samples during training")
+    
+    # Training state config
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None, help="路径到要恢复训练的 safetensors 检查点模型")
+    parser.add_argument("--resume_from_latest", action="store_true", help="是否自动从 output_dir 中最新的模型恢复训练")
+    parser.add_argument("--save_optimizer_state", action="store_true", default=True, help="是否在保存模型时同时保存优化器状态以供未来恢复")
     
     # Model config parameters
     parser.add_argument("--num_layers", type=int, default=10, help="DiT 层数")
@@ -625,9 +747,8 @@ if __name__ == "__main__":
 
         return operator
 
-    # 0.9B
     complextro_model_config = {
-        "num_layers": 10,
+        "num_layers": 20,
         "num_refiner_layers": 0,
         "hidden_size": 2304,
         "num_attention_heads": 24,
@@ -653,28 +774,65 @@ if __name__ == "__main__":
 
     if use_image_text_pairs:
         if args.recursive:
-            import glob, json
-            print(f"递归扫描数据目录: {args.data_dir}")
-            # 查找所有图片及其对应的文本文件
-            image_exts = ["jpg", "jpeg", "png", "webp", "JPG", "JPEG", "PNG", "WEBP"]
-            pairs = []
-            for ext in image_exts:
-                images = glob.glob(os.path.join(args.data_dir, "**", f"*.{ext}"), recursive=True)
-                for img_path in images:
-                    txt_path = os.path.splitext(img_path)[0] + ".txt"
-                    if os.path.exists(txt_path):
-                        with open(txt_path, "r", encoding="utf-8") as f:
-                            prompt = f.read().strip()
-                        pairs.append({"image": img_path, "prompt": prompt})
-            print(f"找到 {len(pairs)} 对数据")
-            # 将递归扫描到的结果通过 UnifiedDataset 加载
-            # 这里我们通过构建一个内存列表来模拟 metadata 文件
-            # UnifiedDataset 默认需要 metadata_path 为文件，所以我们写一个临时文件
-            temp_metadata_path = os.path.join(args.output_dir, "temp_metadata.jsonl")
-            os.makedirs(args.output_dir, exist_ok=True)
-            with open(temp_metadata_path, "w", encoding="utf-8") as f:
-                for p in pairs:
-                    f.write(json.dumps(p, ensure_ascii=False) + "\n")
+            # 持久化元数据路径，避免每次 760w 次扫描
+            temp_metadata_path = os.path.join(args.output_dir, "dataset_metadata.jsonl")
+            
+            if accelerator.is_main_process:
+                import json
+                from concurrent.futures import ProcessPoolExecutor
+                from tqdm import tqdm
+                
+                # 如果文件已存在且不为空，则直接跳过扫描
+                if os.path.exists(temp_metadata_path) and os.path.getsize(temp_metadata_path) > 0:
+                    print(f"检测到已存在的元数据文件: {temp_metadata_path}，将跳过递归扫描直接加载。")
+                else:
+                    print(f"开始大规模递归扫描: {args.data_dir}")
+                    image_exts = {".jpg", ".jpeg", ".png", ".webp", ".JPG", ".JPEG", ".PNG", ".WEBP"}
+                    
+                    # 1. 快速收集路径 (使用 scandir 比 walk 更快)
+                    all_image_paths = []
+                    def fast_scan(path):
+                        try:
+                            with os.scandir(path) as it:
+                                for entry in it:
+                                    if entry.is_dir():
+                                        fast_scan(entry.path)
+                                    elif entry.is_file() and os.path.splitext(entry.name)[1] in image_exts:
+                                        all_image_paths.append(entry.path)
+                        except PermissionError: pass
+
+                    fast_scan(args.data_dir)
+                    all_image_paths.sort()
+                    print(f"收集到 {len(all_image_paths)} 个图像路径，开始读取标签...")
+
+                    # 2. 并行读取 (使用 ProcessPoolExecutor 配合 chunksize 减少 IPC 开销)
+                    def load_pair_batch(paths):
+                        batch_results = []
+                        for img_path in paths:
+                            txt_path = os.path.splitext(img_path)[0] + ".txt"
+                            if os.path.exists(txt_path):
+                                try:
+                                    with open(txt_path, "r", encoding="utf-8") as f:
+                                        prompt = f.read().strip()
+                                    batch_results.append(json.dumps({"image": img_path, "prompt": prompt}, ensure_ascii=False))
+                                except: pass
+                        return batch_results
+
+                    # 分块处理以优化性能
+                    chunk_size = 5000
+                    chunks = [all_image_paths[i:i + chunk_size] for i in range(0, len(all_image_paths), chunk_size)]
+                    
+                    os.makedirs(args.output_dir, exist_ok=True)
+                    with open(temp_metadata_path, "w", encoding="utf-8") as f:
+                        with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
+                            for batch in tqdm(executor.map(load_pair_batch, chunks), total=len(chunks), desc="写入元数据"):
+                                if batch:
+                                    f.write("\n".join(batch) + "\n")
+                    
+                    print(f"元数据已持久化至: {temp_metadata_path}")
+            
+            # 等待主进程完成扫描
+            accelerator.wait_for_everyone()
             
             dataset = UnifiedDataset(
                 base_path=args.data_dir,
@@ -789,10 +947,46 @@ if __name__ == "__main__":
         enable_vram_offload=enable_vram_offload,
         vram_config=vram_config,
     )
-    model_logger = ModelLogger(
-        args.output_dir,
+    # 初始化采样 pipeline
+    sample_pipe = build_complextro_pipe_from_training_module(model, args, accelerator.device)
+    sample_prompts = args.sample_prompts
+    
+    model_logger = SamplingModelLogger(
+        output_path=args.output_dir,
         remove_prefix_in_ckpt="pipe.dit.",
+        pipe=sample_pipe,
+        sample_prompts=sample_prompts,
+        omni_mode=args.train_omni,
+        save_optimizer_state=args.save_optimizer_state,
     )
+
+    # 释放构建采样管道时的显存占用
+    if sample_pipe is not None:
+        torch.cuda.empty_cache()
+
+    # 检查是否需要自动从最新检查点恢复训练
+    if args.resume_from_latest:
+        import glob
+        safetensors_files = glob.glob(os.path.join(args.output_dir, "*.safetensors"))
+        if len(safetensors_files) > 0:
+            safetensors_files.sort(key=os.path.getmtime)
+            latest_checkpoint = safetensors_files[-1]
+            args.resume_from_checkpoint = latest_checkpoint
+            print(f"找到最新检查点：{latest_checkpoint}")
+        else:
+            print("未找到任何 .safetensors 检查点，将从头开始训练。")
+
+    # 检查是否需要恢复训练
+    if getattr(args, "resume_from_checkpoint", None) is not None:
+        print(f"正在从检查点恢复模型权重: {args.resume_from_checkpoint}")
+        if args.resume_from_checkpoint.endswith(".safetensors"):
+            from safetensors.torch import load_file
+            state_dict = load_file(args.resume_from_checkpoint, device="cpu")
+        else:
+            state_dict = torch.load(args.resume_from_checkpoint, map_location="cpu", weights_only=True)
+        # diffsynth 保存的模型通常有前缀 "pipe.dit."，这里在 model 中要去掉，因为这是内部模型前缀
+        clean_state_dict = {k.replace("pipe.dit.", ""): v for k, v in state_dict.items()}
+        model.pipe.dit.load_state_dict(clean_state_dict, strict=False)
 
     launch_training_task(
         accelerator,

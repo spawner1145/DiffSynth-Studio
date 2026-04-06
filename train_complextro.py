@@ -1,7 +1,6 @@
-import argparse
-import os
-import importlib
+import os, importlib
 import torch, accelerate
+from accelerate import DistributedDataParallelKwargs
 from typing import List, Optional, Any
 
 from transformers import AutoProcessor
@@ -28,6 +27,95 @@ from diffsynth.pipelines.complextro_vae_utils import (
     get_complextro_vae_spec,
     infer_complextro_vae_latent_channels,
 )
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+class SamplingModelLogger(ModelLogger):
+    def __init__(self, output_path, remove_prefix_in_ckpt=None, state_dict_converter=lambda x:x, checkpoint_name="model", pipe=None, sample_prompts=None, omni_mode=False, save_optimizer_state=False):
+        super().__init__(output_path, remove_prefix_in_ckpt, state_dict_converter, checkpoint_name)
+        self.pipe = pipe
+        self.sample_prompts = sample_prompts or ["1girl, masterpiece, best quality"]
+        self.omni_mode = omni_mode
+        self.sample_dir = os.path.join(self.output_path, "samples")
+        self.save_optimizer_state = save_optimizer_state
+
+    def save_model(self, accelerator: accelerate.Accelerator, model: torch.nn.Module, file_name):
+        super().save_model(accelerator, model, file_name)
+        
+        # 保存优化器状态
+        if getattr(self, "save_optimizer_state", False):
+            state_dir = os.path.join(self.output_path, file_name.replace(".safetensors", "_optimizer_state"))
+            if accelerator.is_main_process:
+                print(f"正在保存优化器状态至 {state_dir} ...")
+            accelerator.save_state(output_dir=state_dir)
+            if accelerator.is_main_process:
+                print(f"优化器状态保存完成！")
+
+        if accelerator.is_main_process and self.pipe is not None:
+            os.makedirs(self.sample_dir, exist_ok=True)
+            print(f"开始生成预览样本...")
+            
+            unwrapped_model = accelerator.unwrap_model(model)
+            was_training = unwrapped_model.pipe.dit.training
+            unwrapped_model.pipe.dit.eval()
+            
+            with torch.no_grad():
+                for seed, prompt in enumerate(self.sample_prompts):
+                    try:
+                        image = self.pipe(
+                            prompt=prompt,
+                            negative_prompt="",
+                            num_inference_steps=30,
+                            cfg_scale=7.0,
+                            seed=seed,
+                            height=512,
+                            width=512,
+                            omni_mode=self.omni_mode,
+                        )
+                        sample_name = f"{file_name.replace('.safetensors', '')}_sample_{seed}.png"
+                        image.save(os.path.join(self.sample_dir, sample_name))
+                    except Exception as e:
+                        print(f"采样失败: {e}")
+                        import traceback
+                        traceback.print_exc()
+                    
+                    # 每次生成完后清空无用的变量缓存
+                    if 'image' in locals():
+                        del image
+                    torch.cuda.empty_cache()
+            
+            if was_training:
+                unwrapped_model.pipe.dit.train()
+            print(f"预览样本已保存至 {self.sample_dir}")
+
+        accelerator.wait_for_everyone()
+
+def build_complextro_pipe_from_training_module(training_module: DiffusionTrainingModule, args, device):
+    from diffsynth.pipelines.complextro import ComplextroPipeline
+    from transformers import AutoProcessor
+    
+    pipe = ComplextroPipeline(device=device, torch_dtype=torch.bfloat16)
+    pipe.text_encoder = training_module.pipe.text_encoder
+    pipe.vae = training_module.pipe.vae
+    pipe.dit = training_module.pipe.dit
+    
+    if hasattr(training_module.pipe, "image_encoder") and training_module.pipe.image_encoder is not None:
+        pipe.image_encoder = training_module.pipe.image_encoder
+        
+    pipe.processor = AutoProcessor.from_pretrained(args.qwen_tokenizer_dir)
+    pipe.tokenizer = pipe.processor.tokenizer
+    
+    pipe.prediction_type = str(args.prediction_type)
+    pipe.jit_p_mean = -0.8
+    pipe.jit_p_std = 0.8
+    pipe.jit_noise_scale = 1.0
+    pipe.jit_t_eps = 5e-2
+    pipe.jit_sampling_method = "heun"
+    pipe.jit_cfg_interval_min = 0.0
+    pipe.jit_cfg_interval_max = 1.0
+    
+    pipe.vram_management_enabled = False
+    return pipe
 
 
 class ComplextroTrainingModule(DiffusionTrainingModule):
@@ -622,6 +710,20 @@ if __name__ == "__main__":
     """
 
     accelerator = accelerate.Accelerator(gradient_accumulation_steps=1)
+    
+    # ---------------- 注入采样逻辑 ----------------
+    # 从 argparse 等中读取你需要的配置。在这里 train_complextro.py 是硬编码，我们就直接写在这里：
+    sample_prompts = [
+        "green, lizard, plant, Grass, Poison, seed on back, red eyes, smiling expression, short stout limbs, sharp claws",
+        "orange, cream, lizard, Fire, flame on tail tip, large eyes, smiling expression, cream-colored belly patch, sharp claws",
+        "蓝色，米色，棕色，乌龟，水系，龟壳，大眼睛，短四肢，卷曲尾巴",
+        "1girl, solo, upper body, masterpiece, best quality, beautiful detailed eyes",
+    ]
+    
+    # 注意这里等 model 初始化后再注入 pipe 到 logger 中
+    model_logger = None 
+    # ----------------------------------------------
+    
     use_image_text_pairs = False  # True: 使用 ImageTextPairDataset（图片+txt目录），False: 使用 UnifiedDataset（metadata文件）
     train_omni = True
     vae_type = "flux2"
@@ -839,10 +941,26 @@ if __name__ == "__main__":
         enable_vram_offload=enable_vram_offload,
         vram_config=vram_config,
     )
-    model_logger = ModelLogger(
+    
+    # ---------------- 注入采样逻辑 ----------------
+    class DummyArgs:
+        def __init__(self):
+            self.qwen_tokenizer_dir = "/root/autodl-tmp/DiffSynth-Studio/Qwen3_5_2b_claude_heretic"
+            self.prediction_type = prediction_type
+            self.train_omni = train_omni
+            
+    dummy_args = DummyArgs()
+    sample_pipe = build_complextro_pipe_from_training_module(model, dummy_args, accelerator.device)
+    
+    model_logger = SamplingModelLogger(
         "models/Complextro/edit", # dit输出文件夹
         remove_prefix_in_ckpt="pipe.dit.",
+        pipe=sample_pipe,
+        sample_prompts=sample_prompts,
+        omni_mode=train_omni,
+        save_optimizer_state=getattr(args, "save_optimizer_state", False),
     )
+    # ----------------------------------------------
 
     args = argparse.Namespace(
         lr_scheduler="constant",
@@ -851,6 +969,18 @@ if __name__ == "__main__":
         #lr_decay_steps=0.1,
         #lr_scheduler_min_lr_ratio=0.1,
     )
+
+    # 检查是否需要恢复训练
+    if getattr(args, "resume_from_checkpoint", None) is not None:
+        print(f"正在从检查点恢复模型权重: {args.resume_from_checkpoint}")
+        if args.resume_from_checkpoint.endswith(".safetensors"):
+            from safetensors.torch import load_file
+            state_dict = load_file(args.resume_from_checkpoint, device="cpu")
+        else:
+            state_dict = torch.load(args.resume_from_checkpoint, map_location="cpu", weights_only=True)
+        # diffsynth 保存的模型通常有前缀 "pipe.dit."，这里在 model 中要去掉，因为这是内部模型前缀
+        clean_state_dict = {k.replace("pipe.dit.", ""): v for k, v in state_dict.items()}
+        model.pipe.dit.load_state_dict(clean_state_dict, strict=False)
 
     launch_training_task(
         accelerator,
