@@ -594,7 +594,7 @@ class ComplextroUnit_PromptEmbedder(PipelineUnit):
             "tokenize": True,
             "return_dict": True,
             "return_tensors": "pt",
-            "padding": "max_length",
+            "padding": "longest",
             "truncation": True,
             "max_length": 1024,
             "enable_thinking": False
@@ -617,7 +617,7 @@ class ComplextroUnit_PromptEmbedder(PipelineUnit):
                         pipe.processor(
                             text=[text_item],
                             images=images_item,
-                            padding="max_length",
+                            padding="longest",
                             truncation=True,
                             max_length=1024,
                             return_tensors="pt",
@@ -646,11 +646,19 @@ class ComplextroUnit_PromptEmbedder(PipelineUnit):
                 model_inputs = pipe.processor(
                     text=model_inputs,
                     images=None,
-                    padding="max_length",
+                    padding="longest",
                     truncation=True,
                     max_length=1024,
                     return_tensors="pt",
                 )
+        # Pad to multiple of 8
+        seq_len = model_inputs.input_ids.shape[-1]
+        pad_to = seq_len + ((-seq_len) % 8)
+        if pad_to > seq_len:
+            pad_size = pad_to - seq_len
+            model_inputs["input_ids"] = torch.nn.functional.pad(model_inputs.input_ids, (0, pad_size), value=0)
+            model_inputs["attention_mask"] = torch.nn.functional.pad(model_inputs.attention_mask, (0, pad_size), value=0)
+        
         model_inputs = model_inputs.to(pipe.device)
 
         model_kwargs = {

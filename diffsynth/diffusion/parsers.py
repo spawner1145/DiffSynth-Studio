@@ -54,6 +54,16 @@ def add_lora_config(parser: argparse.ArgumentParser):
     parser.add_argument("--preset_lora_model", type=str, default=None, help="Which model the preset LoRA is fused to.")
     return parser
 
+def add_fp8_te_config(parser: argparse.ArgumentParser):
+    parser.add_argument("--fp8_te_enabled", default=False, action="store_true", help="Enable Transformer Engine FP8 training (replaces nn.Linear with TE Linear and wraps forward pass in FP8 autocast).")
+    parser.add_argument("--fp8_te_model", type=str, default="dit", help="Which model to apply TE FP8 Linear replacement to (e.g. dit).")
+    parser.add_argument("--fp8_te_format", type=str, default="HYBRID", help="FP8 format: HYBRID, E4M3, or E5M2.")
+    parser.add_argument("--fp8_te_amax_history_len", type=int, default=16, help="Length of amax history for delayed scaling.")
+    parser.add_argument("--fp8_te_amax_compute_algo", type=str, default="max", help="Algorithm for computing amax: max or most_recent.")
+    parser.add_argument("--fp8_te_exclude_modules", type=str, default=None, help="Comma-separated list of module name prefixes to exclude from TE Linear replacement.")
+    parser.add_argument("--fp8_te_gradient_checkpointing", default=False, action="store_true", help="Use TE-aware gradient checkpointing (te.checkpoint) instead of torch checkpoint.")
+    return parser
+
 def add_gradient_config(parser: argparse.ArgumentParser):
     parser.add_argument("--use_gradient_checkpointing", default=False, action="store_true", help="Whether to use gradient checkpointing.")
     parser.add_argument("--use_gradient_checkpointing_offload", default=False, action="store_true", help="Whether to offload gradient checkpointing to CPU memory.")
@@ -67,4 +77,5 @@ def add_general_config(parser: argparse.ArgumentParser):
     parser = add_output_config(parser)
     parser = add_lora_config(parser)
     parser = add_gradient_config(parser)
+    parser = add_fp8_te_config(parser)
     return parser

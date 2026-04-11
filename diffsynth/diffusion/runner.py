@@ -1,3 +1,4 @@
+import contextlib
 import os, math, ast, importlib, time, torch
 import argparse
 from typing import Any, Callable, Optional, Tuple
@@ -941,6 +942,23 @@ def launch_training_task(
             if accelerator.is_main_process:
                 print(f"优化器状态加载成功！")
 
+    # FP8 TE autocast context
+    fp8_te_enabled = _get_arg(args, "fp8_te_enabled", False)
+    if fp8_te_enabled:
+        from ..core.fp8 import create_fp8_autocast_context
+        fp8_autocast_ctx = create_fp8_autocast_context(
+            enabled=True,
+            fp8_format=_get_arg(args, "fp8_te_format", "HYBRID"),
+            amax_history_len=_get_arg(args, "fp8_te_amax_history_len", 16),
+            amax_compute_algo=_get_arg(args, "fp8_te_amax_compute_algo", "max"),
+        )
+        if accelerator.is_main_process:
+            print(f"FP8 TE autocast enabled: format={_get_arg(args, 'fp8_te_format', 'HYBRID')}, "
+                  f"amax_history_len={_get_arg(args, 'fp8_te_amax_history_len', 16)}, "
+                  f"amax_compute_algo={_get_arg(args, 'fp8_te_amax_compute_algo', 'max')}")
+    else:
+        fp8_autocast_ctx = contextlib.nullcontext
+
     global_step = 0
     log_every_n_steps = max(1, int(log_every_n_steps))
     progress_loss_keys = _get_arg(args, "progress_loss_keys", None)
@@ -968,7 +986,8 @@ def launch_training_task(
         for data in progress_bar:
             current_step.value = int(global_step)
             with accelerator.accumulate(model):
-                loss = _compute_loss(model, dataset, data)
+                with fp8_autocast_ctx():
+                    loss = _compute_loss(model, dataset, data)
                 accelerator.backward(loss)
                 grad_norm = None
                 layer_grad_norms = None

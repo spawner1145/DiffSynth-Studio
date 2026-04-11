@@ -1,5 +1,6 @@
 import torch, json, os, inspect
 from ..core import ModelConfig, load_state_dict
+from ..core.fp8 import replace_linears_with_te, wrap_modules_for_te_checkpointing
 from ..utils.controlnet import ControlNetInput
 from .base_pipeline import PipelineUnit
 from peft import LoraConfig, inject_adapter_in_model
@@ -211,6 +212,33 @@ class DiffusionTrainingModule(torch.nn.Module):
         return lora_target_modules
 
 
+    def apply_fp8_te(
+        self,
+        pipe,
+        fp8_te_model="dit",
+        fp8_te_exclude_modules=None,
+        fp8_te_gradient_checkpointing=False,
+        use_reentrant=True,
+    ):
+        """Apply Transformer Engine FP8 Linear replacement to a model in the pipeline.
+
+        Must be called BEFORE add_lora_to_model (LoRA patches nn.Linear which
+        conflicts with TE Linear replacement).
+        """
+        model = getattr(pipe, fp8_te_model, None)
+        if model is None:
+            print(f"Warning: model '{fp8_te_model}' not found in pipeline, skipping TE FP8.")
+            return
+        exclude_modules = (
+            fp8_te_exclude_modules.split(",") if isinstance(fp8_te_exclude_modules, str)
+            else fp8_te_exclude_modules
+        )
+        replaced = replace_linears_with_te(model, exclude_modules=exclude_modules)
+        print(f"TE FP8: replaced {len(replaced)} nn.Linear modules with TE Linear in '{fp8_te_model}'.")
+        if fp8_te_gradient_checkpointing:
+            wrapped = wrap_modules_for_te_checkpointing(model, use_reentrant=use_reentrant)
+            print(f"TE FP8: wrapped {len(wrapped)} modules for TE gradient checkpointing in '{fp8_te_model}'.")
+
     def switch_pipe_to_training_mode(
         self,
         pipe,
@@ -218,21 +246,30 @@ class DiffusionTrainingModule(torch.nn.Module):
         lora_base_model=None, lora_target_modules="", lora_rank=32, lora_checkpoint=None,
         preset_lora_path=None, preset_lora_model=None,
         task="sft",
+        fp8_te_enabled=False,
+        fp8_te_model="dit",
+        fp8_te_exclude_modules=None,
+        fp8_te_gradient_checkpointing=False,
     ):
         # Scheduler
         pipe.scheduler.set_timesteps(1000, training=True)
-        
+
         # Freeze untrainable models
         pipe.freeze_except([] if trainable_models is None else trainable_models.split(","))
-        
+
         # Preset LoRA
         if preset_lora_path is not None:
             pipe.load_lora(getattr(pipe, preset_lora_model), preset_lora_path)
-        
-        # FP8
-        # FP8 relies on a model-specific memory management scheme.
-        # It is delegated to the subclass.
-        
+
+        # FP8 TE Linear replacement (must be before LoRA injection)
+        if fp8_te_enabled:
+            self.apply_fp8_te(
+                pipe,
+                fp8_te_model=fp8_te_model,
+                fp8_te_exclude_modules=fp8_te_exclude_modules,
+                fp8_te_gradient_checkpointing=fp8_te_gradient_checkpointing,
+            )
+
         # Add LoRA to the base models
         if lora_base_model is not None and not task.endswith(":data_process"):
             if (not hasattr(pipe, lora_base_model)) or getattr(pipe, lora_base_model) is None:

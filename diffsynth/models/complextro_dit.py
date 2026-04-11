@@ -7,7 +7,7 @@ from torch.nn.utils.rnn import pad_sequence
 from .general_modules import TimestepEmbeddings, RMSNorm, AdaLayerNorm
 from ..core.gradient import gradient_checkpoint_forward
 
-SEQ_MULTI_OF = 32
+SEQ_MULTI_OF = 8
 TOKEN_TYPE_TEXT = 0
 TOKEN_TYPE_TARGET_IMAGE = 1
 TOKEN_TYPE_SIGLIP = 2
@@ -491,6 +491,7 @@ class ComplextroParallelAttentionMLP(nn.Module):
         self.norm_q = RMSNorm(head_dim, eps=1e-6)
         self.norm_k = RMSNorm(head_dim, eps=1e-6)
         self.mlp_act = ComplextroSwiGLU()
+        self.attn_gate = nn.Linear(self.inner_dim, self.inner_dim, bias=False)
         self.to_attn_out = nn.Linear(self.inner_dim, dim, bias=bias)
         self.to_mlp_out = nn.Linear(self.mlp_hidden_dim, dim, bias=bias)
 
@@ -519,6 +520,7 @@ class ComplextroParallelAttentionMLP(nn.Module):
             num_heads=q.shape[1],
             attention_mask=attention_mask,
         ).to(q.dtype)
+        attn_out = attn_out * torch.sigmoid(self.attn_gate(attn_out))
         attn_out = self.to_attn_out(attn_out)
 
         mlp_out = self.mlp_act(mlp_fused)
@@ -753,8 +755,10 @@ class ComplextroImageDiT(torch.nn.Module):
         tread_routes: Optional[List[dict]] = None,
         use_text_modulation: bool = False,
         shared_modulation_group_size: Optional[Union[int, Literal["all"]]] = "all",
+        mlp_ratio: float = 4.0,
     ):
         super().__init__()
+        self.mlp_ratio = mlp_ratio
 
         if hidden_size != num_attention_heads * attention_head_dim:
             raise ValueError(
@@ -823,7 +827,6 @@ class ComplextroImageDiT(torch.nn.Module):
         self.img_in = nn.Linear(self.img_token_dim, self.hidden_size)
         self.txt_in = nn.Linear(text_embed_dim, self.hidden_size)
         self.text_pool_proj = nn.Linear(text_embed_dim, self.hidden_size) if self.use_text_modulation else None
-        self.edit_pool_proj = nn.Linear(self.hidden_size, self.hidden_size) if self.use_text_modulation else None
         self.image_pad_token = nn.Parameter(torch.empty((1, self.img_token_dim)))
         self.token_type_embed = nn.Embedding(4, self.hidden_size) if self.use_token_type_embedding else None
 
@@ -906,6 +909,7 @@ class ComplextroImageDiT(torch.nn.Module):
                 dim=self.hidden_size,
                 num_attention_heads=self.num_attention_heads,
                 attention_head_dim=self.attention_head_dim,
+                mlp_ratio=self.mlp_ratio,
                 modulation=True,
                 use_internal_modulation=shared_mods is None,
             ))
@@ -962,37 +966,6 @@ class ComplextroImageDiT(torch.nn.Module):
             pooled = prompt_emb.mean(dim=1)
         return self.text_pool_proj(pooled)
 
-    def _compute_edit_pool_conditioning(
-        self,
-        image_tokens: torch.Tensor,
-        cond_token_mask: torch.Tensor,
-    ) -> Optional[torch.Tensor]:
-        if self.edit_pool_proj is None:
-            return None
-        cond_token_mask = cond_token_mask.to(device=image_tokens.device, dtype=image_tokens.dtype)
-        if float(cond_token_mask.sum().item()) <= 0.0:
-            return None
-        pooled = (image_tokens * cond_token_mask.unsqueeze(-1)).sum(dim=0, keepdim=True)
-        pooled = pooled / cond_token_mask.sum().clamp(min=1.0)
-        return self.edit_pool_proj(pooled)
-
-    @staticmethod
-    def _build_condition_token_mask(
-        length_list: List[int],
-        valid_token_mask: List[int],
-    ) -> torch.Tensor:
-        cond_token_mask = []
-        offset = 0
-        for image_idx, image_len in enumerate(length_list):
-            is_cond_image = image_idx != len(length_list) - 1
-            local_valid = valid_token_mask[offset : offset + image_len]
-            if is_cond_image:
-                cond_token_mask.extend(local_valid)
-            else:
-                cond_token_mask.extend([0] * image_len)
-            offset += image_len
-        return torch.tensor(cond_token_mask, dtype=torch.float32)
-
     def _resolve_token_type_embed_ids(self, token_type_ids: torch.Tensor) -> torch.Tensor:
         token_type_ids = token_type_ids.clamp(TOKEN_TYPE_TEXT, TOKEN_TYPE_COND_IMAGE)
         # Keep text and SigLIP distinct, but let cond/target images share the same role embedding.
@@ -1026,13 +999,7 @@ class ComplextroImageDiT(torch.nn.Module):
             state_dict["text_pool_proj.weight"] = self.text_pool_proj.weight.detach().clone()
             if self.text_pool_proj.bias is not None:
                 state_dict["text_pool_proj.bias"] = self.text_pool_proj.bias.detach().clone()
-        if self.edit_pool_proj is not None and "edit_pool_proj.weight" not in state_dict:
-            if not isinstance(state_dict, dict):
-                state_dict = dict(state_dict)
-            state_dict["edit_pool_proj.weight"] = self.edit_pool_proj.weight.detach().clone()
-            if self.edit_pool_proj.bias is not None:
-                state_dict["edit_pool_proj.bias"] = self.edit_pool_proj.bias.detach().clone()
-
+                
         if self._shared_modulations is not None:
             for group_idx, modulation_layer in enumerate(self._shared_modulations):
                 shared_prefix = f"_shared_modulations.{group_idx}"
@@ -2193,18 +2160,8 @@ class ComplextroImageDiT(torch.nn.Module):
 
                 image_tokens = torch.cat(image_tokens_list, dim=0)
                 image_tokens = self.img_in(image_tokens)
-                cond_token_mask = self._build_condition_token_mask(length_list, image_token_valid_mask).to(
-                    device=image_tokens.device,
-                    dtype=image_tokens.dtype,
-                )
-                edit_pool_cond = self._compute_edit_pool_conditioning(image_tokens, cond_token_mask)
                 local_conditioning_noisy = conditioning_noisy[b : b + 1]
                 local_conditioning_clean = conditioning_clean[b : b + 1]
-                if edit_pool_cond is not None:
-                    local_conditioning_noisy = local_conditioning_noisy + edit_pool_cond
-                    local_conditioning_clean = local_conditioning_clean + edit_pool_cond
-                    conditioning_noisy[b : b + 1] = local_conditioning_noisy
-                    conditioning_clean[b : b + 1] = local_conditioning_clean
                 image_temb = self._build_per_token_temb(
                     image_token_noise_mask,
                     local_conditioning_noisy,

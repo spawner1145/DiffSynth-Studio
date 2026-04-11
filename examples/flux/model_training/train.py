@@ -20,6 +20,10 @@ class FluxTrainingModule(DiffusionTrainingModule):
         offload_models=None,
         device="cpu",
         task="sft",
+        fp8_te_enabled=False,
+        fp8_te_model="dit",
+        fp8_te_exclude_modules=None,
+        fp8_te_gradient_checkpointing=False,
     ):
         super().__init__()
         # Load models
@@ -35,6 +39,10 @@ class FluxTrainingModule(DiffusionTrainingModule):
             lora_base_model, lora_target_modules, lora_rank, lora_checkpoint,
             preset_lora_path, preset_lora_model,
             task=task,
+            fp8_te_enabled=fp8_te_enabled,
+            fp8_te_model=fp8_te_model,
+            fp8_te_exclude_modules=fp8_te_exclude_modules,
+            fp8_te_gradient_checkpointing=fp8_te_gradient_checkpointing,
         )
         
         # Other configs
@@ -176,6 +184,10 @@ if __name__ == "__main__":
         offload_models=args.offload_models,
         task=args.task,
         device=accelerator.device,
+        fp8_te_enabled=getattr(args, "fp8_te_enabled", False),
+        fp8_te_model=getattr(args, "fp8_te_model", "dit"),
+        fp8_te_exclude_modules=getattr(args, "fp8_te_exclude_modules", None),
+        fp8_te_gradient_checkpointing=getattr(args, "fp8_te_gradient_checkpointing", False),
     )
     model_logger = ModelLogger(
         args.output_path,

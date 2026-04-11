@@ -10,6 +10,7 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 from transformers import AutoProcessor
 from diffsynth.core import UnifiedDataset, ImageTextPairDataset, load_model
+from diffsynth.core.fp8 import replace_linears_with_te, wrap_modules_for_te_checkpointing
 from diffsynth.core.vram import AutoWrappedModule
 from diffsynth.configs.vram_management_module_maps import VRAM_MANAGEMENT_MODULE_MAPS, VERSION_CHECKER_MAPS
 from diffsynth.core.data.operators import ImageCropAndResize, LoadImage, ToAbsolutePath
@@ -181,6 +182,9 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
         vram_limit: Optional[float] = None,
         use_gradient_checkpointing: bool = True,
         use_gradient_checkpointing_offload: bool = False,
+        fp8_te_enabled: bool = False,
+        fp8_te_exclude_modules: Optional[str] = None,
+        fp8_te_gradient_checkpointing: bool = False,
     ):
         super().__init__()
         self.train_omni = train_omni
@@ -347,6 +351,15 @@ class ComplextroTrainingModule(DiffusionTrainingModule):
                 f"Text encoder hidden_size ({text_hidden_size}) != Complextro text_embed_dim ({dit_text_dim}). "
                 f"Please align QwenImageTextEncoder(model_type='{qwen_model_type}', model_size='{qwen_model_size}') and ComplextroImageDiT(text_embed_dim=...)."
             )
+
+        # FP8 TE Linear replacement (must be before freeze/LoRA)
+        if fp8_te_enabled:
+            exclude_mods = fp8_te_exclude_modules.split(",") if isinstance(fp8_te_exclude_modules, str) else fp8_te_exclude_modules
+            replaced = replace_linears_with_te(self.pipe.dit, exclude_modules=exclude_mods)
+            print(f"TE FP8: replaced {len(replaced)} nn.Linear with TE Linear in dit.")
+            if fp8_te_gradient_checkpointing:
+                wrapped = wrap_modules_for_te_checkpointing(self.pipe.dit, use_reentrant=False)
+                print(f"TE FP8: wrapped {len(wrapped)} modules for TE gradient checkpointing in dit.")
 
         self.pipe.freeze_except(["dit"])
         self.pipe.scheduler.set_timesteps(1000, training=True)
@@ -627,6 +640,14 @@ if __name__ == "__main__":
     parser.add_argument("--attention_head_dim", type=int, default=96, help="DiT attention head dim")
     parser.add_argument("--enable_vram_offload", action="store_true", help="Enable VRAM offload for frozen auxiliary models")
     parser.add_argument("--offload_device", type=str, default="cpu", help="Offload device when VRAM offload is enabled")
+
+    # FP8 Transformer Engine config
+    parser.add_argument("--fp8_te_enabled", action="store_true", help="Enable TE FP8 Linear replacement + autocast")
+    parser.add_argument("--fp8_te_format", type=str, default="HYBRID", help="FP8 format: HYBRID / E4M3 / E5M2")
+    parser.add_argument("--fp8_te_amax_history_len", type=int, default=16, help="Amax history length for delayed scaling")
+    parser.add_argument("--fp8_te_amax_compute_algo", type=str, default="max", help="Amax compute algo: max / most_recent")
+    parser.add_argument("--fp8_te_exclude_modules", type=str, default=None, help="Comma-separated module prefixes to exclude from TE replacement")
+    parser.add_argument("--fp8_te_gradient_checkpointing", action="store_true", help="Use TE-aware gradient checkpointing")
 
     # 使用 WSD 调度器示例:
     # accelerate launch train_complextro_ddp.py \
@@ -946,6 +967,9 @@ if __name__ == "__main__":
         freq_loss_t_gamma=args.freq_loss_t_gamma,
         enable_vram_offload=enable_vram_offload,
         vram_config=vram_config,
+        fp8_te_enabled=args.fp8_te_enabled,
+        fp8_te_exclude_modules=args.fp8_te_exclude_modules,
+        fp8_te_gradient_checkpointing=args.fp8_te_gradient_checkpointing,
     )
     # 初始化采样 pipeline
     sample_pipe = build_complextro_pipe_from_training_module(model, args, accelerator.device)

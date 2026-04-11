@@ -7,6 +7,15 @@ def create_custom_forward(module):
     return custom_forward
 
 
+def _has_te_linear(model):
+    """Check if model contains any Transformer Engine Linear modules."""
+    try:
+        import transformer_engine.pytorch as te
+        return any(isinstance(m, te.Linear) for m in model.modules())
+    except ImportError:
+        return False
+
+
 def gradient_checkpoint_forward(
     model,
     use_gradient_checkpointing,
@@ -23,12 +32,22 @@ def gradient_checkpoint_forward(
                 use_reentrant=False,
             )
     elif use_gradient_checkpointing:
-        model_output = torch.utils.checkpoint.checkpoint(
-            create_custom_forward(model),
-            *args,
-            **kwargs,
-            use_reentrant=False,
-        )
+        # Use TE checkpoint when model contains TE Linear modules
+        if _has_te_linear(model):
+            import transformer_engine.pytorch as te
+            model_output = te.checkpoint(
+                create_custom_forward(model),
+                *args,
+                **kwargs,
+                use_reentrant=False,
+            )
+        else:
+            model_output = torch.utils.checkpoint.checkpoint(
+                create_custom_forward(model),
+                *args,
+                **kwargs,
+                use_reentrant=False,
+            )
     else:
         model_output = model(*args, **kwargs)
     return model_output
