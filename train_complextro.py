@@ -1,4 +1,4 @@
-import os, importlib
+import os, importlib, argparse
 import torch, accelerate
 from accelerate import DistributedDataParallelKwargs
 from typing import List, Optional, Any
@@ -951,6 +951,14 @@ if __name__ == "__main__":
             
     dummy_args = DummyArgs()
     sample_pipe = build_complextro_pipe_from_training_module(model, dummy_args, accelerator.device)
+
+    args = argparse.Namespace(
+        lr_scheduler="constant",
+        #lr_scheduler="warmup_stable_decay",
+        #lr_warmup_steps=0.01,
+        #lr_decay_steps=0.1,
+        #lr_scheduler_min_lr_ratio=0.1,
+    )
     
     model_logger = SamplingModelLogger(
         "models/Complextro/edit", # dit输出文件夹
@@ -961,14 +969,6 @@ if __name__ == "__main__":
         save_optimizer_state=getattr(args, "save_optimizer_state", False),
     )
     # ----------------------------------------------
-
-    args = argparse.Namespace(
-        lr_scheduler="constant",
-        #lr_scheduler="warmup_stable_decay",
-        #lr_warmup_steps=0.01,
-        #lr_decay_steps=0.1,
-        #lr_scheduler_min_lr_ratio=0.1,
-    )
 
     # 检查是否需要恢复训练
     if getattr(args, "resume_from_checkpoint", None) is not None:
